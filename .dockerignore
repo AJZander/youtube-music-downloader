@@ -1,0 +1,38 @@
+# Git
+.git/
+.gitignore
+
+# Docker
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# Downloads
+downloads/
+
+# Database
+*.db
+*.sqlite
+
+# Documentation
+README.md
+LICENSE
+
+# CI/CD
+.github/
+.gitlab-ci.yml

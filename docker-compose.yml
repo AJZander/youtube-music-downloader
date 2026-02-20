@@ -1,0 +1,60 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: youtube-downloader-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./downloads:/downloads
+      - backend-db:/app/data
+    environment:
+      - DOWNLOAD_DIR=/downloads
+      - DATABASE_URL=sqlite+aiosqlite:///./data/downloads.db
+      - MAX_CONCURRENT_DOWNLOADS=3
+      - AUDIO_FORMAT=mp3
+      - AUDIO_QUALITY=320
+      - DEBUG=false
+      - CORS_ORIGINS=*
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
+      - REQUESTS_CA_BUNDLE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
+    networks:
+      - downloader-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: youtube-downloader-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000/ws
+    depends_on:
+      - backend
+    networks:
+      - downloader-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  downloader-network:
+    driver: bridge
+
+volumes:
+  downloads:
+  backend-db:
