@@ -1,6 +1,6 @@
 from pydantic import BaseModel, HttpUrl, Field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 
 
 class DownloadRequest(BaseModel):

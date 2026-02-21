@@ -13,6 +13,7 @@ import DownloadForm from './components/DownloadForm';
 import DownloadList from './components/DownloadList';
 import Header from './components/Header';
 import ColorPicker from './components/ColorPicker';
+import CookieManager from './components/CookieManager';
 import { ThemeProvider as CustomThemeProvider } from './ThemeContext';
 
 const theme = createTheme({
@@ -55,6 +56,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
+  const [cookieManagerOpen, setCookieManagerOpen] = useState(false);
   const [wsService] = useState(() => {
     const wsUrl = process.env.REACT_APP_WS_URL || 'ws://localhost:8000/ws';
     return new WebSocketService(wsUrl);
@@ -142,6 +144,19 @@ function App() {
     }
   };
 
+  // Handle cookie manager
+  const handleOpenCookieManager = () => {
+    setCookieManagerOpen(true);
+  };
+
+  const handleCloseCookieManager = () => {
+    setCookieManagerOpen(false);
+  };
+
+  const handleCookiesSaved = () => {
+    setSuccessMessage('YouTube authentication updated successfully!');
+  };
+
   // Close error/success messages
   const handleCloseError = () => setError(null);
   const handleCloseSuccess = () => setSuccessMessage(null);
@@ -171,7 +186,7 @@ function App() {
           </Box>
 
           <Container maxWidth="lg" sx={{ px: { xs: 1, sm: 2 } }}>
-            <Header />
+            <Header onAuthClick={handleOpenCookieManager} />
             
             {/* Download Form Section */}
             <Box
@@ -247,6 +262,13 @@ function App() {
               {successMessage}
             </Alert>
           </Snackbar>
+
+          {/* Cookie Manager Dialog */}
+          <CookieManager
+            open={cookieManagerOpen}
+            onClose={handleCloseCookieManager}
+            onSave={handleCookiesSaved}
+          />
         </Box>
       </ThemeProvider>
     </CustomThemeProvider>

@@ -37,19 +37,14 @@ services:
     container_name: youtube-downloader-frontend
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "8080:80"
     environment:
-      - REACT_APP_API_URL=http://localhost:8000
-      - REACT_APP_WS_URL=ws://localhost:8000/ws
+      - REACT_APP_API_URL=https://backend.ytd.zandercs.com
+      - REACT_APP_WS_URL=wss://backend.ytd.zandercs.com/ws
     depends_on:
       - backend
     networks:
       - downloader-network
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
 networks:
   downloader-network:

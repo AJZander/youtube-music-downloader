@@ -1,5 +1,10 @@
 import React, { useState } from 'react';
-import { TextField, Button, Box, InputAdornment } from '@mui/material';
+import { 
+  TextField, 
+  Button, 
+  Box, 
+  InputAdornment
+} from '@mui/material';
 import LinkIcon from '@mui/icons-material/Link';
 import DownloadIcon from '@mui/icons-material/Download';
 
@@ -23,7 +28,7 @@ function DownloadForm({ onSubmit }) {
   };
 
   return (
-    <Box component="form" onSubmit={handleSubmit} sx={{ display: 'flex', gap: 1.5 }}>
+    <Box component="form" onSubmit={handleSubmit} sx={{ display: 'flex', gap: 1.5, alignItems: 'stretch' }}>
       <TextField
         fullWidth
         variant="outlined"
@@ -43,6 +48,7 @@ function DownloadForm({ onSubmit }) {
           },
         }}
         sx={{
+          flex: 1,
           '& .MuiOutlinedInput-root': {
             background: 'var(--bg-tertiary)',
             borderRadius: 1,

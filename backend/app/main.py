@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ from app.models import Download, DownloadStatus
 from app.schemas import DownloadRequest, DownloadResponse, ErrorResponse
 from app.downloader import download_manager
 from app.queue_service import queue_service
+from app.cookies_manager import cookies_manager
 
 # Configure logging
 logging.basicConfig(
@@ -244,6 +245,90 @@ async def get_active_downloads(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve active downloads"
+        )
+
+
+@app.get(
+    "/cookies",
+    tags=["Authentication"]
+)
+async def get_cookies_info():
+    """Get information about stored YouTube cookies."""
+    try:
+        info = cookies_manager.get_cookies_info()
+        return info
+    except Exception as e:
+        logger.error(f"Failed to get cookies info: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve cookies information"
+        )
+
+
+@app.post(
+    "/cookies",
+    tags=["Authentication"]
+)
+async def upload_cookies(cookies_content: str = Body(..., embed=True)):
+    """Upload YouTube cookies for authentication.
+    
+    The cookies should be in Netscape format (cookies.txt).
+    You can export cookies from your browser using extensions like:
+    - "Get cookies.txt LOCALLY" for Chrome/Edge
+    - "cookies.txt" for Firefox
+    
+    Only export cookies from youtube.com and music.youtube.com domains.
+    """
+    try:
+        if not cookies_content or not cookies_content.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cookies content is empty"
+            )
+        
+        cookies_manager.save_cookies(cookies_content)
+        logger.info("YouTube cookies uploaded successfully")
+        
+        return {
+            "success": True,
+            "message": "YouTube cookies saved successfully. Age-restricted content can now be downloaded."
+        }
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Failed to save cookies: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save cookies"
+        )
+
+
+@app.delete(
+    "/cookies",
+    tags=["Authentication"]
+)
+async def delete_cookies():
+    """Delete stored YouTube cookies."""
+    try:
+        deleted = cookies_manager.delete_cookies()
+        if deleted:
+            return {
+                "success": True,
+                "message": "YouTube cookies deleted successfully"
+            }
+        else:
+            return {
+                "success": False,
+                "message": "No cookies to delete"
+            }
+    except Exception as e:
+        logger.error(f"Failed to delete cookies: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete cookies"
         )
 
 

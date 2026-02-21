@@ -31,6 +31,9 @@ A production-grade web application for downloading music from YouTube Music. Bui
 - 💾 High-quality audio downloads (up to 320kbps MP3)
 - 🏷️ Automatic metadata tagging (artist, album, title)
 - 🖼️ Embedded album artwork
+- 🔐 YouTube authentication support for age-restricted content
+- 🎯 Smart artist folder organization (no duplicate folders for featuring artists)
+- 🎨 Customizable download types (album/playlist/song/video)
 
 ## Architecture
 
@@ -108,11 +111,57 @@ A production-grade web application for downloading music from YouTube Music. Bui
    - Artist: `https://music.youtube.com/channel/...`
    - Playlist: `https://music.youtube.com/playlist?list=...`
 
-3. **Click "Download"** - The download will be added to the queue
+3. **Select download type** (optional):
+   - Auto-detect (default)
+   - Single Song
+   - Album
+   - Playlist
+   - Music Video
 
-4. **Monitor progress** - Real-time updates show download status
+4. **Click "Download"** - The download will be added to the queue
 
-5. **Access downloaded files** - Files are saved in `./downloads/` organized by Artist/Album/
+5. **Monitor progress** - Real-time updates show download status
+
+6. **Access downloaded files** - Files are saved in `./downloads/` organized by Artist/Album/
+
+## YouTube Authentication (Age-Restricted Content)
+
+To download age-restricted videos or content that requires sign-in, you'll need to provide YouTube cookies from your browser.
+
+### How to Set Up Authentication:
+
+1. **Install a cookie export browser extension:**
+   - **Chrome/Edge**: [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
+   - **Firefox**: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
+
+2. **Sign in to YouTube** in your browser
+
+3. **Export your YouTube cookies:**
+   - Navigate to youtube.com
+   - Click the cookie extension icon
+   - Export cookies (Netscape format)
+   - Copy the exported content
+
+4. **Upload cookies to the app:**
+   - Click the 🔑 **key icon** in the top-right of the app header
+   - Paste the cookies content into the text area
+   - Click **Save Cookies**
+
+5. **Done!** The app can now download age-restricted content
+
+### Managing Cookies:
+
+- **Check Status**: Click the 🔑 icon to see if cookies are active
+- **Update Cookies**: Upload new cookies anytime (e.g., if they expire)
+- **Remove Cookies**: Click "Remove" in the cookie dialog
+
+> **Privacy Note**: Your cookies are stored locally in the Docker container and are never transmitted elsewhere. They are only used to authenticate with YouTube for downloads.
+
+### What Gets Fixed with Authentication:
+
+✅ Age-restricted music videos  
+✅ Content requiring sign-in  
+✅ Complete album downloads (skips inaccessible tracks instead of failing entirely)
 
 ## Configuration
 
@@ -143,13 +192,19 @@ REACT_APP_WS_URL=ws://localhost:8000/ws
 
 ### REST API
 
+**Downloads:**
 - `GET /` - Root endpoint
 - `GET /health` - Health check
-- `POST /downloads` - Create new download
+- `POST /downloads` - Create new download (with download_type parameter)
 - `GET /downloads` - List all downloads
 - `GET /downloads/{id}` - Get specific download
 - `DELETE /downloads/{id}` - Cancel download
 - `GET /downloads/status/active` - Get active downloads
+
+**Authentication:**
+- `GET /cookies` - Get cookies status and info
+- `POST /cookies` - Upload YouTube cookies (Netscape format)
+- `DELETE /cookies` - Remove stored cookies
 
 ### WebSocket
 
@@ -170,7 +225,8 @@ downloader/
 │   │   ├── schemas.py           # Pydantic schemas
 │   │   ├── database.py          # Database connection
 │   │   ├── downloader.py        # Download manager
-│   │   └── queue_service.py     # Queue management
+│   │   ├── queue_service.py     # Queue management
+│   │   └── cookies_manager.py   # YouTube authentication
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── .env.example
@@ -182,7 +238,9 @@ downloader/
 │   │   │   ├── Header.js
 │   │   │   ├── DownloadForm.js
 │   │   │   ├── DownloadList.js
-│   │   │   └── DownloadItem.js
+│   │   │   ├── DownloadItem.js
+│   │   │   ├── CookieManager.js  # Authentication dialog
+│   │   │   └── ColorPicker.js
 │   │   ├── App.js
 │   │   ├── api.js
 │   │   ├── index.js
@@ -235,6 +293,19 @@ docker-compose restart
 - Check that ffmpeg is installed in the backend container
 - Verify the YouTube URL is valid and accessible
 - Check backend logs: `docker-compose logs backend`
+- **For age-restricted content**: Set up YouTube authentication (see [YouTube Authentication section](#youtube-authentication-age-restricted-content))
+
+### Age-restricted or sign-in required errors
+If you see errors like "Sign in to confirm your age" or "Video requires sign-in":
+1. Click the 🔑 key icon in the app header
+2. Follow the instructions to export and upload your YouTube cookies
+3. Retry the download - it should now work
+
+### Cookies not working
+- Make sure you're signed in to YouTube before exporting cookies
+- Export cookies specifically from youtube.com or music.youtube.com
+- Try re-exporting fresh cookies if they've expired
+- Check that you pasted the entire cookie file content (should start with `# Netscape HTTP Cookie File`)
 
 ### Can't access the web interface
 ```bash
@@ -293,6 +364,7 @@ cp backend/downloads.db backend/downloads.db.backup
 - Should only be run on trusted networks
 - Consider adding nginx reverse proxy with SSL for internet exposure
 - Respect copyright laws and YouTube's Terms of Service
+- **Cookie Storage**: YouTube cookies are stored locally in the Docker container at `/app/data/cookies/` and are never transmitted to external services. They are only used to authenticate downloads with YouTube. Remove cookies when no longer needed.
 
 ## Legal Disclaimer
 

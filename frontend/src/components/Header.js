@@ -1,16 +1,42 @@
 import React from 'react';
-import { Box, Typography } from '@mui/material';
+import { Box, Typography, IconButton, Tooltip } from '@mui/material';
 import MusicNoteIcon from '@mui/icons-material/MusicNote';
+import VpnKeyIcon from '@mui/icons-material/VpnKey';
 
-function Header() {
+function Header({ onAuthClick }) {
   return (
     <Box
       sx={{
         textAlign: 'center',
         color: 'var(--text-primary)',
         py: 3,
+        position: 'relative',
       }}
     >
+      {/* Auth button in top right */}
+      <Box
+        sx={{
+          position: 'absolute',
+          top: 16,
+          right: 0,
+        }}
+      >
+        <Tooltip title="YouTube Authentication (for age-restricted content)">
+          <IconButton
+            onClick={onAuthClick}
+            sx={{
+              color: 'var(--text-secondary)',
+              '&:hover': {
+                color: 'var(--accent-primary)',
+                background: 'rgba(139, 92, 246, 0.1)',
+              },
+            }}
+          >
+            <VpnKeyIcon />
+          </IconButton>
+        </Tooltip>
+      </Box>
+
       <Box
         sx={{
           display: 'flex',

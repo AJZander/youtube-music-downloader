@@ -26,7 +26,7 @@ class Download(Base):
     title = Column(String, nullable=True)
     artist = Column(String, nullable=True)
     album = Column(String, nullable=True)
-    type = Column(String, nullable=False)  # song, album, artist, playlist
+    type = Column(String, nullable=False)  # song, album, artist, playlist (detected type)
     status = Column(String, nullable=False, default=DownloadStatus.QUEUED)
     progress = Column(Float, default=0.0)
     error_message = Column(Text, nullable=True)
