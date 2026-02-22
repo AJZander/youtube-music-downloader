@@ -1,94 +1,84 @@
-import os
+# backend/app/cookies_manager.py
 import logging
-from pathlib import Path
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+_COOKIES_FILENAME = "youtube_cookies.txt"
+
 
 class CookiesManager:
-    """Manages YouTube cookies for authentication."""
-    
-    def __init__(self, cookies_dir: Path = None):
-        """Initialize cookies manager.
-        
-        Args:
-            cookies_dir: Directory to store cookies file
-        """
-        self.cookies_dir = cookies_dir or Path("/app/data/cookies")
-        self.cookies_dir.mkdir(parents=True, exist_ok=True)
-        self.cookies_file = self.cookies_dir / "youtube_cookies.txt"
-        
+    """
+    Manages a single Netscape-format cookies file used by yt-dlp.
+
+    The file lives on the named Docker volume so it persists across
+    container recreations.
+    """
+
+    def __init__(self) -> None:
+        # Ensure the directory exists with correct permissions on first access
+        self._dir: Path = settings.cookies_dir
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._file: Path = self._dir / _COOKIES_FILENAME
+
+    # ── Public helpers ────────────────────────────────────────────────────────
+
     def has_cookies(self) -> bool:
-        """Check if cookies file exists."""
-        return self.cookies_file.exists() and self.cookies_file.stat().st_size > 0
-    
+        """Return True when a non-empty cookies file is present."""
+        return self._file.exists() and self._file.stat().st_size > 0
+
     def get_cookies_path(self) -> Optional[str]:
-        """Get path to cookies file if it exists."""
-        if self.has_cookies():
-            return str(self.cookies_file)
-        return None
-    
-    def save_cookies(self, cookies_content: str) -> bool:
-        """Save cookies content to file.
-        
-        Args:
-            cookies_content: Cookies in Netscape format
-            
-        Returns:
-            True if saved successfully
         """
+        Return absolute path string when cookies exist, else None.
+        yt-dlp accepts a str path via the ``cookiefile`` option.
+        """
+        return str(self._file) if self.has_cookies() else None
+
+    def save_cookies(self, content: str) -> None:
+        """
+        Persist validated Netscape cookie content.
+        Raises ValueError on empty input (schema-level validation should
+        catch format issues before we get here).
+        """
+        content = content.strip()
+        if not content:
+            raise ValueError("Cookie content is empty")
+
+        # Write atomically: write to .tmp then rename
+        tmp = self._file.with_suffix(".tmp")
         try:
-            # Validate it's not empty
-            if not cookies_content or not cookies_content.strip():
-                raise ValueError("Cookies content is empty")
-            
-            # Write to file
-            self.cookies_file.write_text(cookies_content)
-            logger.info(f"Saved cookies to {self.cookies_file}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to save cookies: {e}")
+            tmp.write_text(content, encoding="utf-8")
+            # os.replace is atomic on POSIX; on Windows it may raise if dst exists
+            os.replace(tmp, self._file)
+            logger.info("Cookies saved to %s (%d bytes)", self._file, self._file.stat().st_size)
+        except Exception:
+            tmp.unlink(missing_ok=True)
             raise
-    
+
     def delete_cookies(self) -> bool:
-        """Delete cookies file.
-        
-        Returns:
-            True if deleted successfully
-        """
-        try:
-            if self.cookies_file.exists():
-                self.cookies_file.unlink()
-                logger.info("Deleted cookies")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Failed to delete cookies: {e}")
-            raise
-    
-    def get_cookies_info(self) -> dict:
-        """Get information about stored cookies.
-        
-        Returns:
-            Dictionary with cookies info
-        """
+        """Remove cookies file. Returns True if a file was actually deleted."""
+        if self._file.exists():
+            self._file.unlink()
+            logger.info("Cookies deleted")
+            return True
+        return False
+
+    def info(self) -> dict:
+        """Return a serialisable status dict for the API response."""
         if not self.has_cookies():
-            return {
-                "exists": False,
-                "size": 0,
-                "modified": None
-            }
-        
-        stat = self.cookies_file.stat()
+            return {"exists": False, "size_bytes": 0, "last_modified": None}
+        stat = self._file.stat()
         return {
-            "exists": True,
-            "size": stat.st_size,
-            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
+            "exists":        True,
+            "size_bytes":    stat.st_size,
+            "last_modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
         }
 
 
-# Global instance
+# Module-level singleton — import this everywhere
 cookies_manager = CookiesManager()

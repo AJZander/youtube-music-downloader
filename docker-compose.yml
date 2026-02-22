@@ -1,55 +1,62 @@
+# docker-compose.yml
+# Production-grade multi-container orchestration
 services:
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: youtube-downloader-backend
+    container_name: ytm-backend
     restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
+      # Persistent download storage on host
       - ./downloads:/downloads
-      - backend-db:/app/data
+      # Persistent database and cookie storage
+      - backend-data:/app/data
     environment:
       - DOWNLOAD_DIR=/downloads
-      - DATABASE_URL=sqlite+aiosqlite:///./data/downloads.db
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/downloads.db
       - MAX_CONCURRENT_DOWNLOADS=3
       - AUDIO_FORMAT=mp3
       - AUDIO_QUALITY=320
       - DEBUG=false
       - CORS_ORIGINS=*
       - PYTHONUNBUFFERED=1
+      # Point Python SSL to the certifi bundle baked into the image
       - SSL_CERT_FILE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
       - REQUESTS_CA_BUNDLE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
     networks:
-      - downloader-network
+      - ytm-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 20s
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: youtube-downloader-frontend
+      # Pass API URLs as build-time args so React bakes them in
+      args:
+        - REACT_APP_API_URL=${REACT_APP_API_URL:-http://localhost:8000}
+        - REACT_APP_WS_URL=${REACT_APP_WS_URL:-ws://localhost:8000/ws}
+    container_name: ytm-frontend
     restart: unless-stopped
     ports:
-      - "8080:80"
-    environment:
-      - REACT_APP_API_URL=https://backend.ytd.zandercs.com
-      - REACT_APP_WS_URL=wss://backend.ytd.zandercs.com/ws
+      - "3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
-      - downloader-network
+      - ytm-network
 
 networks:
-  downloader-network:
+  ytm-network:
     driver: bridge
 
 volumes:
-  downloads:
-  backend-db:
+  # Named volume so database & cookies survive container recreations
+  backend-data:

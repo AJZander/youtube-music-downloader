@@ -1,244 +1,204 @@
+# backend/app/queue_service.py
+"""
+Async download queue.
+
+- FIFO queue with configurable concurrency cap.
+- Each download runs as an independent asyncio.Task.
+- All connected WebSocket clients receive JSON updates after every state change.
+- Graceful shutdown cancels in-flight tasks.
+"""
 import asyncio
-from typing import Dict, Set, Optional
-from datetime import datetime
 import logging
+from datetime import datetime
+from typing import Any, Dict, Optional, Set
 
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Download, DownloadStatus
+from app.config import settings          # must be at top — used in module-level singleton
+from app.database import AsyncSessionLocal
 from app.downloader import download_manager
-from app.database import async_session_maker
+from app.models import Download, DownloadStatus
 
 logger = logging.getLogger(__name__)
 
 
 class QueueService:
-    """Service for managing download queue and concurrent downloads."""
-    
-    def __init__(self, max_concurrent: int = 3):
-        self.max_concurrent = max_concurrent
-        self.active_downloads: Dict[int, asyncio.Task] = {}
-        self.download_queue: asyncio.Queue = asyncio.Queue()
-        self.websocket_clients: Set = set()
-        self._worker_task: Optional[asyncio.Task] = None
+    def __init__(self, max_concurrent: int = 3) -> None:
+        self._max   = max_concurrent
+        self._queue: asyncio.Queue[int] = asyncio.Queue()
+        self._active: Dict[int, asyncio.Task] = {}
+        self._ws_clients: Set[Any] = set()
+        self._worker: Optional[asyncio.Task] = None
         self._running = False
-        
-    async def start(self):
-        """Start the queue worker."""
-        if not self._running:
-            self._running = True
-            self._worker_task = asyncio.create_task(self._process_queue())
-            logger.info("Queue service started")
-    
-    async def stop(self):
-        """Stop the queue worker."""
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._worker  = asyncio.create_task(self._loop(), name="queue-worker")
+        logger.info("Queue service started (max_concurrent=%d)", self._max)
+
+    async def stop(self) -> None:
         self._running = False
-        if self._worker_task:
-            self._worker_task.cancel()
+        if self._worker:
+            self._worker.cancel()
             try:
-                await self._worker_task
+                await self._worker
             except asyncio.CancelledError:
                 pass
-        
-        # Cancel all active downloads
-        for task in self.active_downloads.values():
+
+        for task in list(self._active.values()):
             task.cancel()
-        
-        self.active_downloads.clear()
+        self._active.clear()
         logger.info("Queue service stopped")
-    
-    def register_websocket(self, websocket):
-        """Register a WebSocket client for updates."""
-        self.websocket_clients.add(websocket)
-        logger.debug(f"WebSocket client registered. Total clients: {len(self.websocket_clients)}")
-    
-    def unregister_websocket(self, websocket):
-        """Unregister a WebSocket client."""
-        self.websocket_clients.discard(websocket)
-        logger.debug(f"WebSocket client unregistered. Total clients: {len(self.websocket_clients)}")
-    
-    async def broadcast_update(self, download: Download):
-        """Broadcast download update to all connected WebSocket clients."""
-        if not self.websocket_clients:
-            return
-        
-        message = {
-            "type": "download_update",
-            "data": download.to_dict()
-        }
-        
-        # Remove disconnected clients
-        disconnected = set()
-        
-        for ws in self.websocket_clients:
+
+    # ── WebSocket registry ────────────────────────────────────────────────────
+
+    def register_ws(self, ws: Any) -> None:
+        self._ws_clients.add(ws)
+
+    def unregister_ws(self, ws: Any) -> None:
+        self._ws_clients.discard(ws)
+
+    async def _broadcast(self, download: Download) -> None:
+        """Fan-out a download_update message; silently drop dead connections."""
+        dead: Set[Any] = set()
+        payload = {"type": "download_update", "data": download.to_dict()}
+        for ws in self._ws_clients:
             try:
-                await ws.send_json(message)
-            except Exception as e:
-                logger.debug(f"Failed to send to WebSocket client: {e}")
-                disconnected.add(ws)
-        
-        # Clean up disconnected clients
-        for ws in disconnected:
-            self.websocket_clients.discard(ws)
-    
-    async def add_to_queue(self, download_id: int):
-        """Add a download to the queue."""
-        await self.download_queue.put(download_id)
-        logger.info(f"Download {download_id} added to queue")
-    
-    async def _process_queue(self):
-        """Process downloads from the queue."""
-        logger.info("Queue worker started")
-        
+                await ws.send_json(payload)
+            except Exception:
+                dead.add(ws)
+        self._ws_clients -= dead
+
+    # ── Enqueue ───────────────────────────────────────────────────────────────
+
+    async def enqueue(self, download_id: int) -> None:
+        await self._queue.put(download_id)
+        logger.debug("Enqueued download %d", download_id)
+
+    # ── Cancel ────────────────────────────────────────────────────────────────
+
+    async def cancel(self, download_id: int) -> bool:
+        task = self._active.pop(download_id, None)
+        if task:
+            task.cancel()
+
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(Download)
+                .where(Download.id == download_id)
+                .values(status=DownloadStatus.CANCELLED, updated_at=datetime.utcnow())
+            )
+            await session.commit()
+            dl = await session.get(Download, download_id)
+            if dl:
+                await self._broadcast(dl)
+        return True
+
+    # ── Main worker loop ──────────────────────────────────────────────────────
+
+    async def _loop(self) -> None:
+        """Continuously drain the queue up to concurrency limit."""
+        logger.debug("Queue worker loop entered")
         while self._running:
             try:
-                # Clean up completed tasks
-                completed = [
-                    download_id 
-                    for download_id, task in self.active_downloads.items() 
-                    if task.done()
-                ]
-                for download_id in completed:
-                    del self.active_downloads[download_id]
-                
-                # Start new downloads if we have capacity
-                while len(self.active_downloads) < self.max_concurrent:
+                # Prune finished tasks
+                self._active = {
+                    did: t for did, t in self._active.items() if not t.done()
+                }
+
+                # Spin up new tasks while under the concurrency cap
+                while len(self._active) < self._max:
                     try:
-                        download_id = await asyncio.wait_for(
-                            self.download_queue.get(), 
-                            timeout=1.0
-                        )
-                        
-                        # Start download task
-                        task = asyncio.create_task(
-                            self._process_download(download_id)
-                        )
-                        self.active_downloads[download_id] = task
-                        logger.info(f"Started download {download_id}")
-                        
+                        did = await asyncio.wait_for(self._queue.get(), timeout=1.0)
                     except asyncio.TimeoutError:
                         break
-                
-                await asyncio.sleep(0.5)
-                
+                    task = asyncio.create_task(
+                        self._run_download(did), name=f"download-{did}"
+                    )
+                    self._active[did] = task
+
+                await asyncio.sleep(0.25)
+
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(f"Error in queue worker: {e}", exc_info=True)
+            except Exception:
+                logger.exception("Unexpected error in queue loop")
                 await asyncio.sleep(1)
-        
-        logger.info("Queue worker stopped")
-    
-    async def _process_download(self, download_id: int):
-        """Process a single download."""
-        async with async_session_maker() as session:
-            try:
-                # Get download from database
-                result = await session.execute(
-                    select(Download).where(Download.id == download_id)
-                )
-                download = result.scalar_one_or_none()
-                
-                if not download:
-                    logger.error(f"Download {download_id} not found")
-                    return
-                
-                # Update status to downloading
-                download.status = DownloadStatus.DOWNLOADING
-                download.progress = 0
+
+    # ── Per-download task ─────────────────────────────────────────────────────
+
+    async def _run_download(self, download_id: int) -> None:
+        async with AsyncSessionLocal() as session:
+            download = await session.get(Download, download_id)
+            if not download:
+                logger.error("Download %d not found in DB", download_id)
+                return
+
+            # Mark as downloading
+            download.status    = DownloadStatus.DOWNLOADING
+            download.progress  = 0.0
+            download.updated_at = datetime.utcnow()
+            await session.commit()
+            await session.refresh(download)
+            await self._broadcast(download)
+
+            # ── Callback helpers ──────────────────────────────────────────────
+
+            async def on_progress(pct: float) -> None:
+                download.progress   = min(pct, 99.9)
                 download.updated_at = datetime.utcnow()
                 await session.commit()
                 await session.refresh(download)
-                await self.broadcast_update(download)
-                
-                # Progress callback
-                async def update_progress(progress: float):
-                    download.progress = min(progress, 99.9)
-                    download.updated_at = datetime.utcnow()
-                    await session.commit()
-                    await session.refresh(download)
-                    await self.broadcast_update(download)
-                
-                # Status callback
-                async def update_status(status: DownloadStatus, progress: float):
-                    download.status = status
-                    download.progress = progress
-                    download.updated_at = datetime.utcnow()
-                    await session.commit()
-                    await session.refresh(download)
-                    await self.broadcast_update(download)
-                
-                # Perform download
+                await self._broadcast(download)
+
+            async def on_status(st: DownloadStatus, pct: float) -> None:
+                download.status     = st
+                download.progress   = pct
+                download.updated_at = datetime.utcnow()
+                await session.commit()
+                await session.refresh(download)
+                await self._broadcast(download)
+
+            # ── Execute download ──────────────────────────────────────────────
+            try:
                 result = await download_manager.download(
                     download.url,
-                    progress_callback=update_progress,
-                    status_callback=update_status
+                    on_progress=on_progress,
+                    on_status=on_status,
                 )
-                
-                # Update download with results
-                if download.title == 'Pending...':
-                    download.title = result['title']
-                if download.artist == 'Unknown':
-                    download.artist = result['artist']
-                if download.album == 'Unknown':
-                    download.album = result['album']
-                
-                download.status = DownloadStatus.COMPLETED
-                download.progress = 100
-                download.file_path = str(download_manager.download_dir)
-                download.updated_at = datetime.utcnow()
-                
+
+                # Update record with final metadata
+                download.title        = result.get("title", download.title)
+                download.artist       = result.get("artist", download.artist)
+                download.album        = result.get("album", download.album)
+                download.total_tracks = result.get("total_tracks")
+                download.done_tracks  = result.get("done_tracks")
+                download.status       = DownloadStatus.COMPLETED
+                download.progress     = 100.0
+                download.file_path    = str(download_manager._root)
+                download.updated_at   = datetime.utcnow()
                 await session.commit()
                 await session.refresh(download)
-                await self.broadcast_update(download)
-                
-                logger.info(f"Download {download_id} completed successfully")
-                
-            except Exception as e:
-                logger.error(f"Download {download_id} failed: {e}", exc_info=True)
-                
-                # Update download with error
-                try:
-                    download.status = DownloadStatus.FAILED
-                    download.error_message = str(e)
-                    download.updated_at = datetime.utcnow()
-                    await session.commit()
-                    await session.refresh(download)
-                    await self.broadcast_update(download)
-                except Exception as update_error:
-                    logger.error(f"Failed to update download status: {update_error}")
-    
-    async def cancel_download(self, download_id: int) -> bool:
-        """Cancel a download."""
-        # Cancel active download task if exists
-        if download_id in self.active_downloads:
-            task = self.active_downloads[download_id]
-            task.cancel()
-            del self.active_downloads[download_id]
-            
-            async with async_session_maker() as session:
-                await session.execute(
-                    update(Download)
-                    .where(Download.id == download_id)
-                    .values(
-                        status=DownloadStatus.CANCELLED,
-                        updated_at=datetime.utcnow()
-                    )
-                )
+                await self._broadcast(download)
+                logger.info("Download %d completed (%s track(s))", download_id, result.get("done_tracks"))
+
+            except asyncio.CancelledError:
+                # Task was cancelled externally — status already set by cancel()
+                logger.info("Download %d was cancelled", download_id)
+
+            except Exception as exc:
+                logger.exception("Download %d failed", download_id)
+                download.status        = DownloadStatus.FAILED
+                download.error_message = str(exc)[:1024]
+                download.updated_at    = datetime.utcnow()
                 await session.commit()
-                
-                result = await session.execute(
-                    select(Download).where(Download.id == download_id)
-                )
-                download = result.scalar_one_or_none()
-                if download:
-                    await self.broadcast_update(download)
-            
-            return True
-        
-        return False
+                await session.refresh(download)
+                await self._broadcast(download)
 
 
-# Global queue service instance
-queue_service = QueueService(max_concurrent=3)
+# ── Module-level singleton ────────────────────────────────────────────────────
+queue_service = QueueService(max_concurrent=settings.max_concurrent_downloads)

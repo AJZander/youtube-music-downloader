@@ -1,278 +1,168 @@
-import React, { useState, useEffect, useCallback } from 'react';
+// frontend/src/App.js
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Container,
-  Box,
-  ThemeProvider,
-  createTheme,
-  CssBaseline,
-  Alert,
-  Snackbar,
+  Alert, Box, Container, CssBaseline,
+  Snackbar, ThemeProvider, createTheme,
 } from '@mui/material';
-import { downloadAPI, WebSocketService } from './api';
+
+import { api, WSService } from './api';
+import Header       from './components/Header';
 import DownloadForm from './components/DownloadForm';
 import DownloadList from './components/DownloadList';
-import Header from './components/Header';
-import ColorPicker from './components/ColorPicker';
-import CookieManager from './components/CookieManager';
-import { ThemeProvider as CustomThemeProvider } from './ThemeContext';
+import CookieDialog from './components/CookieDialog';
 
+// ── MUI dark theme ────────────────────────────────────────────────────────────
 const theme = createTheme({
   palette: {
     mode: 'dark',
-    primary: {
-      main: '#8B5CF6',
-    },
-    background: {
-      default: '#0f0f1a',
-      paper: '#1a1a24',
-    },
-    text: {
-      primary: '#ffffff',
-      secondary: '#a0a0b0',
-    },
+    primary:    { main: '#8B5CF6' },
+    background: { default: '#0f0f1a', paper: '#1a1a24' },
   },
   typography: {
-    fontFamily: '-apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", "Roboto", sans-serif',
+    fontFamily: '"Inter", "Segoe UI", system-ui, sans-serif',
     fontSize: 13,
-    h4: { fontWeight: 600, fontSize: '1.75rem' },
-    h5: { fontWeight: 600, fontSize: '1.25rem' },
-    h6: { fontWeight: 500, fontSize: '1rem' },
-    body1: { fontSize: '0.875rem' },
-    body2: { fontSize: '0.8125rem' },
   },
   components: {
-    MuiPaper: {
-      styleOverrides: {
-        root: {
-          backgroundImage: 'none',
-        },
-      },
-    },
+    MuiPaper: { styleOverrides: { root: { backgroundImage: 'none' } } },
   },
 });
 
-function App() {
-  const [downloads, setDownloads] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [successMessage, setSuccessMessage] = useState(null);
-  const [cookieManagerOpen, setCookieManagerOpen] = useState(false);
-  const [wsService] = useState(() => {
-    const wsUrl = process.env.REACT_APP_WS_URL || 'ws://localhost:8000/ws';
-    return new WebSocketService(wsUrl);
-  });
+// ── Toast helper ──────────────────────────────────────────────────────────────
+function useToast() {
+  const [toast, setToast] = useState(null); // { msg, sev }
+  const show = useCallback((msg, sev = 'success') => setToast({ msg, sev }), []);
+  const hide = useCallback(() => setToast(null), []);
+  return { toast, show, hide };
+}
 
-  // Fetch downloads
+export default function App() {
+  const [downloads,      setDownloads]      = useState([]);
+  const [loading,        setLoading]        = useState(true);
+  const [cookieOpen,     setCookieOpen]     = useState(false);
+  const { toast, show: showToast, hide: hideToast } = useToast();
+
+  // Stable WS instance across renders
+  const ws = useRef(null);
+  if (!ws.current) ws.current = new WSService();
+
+  // ── Initial fetch ───────────────────────────────────────────────────────────
   const fetchDownloads = useCallback(async () => {
     try {
-      const data = await downloadAPI.getDownloads();
-      setDownloads(data);
-      setLoading(false);
-    } catch (err) {
-      console.error('Failed to fetch downloads:', err);
-      setError('Failed to fetch downloads');
+      setDownloads(await api.getDownloads());
+    } catch {
+      showToast('Could not load download history', 'error');
+    } finally {
       setLoading(false);
     }
-  }, []);
+  }, [showToast]);
 
-  // Initialize WebSocket and fetch data
+  // ── WebSocket subscription ──────────────────────────────────────────────────
   useEffect(() => {
-    // Initial fetch
     fetchDownloads();
 
-    // Setup WebSocket
-    wsService
-      .connect()
-      .then(() => {
-        console.log('WebSocket connected successfully');
-        wsService.startPing();
-      })
-      .catch((err) => {
-        console.error('WebSocket connection failed:', err);
-        setError('Real-time updates unavailable');
-      });
+    const svc = ws.current;
 
-    // Listen for initial data
-    wsService.on('initial_data', (data) => {
-      console.log('Received initial data:', data);
-      setDownloads(data);
-    });
+    svc.connect().catch(() => showToast('Real-time updates unavailable', 'warning'));
 
-    // Listen for download updates
-    wsService.on('download_update', (data) => {
-      console.log('Download update:', data);
-      setDownloads((prevDownloads) => {
-        const index = prevDownloads.findIndex((d) => d.id === data.id);
-        if (index >= 0) {
-          const newDownloads = [...prevDownloads];
-          newDownloads[index] = data;
-          return newDownloads;
-        } else {
-          return [data, ...prevDownloads];
+    // Replace entire list on first connect
+    const offInit   = svc.on('initial_data', data => setDownloads(data));
+    // Upsert on subsequent updates
+    const offUpdate = svc.on('download_update', item =>
+      setDownloads(prev => {
+        const idx = prev.findIndex(d => d.id === item.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = item;
+          return next;
         }
-      });
-    });
+        return [item, ...prev];
+      })
+    );
 
-    // Cleanup
     return () => {
-      wsService.stopPing();
-      wsService.disconnect();
+      offInit();
+      offUpdate();
+      svc.disconnect();
     };
-  }, [wsService, fetchDownloads]);
+  }, [fetchDownloads, showToast]);
 
-  // Handle new download
-  const handleDownload = async (url) => {
+  // ── Handlers ────────────────────────────────────────────────────────────────
+  const handleDownload = useCallback(async (url) => {
     try {
-      const download = await downloadAPI.createDownload(url);
-      setSuccessMessage('Download added to queue!');
-      // The download will be added via WebSocket update
-      console.log('Created download:', download);
+      await api.createDownload(url);
+      showToast('Added to queue!');
     } catch (err) {
-      console.error('Failed to create download:', err);
-      setError(err.response?.data?.detail || 'Failed to add download');
+      const detail = err.response?.data?.detail || 'Failed to add download';
+      showToast(detail, 'error');
     }
-  };
+  }, [showToast]);
 
-  // Handle cancel download
-  const handleCancelDownload = async (id) => {
+  const handleCancel = useCallback(async (id) => {
     try {
-      await downloadAPI.cancelDownload(id);
-      setSuccessMessage('Download cancelled');
-    } catch (err) {
-      console.error('Failed to cancel download:', err);
-      setError('Failed to cancel download');
+      await api.cancelDownload(id);
+    } catch {
+      showToast('Failed to cancel', 'error');
     }
-  };
+  }, [showToast]);
 
-  // Handle cookie manager
-  const handleOpenCookieManager = () => {
-    setCookieManagerOpen(true);
-  };
-
-  const handleCloseCookieManager = () => {
-    setCookieManagerOpen(false);
-  };
-
-  const handleCookiesSaved = () => {
-    setSuccessMessage('YouTube authentication updated successfully!');
-  };
-
-  // Close error/success messages
-  const handleCloseError = () => setError(null);
-  const handleCloseSuccess = () => setSuccessMessage(null);
-
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
-    <CustomThemeProvider>
-      <ThemeProvider theme={theme}>
-        <CssBaseline />
-        <Box
-          sx={{
-            minHeight: '100vh',
-            background: 'var(--bg-primary)',
-            py: 2,
-            px: 2,
-          }}
-        >
-          {/* Color Picker - Fixed Position */}
-          <Box
-            sx={{
-              position: 'fixed',
-              top: 16,
-              right: 16,
-              zIndex: 1000,
-            }}
-          >
-            <ColorPicker />
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <Box sx={{ minHeight: '100vh', bgcolor: '#0f0f1a', py: 3 }}>
+        <Container maxWidth="lg">
+
+          <Header onAuthClick={() => setCookieOpen(true)} />
+
+          {/* URL input */}
+          <Box sx={cardSx}>
+            <DownloadForm onSubmit={handleDownload} />
           </Box>
 
-          <Container maxWidth="lg" sx={{ px: { xs: 1, sm: 2 } }}>
-            <Header onAuthClick={handleOpenCookieManager} />
-            
-            {/* Download Form Section */}
-            <Box
-              sx={{
-                p: { xs: 2, sm: 2.5 },
-                mt: 3,
-                borderRadius: 1.5,
-                background: 'var(--bg-secondary)',
-                border: '1px solid var(--border-subtle)',
-                boxShadow: 'var(--shadow-sm)',
-              }}
-            >
-              <DownloadForm onSubmit={handleDownload} />
-            </Box>
+          {/* Download queue / history */}
+          <Box sx={{ ...cardSx, mt: 2 }}>
+            <DownloadList
+              downloads={downloads}
+              loading={loading}
+              onCancel={handleCancel}
+            />
+          </Box>
 
-            {/* Downloads List Section */}
-            <Box
-              sx={{
-                p: { xs: 2, sm: 2.5 },
-                mt: 2,
-                borderRadius: 1.5,
-                background: 'var(--bg-secondary)',
-                border: '1px solid var(--border-subtle)',
-                boxShadow: 'var(--shadow-sm)',
-              }}
-            >
-              <DownloadList
-                downloads={downloads}
-                loading={loading}
-                onCancel={handleCancelDownload}
-              />
-            </Box>
-          </Container>
+        </Container>
 
-          {/* Error Snackbar */}
-          <Snackbar
-            open={!!error}
-            autoHideDuration={6000}
-            onClose={handleCloseError}
-            anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
-          >
-            <Alert 
-              onClose={handleCloseError} 
-              severity="error" 
-              sx={{ 
-                width: '100%',
-                background: '#2d1b1b',
-                border: '1px solid #ff5252',
-                fontSize: '0.8125rem',
-              }}
+        {/* Cookie auth dialog */}
+        <CookieDialog
+          open={cookieOpen}
+          onClose={() => setCookieOpen(false)}
+          onSuccess={msg => showToast(msg)}
+        />
+
+        {/* Toast notifications */}
+        <Snackbar
+          open={!!toast}
+          autoHideDuration={5000}
+          onClose={hideToast}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        >
+          {toast && (
+            <Alert
+              onClose={hideToast}
+              severity={toast.sev}
+              sx={{ width: '100%' }}
             >
-              {error}
+              {toast.msg}
             </Alert>
-          </Snackbar>
-
-          {/* Success Snackbar */}
-          <Snackbar
-            open={!!successMessage}
-            autoHideDuration={3000}
-            onClose={handleCloseSuccess}
-            anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
-          >
-            <Alert 
-              onClose={handleCloseSuccess} 
-              severity="success" 
-              sx={{ 
-                width: '100%',
-                background: '#1b2d1b',
-                border: '1px solid #4caf50',
-                fontSize: '0.8125rem',
-              }}
-            >
-              {successMessage}
-            </Alert>
-          </Snackbar>
-
-          {/* Cookie Manager Dialog */}
-          <CookieManager
-            open={cookieManagerOpen}
-            onClose={handleCloseCookieManager}
-            onSave={handleCookiesSaved}
-          />
-        </Box>
-      </ThemeProvider>
-    </CustomThemeProvider>
+          )}
+        </Snackbar>
+      </Box>
+    </ThemeProvider>
   );
 }
 
-export default App;
+const cardSx = {
+  p: 2.5,
+  mt: 3,
+  borderRadius: 2,
+  bgcolor: '#1a1a24',
+  border: '1px solid rgba(255,255,255,0.07)',
+};

@@ -1,288 +1,191 @@
-import React from 'react';
+// frontend/src/components/DownloadItem.js
+import React, { memo } from 'react';
 import {
-  Box,
-  Typography,
-  LinearProgress,
-  Chip,
-  IconButton,
+  Box, Chip, IconButton, LinearProgress, Tooltip, Typography,
 } from '@mui/material';
-import CancelIcon from '@mui/icons-material/Cancel';
-import CheckCircleIcon from '@mui/icons-material/CheckCircle';
-import ErrorIcon from '@mui/icons-material/Error';
-import QueueIcon from '@mui/icons-material/Queue';
-import DownloadingIcon from '@mui/icons-material/Downloading';
-import AlbumIcon from '@mui/icons-material/Album';
-import AudiotrackIcon from '@mui/icons-material/Audiotrack';
-import PersonIcon from '@mui/icons-material/Person';
+import AlbumIcon        from '@mui/icons-material/Album';
+import AudiotrackIcon   from '@mui/icons-material/Audiotrack';
+import CancelIcon       from '@mui/icons-material/Cancel';
+import CheckCircleIcon  from '@mui/icons-material/CheckCircle';
+import DownloadingIcon  from '@mui/icons-material/Downloading';
+import ErrorIcon        from '@mui/icons-material/Error';
+import PersonIcon       from '@mui/icons-material/Person';
 import PlaylistPlayIcon from '@mui/icons-material/PlaylistPlay';
+import QueueIcon        from '@mui/icons-material/Queue';
 
-const getStatusColor = (status) => {
-  switch (status) {
-    case 'completed':
-      return '#10B981';
-    case 'failed':
-      return '#EF4444';
-    case 'downloading':
-      return 'var(--accent-primary)';
-    case 'queued':
-      return '#F59E0B';
-    case 'cancelled':
-      return '#6B7280';
-    default:
-      return 'var(--accent-primary)';
-  }
+// ── Colour / icon mappings ────────────────────────────────────────────────────
+
+const STATUS_COLOR = {
+  queued:      '#F59E0B',
+  downloading: '#8B5CF6',
+  processing:  '#8B5CF6',
+  completed:   '#10B981',
+  failed:      '#EF4444',
+  cancelled:   '#6B7280',
 };
 
-const getStatusIcon = (status) => {
-  const iconStyle = { fontSize: 14 };
-  switch (status) {
-    case 'completed':
-      return <CheckCircleIcon sx={iconStyle} />;
-    case 'failed':
-      return <ErrorIcon sx={iconStyle} />;
-    case 'downloading':
-      return <DownloadingIcon sx={iconStyle} />;
-    case 'queued':
-      return <QueueIcon sx={iconStyle} />;
-    default:
-      return null;
-  }
+const STATUS_ICON = {
+  queued:      <QueueIcon      sx={{ fontSize: 13 }} />,
+  downloading: <DownloadingIcon sx={{ fontSize: 13 }} />,
+  processing:  <DownloadingIcon sx={{ fontSize: 13 }} />,
+  completed:   <CheckCircleIcon sx={{ fontSize: 13 }} />,
+  failed:      <ErrorIcon       sx={{ fontSize: 13 }} />,
 };
 
-const getTypeIcon = (type) => {
-  const iconStyle = { fontSize: 16, color: 'var(--accent-primary)' };
-  switch (type) {
-    case 'album':
-      return <AlbumIcon sx={iconStyle} />;
-    case 'artist':
-      return <PersonIcon sx={iconStyle} />;
-    case 'playlist':
-      return <PlaylistPlayIcon sx={iconStyle} />;
-    case 'song':
-    default:
-      return <AudiotrackIcon sx={iconStyle} />;
-  }
+const TYPE_ICON = {
+  album:    <AlbumIcon        sx={{ fontSize: 17, color: '#8B5CF6' }} />,
+  artist:   <PersonIcon       sx={{ fontSize: 17, color: '#8B5CF6' }} />,
+  playlist: <PlaylistPlayIcon sx={{ fontSize: 17, color: '#8B5CF6' }} />,
+  song:     <AudiotrackIcon   sx={{ fontSize: 17, color: '#8B5CF6' }} />,
 };
 
-function DownloadItem({ download, onCancel }) {
-  const canCancel = download.status === 'queued' || download.status === 'downloading';
+// ── Component ─────────────────────────────────────────────────────────────────
 
-  const formatDate = (dateString) => {
-    if (!dateString) return '';
-    const date = new Date(dateString);
-    return date.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  };
+function DownloadItem({ download: d, onCancel }) {
+  const canCancel = d.status === 'queued' || d.status === 'downloading';
+  const color     = STATUS_COLOR[d.status] || '#8B5CF6';
+  const isActive  = d.status === 'downloading' || d.status === 'processing';
+
+  const trackLabel = d.total_tracks > 1
+    ? `${d.done_tracks ?? 0}/${d.total_tracks} tracks`
+    : null;
+
+  const dateStr = d.created_at
+    ? new Date(d.created_at).toLocaleString('en-AU', {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      })
+    : '';
 
   return (
-    <Box
-      sx={{
-        background: 'var(--bg-tertiary)',
-        border: '1px solid var(--border-subtle)',
-        borderRadius: 1,
-        p: 1.5,
-        transition: 'all 0.2s',
-        '&:hover': {
-          borderColor: 'var(--border-medium)',
-          background: 'var(--bg-elevated)',
-        },
-      }}
-    >
-      <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5 }}>
-        {/* Type Icon */}
-        <Box
-          sx={{
-            minWidth: 32,
-            width: 32,
-            height: 32,
-            borderRadius: 0.75,
-            background: 'rgba(139, 92, 246, 0.1)',
-            border: '1px solid rgba(139, 92, 246, 0.2)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            mt: 0.25,
-          }}
-        >
-          {getTypeIcon(download.type)}
+    <Box sx={{
+      p: 1.5,
+      borderRadius: 1.5,
+      bgcolor: '#252530',
+      border: '1px solid rgba(255,255,255,0.06)',
+      transition: 'border-color .2s',
+      '&:hover': { borderColor: 'rgba(255,255,255,0.12)' },
+    }}>
+      <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'flex-start' }}>
+
+        {/* Type icon pill */}
+        <Box sx={{
+          width: 34, height: 34, minWidth: 34, borderRadius: 1,
+          bgcolor: 'rgba(139,92,246,0.1)', border: '1px solid rgba(139,92,246,0.2)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          {TYPE_ICON[d.download_type] ?? TYPE_ICON.song}
         </Box>
 
         {/* Content */}
         <Box sx={{ flex: 1, minWidth: 0 }}>
-          {/* Title and Status Row */}
-          <Box
-            sx={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'flex-start',
-              gap: 1.5,
-              mb: 0.5,
-            }}
-          >
-            <Box sx={{ flex: 1, minWidth: 0 }}>
+
+          {/* Top row */}
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 1 }}>
+            <Box sx={{ minWidth: 0 }}>
               <Typography
-                variant="body1"
                 noWrap
-                sx={{
-                  color: 'var(--text-primary)',
-                  fontSize: '0.875rem',
-                  fontWeight: 500,
-                  mb: 0.25,
-                  lineHeight: 1.4,
-                }}
-                title={download.title}
+                sx={{ color: '#fff', fontWeight: 500, fontSize: '0.875rem', lineHeight: 1.4 }}
+                title={d.title}
               >
-                {download.title}
+                {d.title ?? 'Loading…'}
               </Typography>
               <Typography
-                variant="body2"
                 noWrap
-                sx={{
-                  color: 'var(--text-secondary)',
-                  fontSize: '0.75rem',
-                  lineHeight: 1.3,
-                }}
+                sx={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.75rem', lineHeight: 1.3 }}
               >
-                {download.artist}
-                {download.album !== 'Unknown Album' && ` • ${download.album}`}
+                {d.artist}
+                {d.album && d.album !== 'Unknown Album' ? ` · ${d.album}` : ''}
+                {trackLabel ? ` · ${trackLabel}` : ''}
               </Typography>
             </Box>
 
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+            {/* Status chip + cancel */}
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
               <Chip
-                icon={getStatusIcon(download.status)}
-                label={download.status.toUpperCase()}
+                icon={STATUS_ICON[d.status]}
+                label={d.status.toUpperCase()}
                 size="small"
                 sx={{
-                  height: 22,
-                  fontSize: '0.6875rem',
-                  fontWeight: 600,
-                  letterSpacing: '0.02em',
-                  color: getStatusColor(download.status),
-                  background: `${getStatusColor(download.status)}15`,
-                  border: `1px solid ${getStatusColor(download.status)}30`,
-                  '& .MuiChip-icon': {
-                    color: getStatusColor(download.status),
-                    marginLeft: '4px',
-                  },
+                  height: 22, fontSize: '0.65rem', fontWeight: 700,
+                  color: color,
+                  bgcolor: `${color}18`,
+                  border: `1px solid ${color}30`,
+                  '& .MuiChip-icon': { color, ml: '4px' },
                 }}
               />
               {canCancel && (
-                <IconButton
-                  onClick={() => onCancel(download.id)}
-                  size="small"
-                  sx={{
-                    width: 26,
-                    height: 26,
-                    color: '#EF4444',
-                    '&:hover': {
-                      background: 'rgba(239, 68, 68, 0.1)',
-                    },
-                  }}
-                >
-                  <CancelIcon sx={{ fontSize: 16 }} />
-                </IconButton>
+                <Tooltip title="Cancel">
+                  <IconButton
+                    size="small"
+                    onClick={() => onCancel(d.id)}
+                    sx={{
+                      width: 26, height: 26, color: '#EF4444',
+                      '&:hover': { bgcolor: 'rgba(239,68,68,0.1)' },
+                    }}
+                  >
+                    <CancelIcon sx={{ fontSize: 16 }} />
+                  </IconButton>
+                </Tooltip>
               )}
             </Box>
           </Box>
 
-          {/* Progress Bar */}
-          {(download.status === 'downloading' || download.status === 'queued') && (
+          {/* Progress bar */}
+          {isActive && (
             <Box sx={{ mt: 1 }}>
-              <Box
-                sx={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  mb: 0.5,
-                }}
-              >
-                <Typography variant="caption" sx={{ color: 'var(--text-tertiary)', fontSize: '0.6875rem' }}>
-                  {download.status === 'queued' ? 'Queued' : 'Downloading'}
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
+                <Typography sx={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.3)' }}>
+                  {d.status}
                 </Typography>
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: 'var(--accent-primary)',
-                    fontSize: '0.6875rem',
-                    fontWeight: 600,
-                  }}
-                >
-                  {download.progress.toFixed(1)}%
+                <Typography sx={{ fontSize: '0.65rem', color: '#8B5CF6', fontWeight: 600 }}>
+                  {d.progress.toFixed(1)}%
                 </Typography>
               </Box>
               <LinearProgress
                 variant="determinate"
-                value={download.progress}
+                value={d.progress}
                 sx={{
-                  height: 4,
-                  borderRadius: 2,
-                  background: 'rgba(255, 255, 255, 0.05)',
+                  height: 3, borderRadius: 2,
+                  bgcolor: 'rgba(255,255,255,0.06)',
                   '& .MuiLinearProgress-bar': {
                     borderRadius: 2,
-                    background: 'var(--accent-gradient)',
+                    background: 'linear-gradient(90deg, #8B5CF6, #6D28D9)',
                   },
                 }}
               />
             </Box>
           )}
 
-          {/* Error Message */}
-          {download.error_message && (
-            <Typography
-              variant="body2"
-              sx={{
-                mt: 1,
-                p: 1,
-                borderRadius: 0.75,
-                background: 'rgba(239, 68, 68, 0.1)',
-                border: '1px solid rgba(239, 68, 68, 0.2)',
-                color: '#EF4444',
-                fontSize: '0.75rem',
-                lineHeight: 1.4,
-              }}
-            >
-              {download.error_message}
-            </Typography>
+          {/* Error message */}
+          {d.error_message && (
+            <Box sx={{
+              mt: 1, p: 1, borderRadius: 1,
+              bgcolor: 'rgba(239,68,68,0.08)',
+              border: '1px solid rgba(239,68,68,0.2)',
+            }}>
+              <Typography sx={{ color: '#EF4444', fontSize: '0.72rem', lineHeight: 1.4 }}>
+                {d.error_message}
+              </Typography>
+            </Box>
           )}
 
-          {/* Metadata Row */}
-          <Box
-            sx={{
-              display: 'flex',
-              gap: 1.5,
-              mt: 1,
-              flexWrap: 'wrap',
-              alignItems: 'center',
-            }}
-          >
+          {/* Footer meta */}
+          <Box sx={{ display: 'flex', gap: 1.5, mt: 0.75, alignItems: 'center', flexWrap: 'wrap' }}>
             <Chip
-              label={download.type.toUpperCase()}
+              label={(d.download_type ?? 'song').toUpperCase()}
               size="small"
               sx={{
-                height: 18,
-                fontSize: '0.6875rem',
-                fontWeight: 500,
-                color: 'var(--text-tertiary)',
-                background: 'transparent',
-                border: '1px solid var(--border-medium)',
-                '& .MuiChip-label': {
-                  px: 0.75,
-                },
+                height: 18, fontSize: '0.6rem', fontWeight: 500,
+                color: 'rgba(255,255,255,0.35)',
+                bgcolor: 'transparent',
+                border: '1px solid rgba(255,255,255,0.12)',
+                '& .MuiChip-label': { px: 0.75 },
               }}
             />
-            <Typography variant="caption" sx={{ color: 'var(--text-tertiary)', fontSize: '0.6875rem' }}>
-              {formatDate(download.created_at)}
+            <Typography sx={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.25)' }}>
+              {dateStr}
             </Typography>
-            {download.status === 'completed' && download.updated_at && (
-              <Typography variant="caption" sx={{ color: '#10B981', fontSize: '0.6875rem' }}>
-                ✓ {formatDate(download.updated_at)}
-              </Typography>
-            )}
           </Box>
         </Box>
       </Box>
@@ -290,4 +193,4 @@ function DownloadItem({ download, onCancel }) {
   );
 }
 
-export default DownloadItem;
+export default memo(DownloadItem);

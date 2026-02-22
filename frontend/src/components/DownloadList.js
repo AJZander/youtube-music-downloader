@@ -1,43 +1,32 @@
+// frontend/src/components/DownloadList.js
 import React from 'react';
-import {
-  Box,
-  List,
-  CircularProgress,
-  Typography,
-} from '@mui/material';
+import { Box, CircularProgress, Typography } from '@mui/material';
 import DownloadItem from './DownloadItem';
 
-function DownloadList({ downloads, loading, onCancel }) {
+export default function DownloadList({ downloads, loading, onCancel }) {
   if (loading) {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}>
-        <CircularProgress size={32} sx={{ color: 'var(--accent-primary)' }} />
+        <CircularProgress size={28} sx={{ color: '#8B5CF6' }} />
       </Box>
     );
   }
 
-  if (downloads.length === 0) {
+  if (!downloads.length) {
     return (
       <Box sx={{ textAlign: 'center', py: 6 }}>
-        <Typography variant="body1" sx={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
-          No downloads yet
-        </Typography>
-        <Typography variant="body2" sx={{ color: 'var(--text-tertiary)', mt: 0.5, fontSize: '0.8125rem' }}>
-          Add a YouTube Music URL above to get started
+        <Typography sx={{ color: 'rgba(255,255,255,0.3)', fontSize: '0.875rem' }}>
+          No downloads yet — add a URL above to get started
         </Typography>
       </Box>
     );
   }
 
   return (
-    <List sx={{ width: '100%', p: 0 }}>
-      {downloads.map((download, index) => (
-        <Box key={download.id} sx={{ mb: index < downloads.length - 1 ? 1.5 : 0 }}>
-          <DownloadItem download={download} onCancel={onCancel} />
-        </Box>
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+      {downloads.map(d => (
+        <DownloadItem key={d.id} download={d} onCancel={onCancel} />
       ))}
-    </List>
+    </Box>
   );
 }
-
-export default DownloadList;

@@ -1,162 +1,111 @@
+// frontend/src/api.js
 import axios from 'axios';
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const WS   = process.env.REACT_APP_WS_URL  || 'ws://localhost:8000/ws';
 
-const api = axios.create({
-  baseURL: API_BASE_URL,
-  headers: {
-    'Content-Type': 'application/json',
-  },
+// Axios instance with sensible defaults
+const http = axios.create({
+  baseURL: BASE,
+  timeout: 30_000,
+  headers: { 'Content-Type': 'application/json' },
 });
 
-export const downloadAPI = {
-  // Create a new download
-  createDownload: async (url) => {
-    const response = await api.post('/downloads', { url });
-    return response.data;
-  },
+// ── REST helpers ──────────────────────────────────────────────────────────────
 
-  // Get all downloads
-  getDownloads: async (limit = 50, offset = 0) => {
-    const response = await api.get('/downloads', {
-      params: { limit, offset },
-    });
-    return response.data;
-  },
-
-  // Get a specific download
-  getDownload: async (id) => {
-    const response = await api.get(`/downloads/${id}`);
-    return response.data;
-  },
-
-  // Cancel a download
-  cancelDownload: async (id) => {
-    await api.delete(`/downloads/${id}`);
-  },
-
-  // Get active downloads
-  getActiveDownloads: async () => {
-    const response = await api.get('/downloads/status/active');
-    return response.data;
-  },
-
-  // Health check
-  healthCheck: async () => {
-    const response = await api.get('/health');
-    return response.data;
-  },
+export const api = {
+  createDownload: (url)  => http.post('/downloads', { url }).then(r => r.data),
+  getDownloads:   ()     => http.get('/downloads').then(r => r.data),
+  cancelDownload: (id)   => http.delete(`/downloads/${id}`),
+  getCookiesInfo: ()     => http.get('/cookies').then(r => r.data),
+  saveCookies:    (text) => http.post('/cookies', { cookies_content: text }).then(r => r.data),
+  deleteCookies:  ()     => http.delete('/cookies').then(r => r.data),
 };
 
-export class WebSocketService {
-  constructor(url) {
-    this.url = url || `ws://localhost:8000/ws`;
-    this.ws = null;
-    this.listeners = new Map();
-    this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 5;
-    this.reconnectDelay = 1000;
+// ── WebSocket service ─────────────────────────────────────────────────────────
+
+export class WSService {
+  constructor() {
+    this._url       = WS;
+    this._ws        = null;
+    this._handlers  = {};       // { eventType: [fn, ...] }
+    this._ping      = null;
+    this._retries   = 0;
+    this._maxRetry  = 8;
+    this._closed    = false;    // set true on intentional disconnect
   }
 
   connect() {
     return new Promise((resolve, reject) => {
       try {
-        this.ws = new WebSocket(this.url);
+        this._ws = new WebSocket(this._url);
 
-        this.ws.onopen = () => {
-          console.log('WebSocket connected');
-          this.reconnectAttempts = 0;
+        this._ws.onopen = () => {
+          this._retries = 0;
+          this._startPing();
           resolve();
         };
 
-        this.ws.onmessage = (event) => {
+        this._ws.onmessage = ({ data }) => {
           try {
-            const data = JSON.parse(event.data);
-            this.notifyListeners(data.type, data.data);
-          } catch (error) {
-            console.error('Failed to parse WebSocket message:', error);
-          }
+            const { type, data: payload } = JSON.parse(data);
+            (this._handlers[type] || []).forEach(fn => fn(payload));
+          } catch { /* ignore malformed frames */ }
         };
 
-        this.ws.onerror = (error) => {
-          console.error('WebSocket error:', error);
-          reject(error);
+        this._ws.onerror = () => {
+          reject(new Error('WebSocket connection error'));
         };
 
-        this.ws.onclose = () => {
-          console.log('WebSocket disconnected');
-          this.handleReconnect();
+        this._ws.onclose = () => {
+          this._stopPing();
+          if (!this._closed) this._scheduleReconnect();
         };
-      } catch (error) {
-        reject(error);
+      } catch (err) {
+        reject(err);
       }
     });
   }
 
-  handleReconnect() {
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      this.reconnectAttempts++;
-      console.log(`Reconnecting... Attempt ${this.reconnectAttempts}`);
-      setTimeout(() => {
-        this.connect().catch((error) => {
-          console.error('Reconnection failed:', error);
-        });
-      }, this.reconnectDelay * this.reconnectAttempts);
-    }
+  on(type, fn) {
+    (this._handlers[type] = this._handlers[type] || []).push(fn);
+    return () => this.off(type, fn); // returns unsubscribe fn
   }
 
-  on(eventType, callback) {
-    if (!this.listeners.has(eventType)) {
-      this.listeners.set(eventType, []);
-    }
-    this.listeners.get(eventType).push(callback);
-  }
-
-  off(eventType, callback) {
-    if (this.listeners.has(eventType)) {
-      const callbacks = this.listeners.get(eventType);
-      const index = callbacks.indexOf(callback);
-      if (index > -1) {
-        callbacks.splice(index, 1);
-      }
-    }
-  }
-
-  notifyListeners(eventType, data) {
-    if (this.listeners.has(eventType)) {
-      this.listeners.get(eventType).forEach((callback) => {
-        callback(data);
-      });
-    }
-  }
-
-  send(data) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-    }
+  off(type, fn) {
+    if (this._handlers[type])
+      this._handlers[type] = this._handlers[type].filter(f => f !== fn);
   }
 
   disconnect() {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+    this._closed = true;
+    this._stopPing();
+    if (this._ws) { this._ws.close(); this._ws = null; }
   }
 
-  // Ping to keep connection alive
-  startPing(interval = 30000) {
-    this.pingInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send('ping');
-      }
-    }, interval);
+  _startPing() {
+    this._stopPing();
+    // Heartbeat every 25 s to prevent proxy timeouts
+    this._ping = setInterval(() => {
+      if (this._ws?.readyState === WebSocket.OPEN) this._ws.send('ping');
+    }, 25_000);
   }
 
-  stopPing() {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
+  _stopPing() {
+    if (this._ping) { clearInterval(this._ping); this._ping = null; }
+  }
+
+  _scheduleReconnect() {
+    if (this._retries >= this._maxRetry) {
+      console.warn('WS: max reconnection attempts reached');
+      return;
     }
+    // Exponential back-off: 1s, 2s, 4s … capped at 30s
+    const delay = Math.min(1000 * 2 ** this._retries, 30_000);
+    this._retries++;
+    console.log(`WS: reconnecting in ${delay}ms (attempt ${this._retries})`);
+    setTimeout(() => {
+      this.connect().catch(() => { /* next onclose will schedule again */ });
+    }, delay);
   }
 }
-
-export default api;
