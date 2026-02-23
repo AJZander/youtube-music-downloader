@@ -51,6 +51,6 @@ docker compose up -d --build
 | `DOWNLOAD_DIR` | `/downloads` | Where files are saved |
 | `MAX_CONCURRENT_DOWNLOADS` | `3` | Parallel downloads |
 | `AUDIO_FORMAT` | `mp3` | `mp3 \| flac \| m4a \| opus` |
-| `AUDIO_QUALITY` | `320` | kbps (128/192/256/320) |
+| `AUDIO_QUALITY` | `0` | **Deprecated** - Audio is always downloaded at highest quality (0 = VBR best) |
 | `CORS_ORIGINS` | `*` | Restrict in production |
 | `DEBUG` | `false` | Verbose logging |

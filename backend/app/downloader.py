@@ -253,7 +253,8 @@ class DownloadManager:
                     # Extract audio and re-encode to target format
                     "key":              "FFmpegExtractAudio",
                     "preferredcodec":   settings.audio_format,
-                    "preferredquality": settings.audio_quality,
+                    # preferredquality=0 means "best" for lossy formats (VBR highest quality)
+                    "preferredquality": "0",
                     "nopostoverwrites": False,
                 },
                 {

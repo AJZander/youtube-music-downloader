@@ -20,8 +20,9 @@ class Settings(BaseSettings):
     max_concurrent_downloads: int = 3
     # mp3 | flac | m4a | opus | wav
     audio_format: str = "mp3"
-    # 128 | 192 | 256 | 320
-    audio_quality: str = "320"
+    # DEPRECATED: audio_quality is no longer used. Audio is always downloaded at
+    # the highest quality possible (VBR best quality for lossy formats).
+    audio_quality: str = "0"
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: Union[str, list[str]] = "*"
