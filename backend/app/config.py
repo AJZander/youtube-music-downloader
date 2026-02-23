@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     audio_format: str = "mp3"
     # DEPRECATED: audio_quality is no longer used. Audio is always downloaded at
     # the highest quality possible (VBR best quality for lossy formats).
-    audio_quality: str = "320"
+    audio_quality: str = "0"
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: Union[str, list[str]] = "*"
