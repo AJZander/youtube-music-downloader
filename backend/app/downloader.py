@@ -251,9 +251,10 @@ class DownloadManager:
             "postprocessors": [
                 {
                     # Extract audio and re-encode to target format
+                    # preferredquality=0 means "best" for lossy formats (VBR highest quality)
                     "key":              "FFmpegExtractAudio",
                     "preferredcodec":   settings.audio_format,
-                    "preferredquality": settings.audio_quality,
+                    "preferredquality": "0",
                     "nopostoverwrites": False,
                 },
                 {
