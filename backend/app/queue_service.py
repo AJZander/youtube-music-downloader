@@ -151,8 +151,12 @@ class QueueService:
                 await self._broadcast(download)
 
             try:
+                # Use the stored format_id
+                format_id = download.format_id or "bestaudio/best"
+                
                 result = await download_manager.download(
                     download.url,
+                    format_id=format_id,
                     on_progress=on_progress,
                     on_status=on_status,
                 )

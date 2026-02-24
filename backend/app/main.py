@@ -12,12 +12,14 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.cookies_manager import cookies_manager
 from app.database import AsyncSessionLocal, get_session, init_db
 from app.downloader import download_manager
 from app.models import Download, DownloadStatus
 from app.queue_service import queue_service
-from app.schemas import CookieUpload, DownloadCreate, DownloadResponse, ErrorDetail
+from app.schemas import (
+    DownloadCreate, DownloadResponse,
+    FormatListResponse, ErrorDetail
+)
 
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
@@ -38,8 +40,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="2.0.0",
-    description="Production-grade YouTube Music downloader API",
+    version="2.1.0",
+    description="Production-grade YouTube Music downloader API with interactive format selection",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url=None,
@@ -56,12 +58,33 @@ app.add_middleware(
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"app": settings.app_name, "status": "ok", "version": "2.0.0"}
+    return {"app": settings.app_name, "status": "ok", "version": "2.1.0"}
 
 
 @app.get("/health", tags=["Health"])
 async def health():
     return {"status": "healthy", "ts": datetime.utcnow().isoformat()}
+
+
+@app.post(
+    "/formats",
+    response_model=FormatListResponse,
+    tags=["Downloads"],
+)
+async def get_available_formats(body: DownloadCreate):
+    """
+    Get available formats for a URL before downloading.
+    Shows user what audio/video options are available.
+    """
+    try:
+        formats_info = await download_manager.get_formats(body.url)
+        return formats_info
+    except Exception as exc:
+        logger.error("get_formats failed for %s: %s", body.url, exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Could not extract formats from URL: {exc}",
+        )
 
 
 @app.post(
@@ -74,6 +97,10 @@ async def create_download(
     body: DownloadCreate,
     session: AsyncSession = Depends(get_session),
 ):
+    """
+    Create a new download job.
+    If format_id is not provided, uses 'bestaudio/best' (auto-select).
+    """
     try:
         info = await download_manager.get_info(body.url)
     except Exception as exc:
@@ -82,6 +109,9 @@ async def create_download(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Could not read metadata from URL: {exc}",
         )
+
+    # Store the selected format
+    format_id = body.format_id or "bestaudio/best"
 
     dl = Download(
         url           = body.url,
@@ -92,13 +122,14 @@ async def create_download(
         total_tracks  = info.get("total_tracks"),
         status        = DownloadStatus.QUEUED,
         progress      = 0.0,
+        format_id     = format_id,  # Store selected format
     )
     session.add(dl)
     await session.commit()
     await session.refresh(dl)
 
     await queue_service.enqueue(dl.id)
-    logger.info("Queued download %d — %s", dl.id, body.url)
+    logger.info("Queued download %d — %s (format: %s)", dl.id, body.url, format_id)
     return dl.to_dict()
 
 
@@ -158,30 +189,6 @@ async def active_downloads(session: AsyncSession = Depends(get_session)):
         .order_by(Download.created_at)
     )
     return [d.to_dict() for d in rows.scalars()]
-
-
-@app.get("/cookies", tags=["Auth"])
-async def cookies_info():
-    return cookies_manager.info()
-
-
-@app.post("/cookies", tags=["Auth"])
-async def upload_cookies(body: CookieUpload):
-    try:
-        cookies_manager.save_cookies(body.cookies_content)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return {
-        "ok": True, 
-        "message": "Cookies saved. Age-restricted content and premium features are now enabled. "
-                  "Note: Cookies must be from an authenticated YouTube/Google session."
-    }
-
-
-@app.delete("/cookies", tags=["Auth"])
-async def delete_cookies():
-    deleted = cookies_manager.delete_cookies()
-    return {"ok": deleted, "message": "Deleted" if deleted else "No cookies to delete"}
 
 
 @app.websocket("/ws")

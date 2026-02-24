@@ -36,6 +36,8 @@ class Download(Base):
     # Total tracks for playlist/album display
     total_tracks  = Column(Integer,      nullable=True)
     done_tracks   = Column(Integer,      nullable=True, default=0)
+    # User-selected format ID
+    format_id     = Column(String(128),  nullable=True, default="bestaudio/best")
     created_at    = Column(DateTime,     default=datetime.utcnow)
     updated_at    = Column(DateTime,     default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -53,6 +55,7 @@ class Download(Base):
             "file_path":     self.file_path,
             "total_tracks":  self.total_tracks,
             "done_tracks":   self.done_tracks,
+            "format_id":     self.format_id,
             "created_at":    self.created_at.isoformat() if self.created_at else None,
             "updated_at":    self.updated_at.isoformat() if self.updated_at else None,
         }

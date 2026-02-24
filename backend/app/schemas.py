@@ -9,6 +9,7 @@ from app.utils import is_valid_youtube_url
 
 class DownloadCreate(BaseModel):
     url: str
+    format_id: Optional[str] = None  # If not provided, uses "bestaudio/best"
 
     @field_validator("url")
     @classmethod
@@ -34,6 +35,7 @@ class DownloadResponse(BaseModel):
     file_path:     Optional[str]
     total_tracks:  Optional[int]
     done_tracks:   Optional[int]
+    format_id:     Optional[str]
     created_at:    Optional[datetime]
     updated_at:    Optional[datetime]
 
@@ -41,22 +43,36 @@ class DownloadResponse(BaseModel):
         from_attributes = True
 
 
-class CookieUpload(BaseModel):
-    cookies_content: str
+class FormatOption(BaseModel):
+    """Single format option for user selection."""
+    format_id: str
+    label: str
+    description: str
+    ext: Optional[str] = None
+    codec: Optional[str] = None
+    bitrate: Optional[int] = None
+    filesize_mb: Optional[float] = None
+    recommended: bool = False
+    has_video: bool = False
+    note: Optional[str] = None  # e.g., "authenticated"
 
-    @field_validator("cookies_content")
-    @classmethod
-    def validate_netscape_format(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Cookie content must not be empty")
-        # Netscape cookie files must start with this magic comment
-        if not v.startswith("# Netscape HTTP Cookie File") and not v.startswith("# HTTP Cookie File"):
-            raise ValueError(
-                "Cookies must be in Netscape format. "
-                "The file should start with '# Netscape HTTP Cookie File'."
-            )
-        return v
+
+class FormatMetadata(BaseModel):
+    """Video/playlist metadata."""
+    title: str
+    artist: str
+    folder_artist: str
+    album: str
+    download_type: str
+    total_tracks: int
+
+
+class FormatListResponse(BaseModel):
+    """Response containing available formats and metadata."""
+    formats: list[FormatOption]
+    metadata: FormatMetadata
+    has_video: bool
+    is_playlist: bool
 
 
 class ErrorDetail(BaseModel):

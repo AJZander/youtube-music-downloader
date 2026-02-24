@@ -1,26 +1,11 @@
 // frontend/src/components/Header.js
 import React from 'react';
-import { Box, IconButton, Tooltip, Typography } from '@mui/material';
+import { Box, Typography } from '@mui/material';
 import MusicNoteIcon from '@mui/icons-material/MusicNote';
-import VpnKeyIcon    from '@mui/icons-material/VpnKey';
 
-export default function Header({ onAuthClick }) {
+export default function Header() {
   return (
     <Box sx={{ textAlign: 'center', position: 'relative', py: 2 }}>
-
-      {/* Auth button — top-right */}
-      <Tooltip title="YouTube authentication (age-restricted content)">
-        <IconButton
-          onClick={onAuthClick}
-          sx={{
-            position: 'absolute', top: 8, right: 0,
-            color: 'rgba(255,255,255,0.4)',
-            '&:hover': { color: '#8B5CF6', bgcolor: 'rgba(139,92,246,0.1)' },
-          }}
-        >
-          <VpnKeyIcon />
-        </IconButton>
-      </Tooltip>
 
       {/* Logo + title */}
       <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 1.5, mb: 0.5 }}>

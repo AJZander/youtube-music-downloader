@@ -14,21 +14,6 @@ services:
       - ../plex/media/Music:/downloads
       # Persistent database and cookie storage
       - backend-data:/app/data
-    environment:
-      - DOWNLOAD_DIR=/downloads
-      - DATABASE_URL=sqlite+aiosqlite:////app/data/downloads.db
-      - MAX_CONCURRENT_DOWNLOADS=1
-      - AUDIO_FORMAT=best
-      - MP3_QUALITY=320
-      - DOWNLOAD_INTERVAL_SECONDS=5
-      - RATE_LIMIT_BACKOFF_SECONDS=300
-      - MAX_RATE_LIMIT_RETRIES=3
-      - USER_AGENT=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0
-      - DEBUG=false
-      - CORS_ORIGINS=*
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
-      - REQUESTS_CA_BUNDLE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
     networks:
       - ytm-network
     healthcheck:
