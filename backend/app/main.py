@@ -26,8 +26,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up…")
@@ -37,8 +35,6 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down…")
     await queue_service.stop()
 
-
-# ── App factory ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title=settings.app_name,
@@ -58,8 +54,6 @@ app.add_middleware(
 )
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
-
 @app.get("/", tags=["Health"])
 async def root():
     return {"app": settings.app_name, "status": "ok", "version": "2.0.0"}
@@ -69,8 +63,6 @@ async def root():
 async def health():
     return {"status": "healthy", "ts": datetime.utcnow().isoformat()}
 
-
-# ── Downloads ─────────────────────────────────────────────────────────────────
 
 @app.post(
     "/downloads",
@@ -82,10 +74,6 @@ async def create_download(
     body: DownloadCreate,
     session: AsyncSession = Depends(get_session),
 ):
-    """
-    Validate the URL, extract lightweight metadata, persist a Download
-    record, and enqueue it for processing.
-    """
     try:
         info = await download_manager.get_info(body.url)
     except Exception as exc:
@@ -172,25 +160,22 @@ async def active_downloads(session: AsyncSession = Depends(get_session)):
     return [d.to_dict() for d in rows.scalars()]
 
 
-# ── Cookies / Authentication ──────────────────────────────────────────────────
-
 @app.get("/cookies", tags=["Auth"])
 async def cookies_info():
-    """Returns whether cookies are configured and their last-modified date."""
     return cookies_manager.info()
 
 
 @app.post("/cookies", tags=["Auth"])
 async def upload_cookies(body: CookieUpload):
-    """
-    Accept Netscape-format cookie content and persist it to the data volume.
-    Validation is done in the Pydantic schema (CookieUpload).
-    """
     try:
         cookies_manager.save_cookies(body.cookies_content)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return {"ok": True, "message": "Cookies saved. Age-restricted downloads are now enabled."}
+    return {
+        "ok": True, 
+        "message": "Cookies saved. Age-restricted content and premium features are now enabled. "
+                  "Note: Cookies must be from an authenticated YouTube/Google session."
+    }
 
 
 @app.delete("/cookies", tags=["Auth"])
@@ -199,14 +184,11 @@ async def delete_cookies():
     return {"ok": deleted, "message": "Deleted" if deleted else "No cookies to delete"}
 
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
-
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     queue_service.register_ws(ws)
     try:
-        # Send current snapshot on connect
         async with AsyncSessionLocal() as session:
             rows = await session.execute(
                 select(Download).order_by(desc(Download.created_at)).limit(50)
@@ -216,7 +198,6 @@ async def ws_endpoint(ws: WebSocket):
                 "data": [d.to_dict() for d in rows.scalars()],
             })
 
-        # Keep alive — handle client pings
         while True:
             msg = await ws.receive_text()
             if msg == "ping":
