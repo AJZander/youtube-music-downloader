@@ -63,30 +63,30 @@ class DownloadManager:
 
         # Step 2: Get specific formats
         sample_url = url
-            
-            if basic_info.get("_type") == "playlist":
-                entries = basic_info.get("entries", [])
-                valid_entries = [e for e in entries if e and e.get("url")]
-                
-                if valid_entries:
-                    first_entry = valid_entries[0]
-                    sample_url = first_entry.get("url") or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
-                    logger.info("Using sample video for format extraction: %s", sample_url)
 
-            # Extract formats from sample
-            format_opts = self._get_base_ydl_opts()
-            format_opts.update({
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "no_download": True,
-                "simulate": True,
-                "format": "bestaudio/best",
-            })
+        if basic_info.get("_type") == "playlist":
+            entries = basic_info.get("entries", [])
+            valid_entries = [e for e in entries if e and e.get("url")]
 
-            def _get_format_info():
-                with yt_dlp.YoutubeDL(format_opts) as ydl:
-                    return ydl.extract_info(sample_url, download=False)
+            if valid_entries:
+                first_entry = valid_entries[0]
+                sample_url = first_entry.get("url") or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
+                logger.info("Using sample video for format extraction: %s", sample_url)
+
+        # Extract formats from sample
+        format_opts = self._get_base_ydl_opts()
+        format_opts.update({
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "no_download": True,
+            "simulate": True,
+            "format": "bestaudio/best",
+        })
+
+        def _get_format_info():
+            with yt_dlp.YoutubeDL(format_opts) as ydl:
+                return ydl.extract_info(sample_url, download=False)
 
         try:
             format_info = await loop.run_in_executor(None, _get_format_info)
