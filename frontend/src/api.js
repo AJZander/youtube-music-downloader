@@ -21,8 +21,33 @@ export const api = {
 	createDownload: (url, format_id = null) =>
 		http.post('/downloads', { url, format_id }).then(r => r.data),
 
-	getDownloads: () => http.get('/downloads').then(r => r.data),
+	// List downloads — all optional: status filter, search term, limit, offset
+	getDownloads: ({ status, search, limit = 500, offset = 0 } = {}) => {
+		const params = { limit, offset };
+		if (status)  params.status = status;
+		if (search)  params.search = search;
+		return http.get('/downloads', { params }).then(r => r.data);
+	},
+
+	// Per-status counts
+	getStats: () => http.get('/downloads/stats').then(r => r.data),
+
+	// Cancel a single queued/downloading item
 	cancelDownload: (id) => http.delete(`/downloads/${id}`),
+
+	// Retry a failed or cancelled item
+	retryDownload: (id) => http.post(`/downloads/${id}/retry`).then(r => r.data),
+
+	// Bulk-delete all downloads with a given status
+	bulkDelete: (statusValue) =>
+		http.delete('/downloads', { params: { status: statusValue } }),
+
+	// ── Channel Import ──────────────────────────────────────────────────────────
+	getChannelPlaylists: (url) =>
+		http.post('/channel/playlists', { url }).then(r => r.data),
+
+	queueChannelPlaylists: (playlists) =>
+		http.post('/channel/queue-all', { playlists }).then(r => r.data),
 };
 
 // ── WebSocket service ─────────────────────────────────────────────────────────

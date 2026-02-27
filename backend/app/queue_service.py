@@ -28,8 +28,41 @@ class QueueService:
             return
         self._running = True
         self._worker  = asyncio.create_task(self._loop(), name="queue-worker")
-        logger.info("Queue service started (max_concurrent=%d, rate_limit=%ds)", 
+        logger.info("Queue service started (max_concurrent=%d, rate_limit=%ds)",
                    self._max, settings.download_interval_seconds)
+        await self._resume_interrupted()
+
+    async def _resume_interrupted(self) -> None:
+        """
+        On startup, find any rows that were left in QUEUED or DOWNLOADING state
+        from a previous run and re-enqueue them so they are not silently lost.
+        Rows stuck as DOWNLOADING are reset to QUEUED first (the previous worker
+        died mid-transfer, so progress is unknown).
+        """
+        async with AsyncSessionLocal() as session:
+            # Reset stuck DOWNLOADING rows back to QUEUED
+            await session.execute(
+                update(Download)
+                .where(Download.status == DownloadStatus.DOWNLOADING)
+                .values(status=DownloadStatus.QUEUED, progress=0.0,
+                        updated_at=datetime.utcnow())
+            )
+            await session.commit()
+
+            # Load all QUEUED rows ordered oldest-first
+            result = await session.execute(
+                select(Download)
+                .where(Download.status == DownloadStatus.QUEUED)
+                .order_by(Download.created_at)
+            )
+            pending = result.scalars().all()
+
+        if pending:
+            logger.info("Resuming %d pending download(s) from previous session", len(pending))
+            for dl in pending:
+                await self._queue.put(dl.id)
+        else:
+            logger.info("No pending downloads to resume")
 
     async def stop(self) -> None:
         self._running = False
@@ -126,6 +159,11 @@ class QueueService:
             download = await session.get(Download, download_id)
             if not download:
                 logger.error("Download %d not found in DB", download_id)
+                return
+
+            # Item may have been cancelled while sitting in the in-memory queue
+            if download.status == DownloadStatus.CANCELLED:
+                logger.info("Download %d was cancelled before it started — skipping", download_id)
                 return
 
             download.status    = DownloadStatus.DOWNLOADING

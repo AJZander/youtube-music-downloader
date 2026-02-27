@@ -11,6 +11,10 @@ body {
   color: #fff;
   -webkit-font-smoothing: antialiased;
   min-height: 100vh;
+  /* Prevent text size adjustment on mobile */
+  -webkit-text-size-adjust: 100%;
+  /* Smooth scrolling */
+  scroll-behavior: smooth;
 }
 
 /* Thin, subtle scrollbars */
@@ -18,3 +22,25 @@ body {
 ::-webkit-scrollbar-track  { background: #1a1a24; }
 ::-webkit-scrollbar-thumb  { background: #252530; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+
+/* Mobile touch improvements */
+@media (max-width: 600px) {
+  /* Prevent horizontal scrolling */
+  html, body {
+    overflow-x: hidden;
+  }
+  
+  /* Improve touch targets */
+  button, a, input, select, textarea {
+    min-height: 44px;
+  }
+  
+  /* Reduce motion for mobile */
+  @media (prefers-reduced-motion: reduce) {
+    * {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

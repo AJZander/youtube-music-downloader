@@ -25,7 +25,7 @@ export default function DownloadForm({ onSubmit }) {
     <Box
       component="form"
       onSubmit={handleSubmit}
-      sx={{ display: 'flex', gap: 1.5, alignItems: 'center' }}
+      sx={{ display: 'flex', gap: { xs: 1, sm: 1.5 }, alignItems: 'center', flexDirection: { xs: 'column', sm: 'row' } }}
     >
       <TextField
         fullWidth
@@ -50,6 +50,7 @@ export default function DownloadForm({ onSubmit }) {
           },
           '& input': {
             color: '#fff',
+            fontSize: { xs: '0.875rem', sm: '1rem' },
             '&::placeholder': { color: 'rgba(255,255,255,0.3)', opacity: 1 },
           },
         }}
@@ -59,9 +60,10 @@ export default function DownloadForm({ onSubmit }) {
         type="submit"
         variant="contained"
         disabled={loading || !url.trim()}
+        fullWidth={false}
         startIcon={<DownloadIcon sx={{ fontSize: 18 }} />}
         sx={{
-          minWidth: 120,
+          minWidth: { xs: '100%', sm: 120 },
           height: 40,
           textTransform: 'none',
           fontWeight: 600,

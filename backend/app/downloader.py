@@ -214,6 +214,206 @@ class DownloadManager:
 
         return recommendations
 
+    async def get_channel_playlists(self, url: str) -> list[dict]:
+        """
+        Extract all albums AND playlists from a YouTube channel.
+        Accepts any channel URL (/@Artist, /c/Name, /channel/UCxxx).
+
+        YouTube Music artist channels keep albums/singles under the /releases tab
+        and user-created playlists under /playlists.  We scan BOTH tabs and merge
+        the results so nothing is missed.
+
+        Returns a list of playlist dicts with id, title, url, thumbnail, track_count.
+        """
+        import re as _re
+
+        # Strip any existing tab suffix to get the bare channel root
+        clean = url.rstrip("/")
+        clean = _re.sub(
+            r"/(videos|shorts|streams|about|community|featured|store|playlists|releases)$",
+            "",
+            clean,
+        )
+
+        # Tabs to scan – 'releases' is where YouTube Music albums/singles live;
+        # 'playlists' holds user-created collections.
+        tabs_to_scan = [
+            ("releases", clean + "/releases"),
+        ]
+
+        opts = self._get_base_ydl_opts()
+        opts.update({
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",  # Get playlist metadata including track counts
+            "skip_download": True,
+        })
+
+        loop = asyncio.get_event_loop()
+
+        def _run(tab_url: str):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(tab_url, download=False)
+
+        channel_name: str | None = None
+        channel_url_out: str | None = None
+        seen_ids: set[str] = set()
+        playlists: list[dict] = []
+
+        for tab_name, tab_url in tabs_to_scan:
+            try:
+                raw = await loop.run_in_executor(None, _run, tab_url)
+            except Exception as exc:
+                logger.warning(
+                    "Could not scan %s tab (%s): %s — skipping", tab_name, tab_url, exc
+                )
+                continue
+
+            if not raw:
+                continue
+
+            # Capture channel identity from whichever tab responds first
+            if not channel_name:
+                channel_name = raw.get("channel") or raw.get("uploader") or raw.get("title")
+                channel_url_out = raw.get("channel_url") or raw.get("uploader_url")
+
+            entries = raw.get("entries") or []
+            tab_count = 0
+
+            for entry in entries:
+                if not entry:
+                    continue
+
+                playlist_id = entry.get("id") or entry.get("playlist_id")
+                entry_url = entry.get("url") or entry.get("webpage_url")
+                if not entry_url and playlist_id:
+                    entry_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+                if not entry_url:
+                    continue
+
+                # Deduplicate across tabs
+                dedup_key = playlist_id or entry_url
+                if dedup_key in seen_ids:
+                    continue
+                seen_ids.add(dedup_key)
+
+                # Log first entry to see what data we have available
+                if tab_count == 0:
+                    logger.info(
+                        "First entry fields: %s",
+                        {k: v for k, v in entry.items() if k not in ("entries", "thumbnails")}
+                    )
+
+                # Best thumbnail
+                thumb = None
+                thumbnails = entry.get("thumbnails")
+                if thumbnails and isinstance(thumbnails, list):
+                    thumb = thumbnails[-1].get("url")
+                if not thumb:
+                    thumb = entry.get("thumbnail")
+
+                # Try multiple fields to get track count
+                track_count = (
+                    entry.get("playlist_count") or
+                    entry.get("n_entries") or
+                    entry.get("entry_count") or
+                    entry.get("video_count") or
+                    entry.get("track_count")
+                )
+                
+                # If still no track count and entries list is available, use its length
+                if track_count is None:
+                    entry_entries = entry.get("entries")
+                    if entry_entries and isinstance(entry_entries, list):
+                        track_count = len(entry_entries)
+                
+                title = entry.get("title") or "Unknown Playlist"
+                release_type = self._classify_release_type(
+                    entry, tab_name, title, track_count
+                )
+
+                playlists.append({
+                    "id": playlist_id,
+                    "title": title,
+                    "url": entry_url,
+                    "thumbnail": thumb,
+                    "track_count": track_count,
+                    "channel": channel_name,
+                    "channel_url": channel_url_out,
+                    "source_tab": tab_name,
+                    "release_type": release_type,
+                })
+                tab_count += 1
+
+            logger.info(
+                "Tab '%s': found %d new entries (total so far: %d)",
+                tab_name, tab_count, len(playlists),
+            )
+
+        if channel_name is None and not playlists:
+            raise RuntimeError(
+                "Could not access any channel tabs. "
+                "Check that the URL is a valid YouTube channel."
+            )
+
+        logger.info(
+            "Found %d total entries (albums + playlists) on channel %s",
+            len(playlists), channel_name or url,
+        )
+        return playlists
+
+    @staticmethod
+    def _classify_release_type(
+        entry: dict,
+        tab_name: str,
+        title: str,
+        track_count: int | None,
+    ) -> str:
+        """
+        Determine whether a release is an album or single based on track count.
+
+        Priority:
+        1. Explicit field from yt-dlp  (newer builds populate release_type)
+        2. YouTube Music title suffixes (" - Single", " - EP", " - Album")
+        3. Track-count heuristic        (< 5 tracks → single, >= 5 → album)
+        4. Conservative default         (releases tab → album, other → playlist)
+        """
+        import re as _re
+
+        # Non-release tabs are just playlists
+        if tab_name != "releases":
+            return "playlist"
+
+        # 1. Explicit field (e.g. "Album", "EP", "Single")
+        explicit = (
+            entry.get("release_type")
+            or entry.get("album_type")
+            or entry.get("playlist_type")
+        )
+        if explicit:
+            norm = str(explicit).lower().strip()
+            # Treat EP as album
+            if norm == "album" or norm == "ep":
+                return "album"
+            if norm == "single":
+                return "single"
+
+        # 2. Title suffix patterns used by YouTube Music
+        lower = title.lower()
+        if _re.search(r"[-–]\s*single\s*$", lower):
+            return "single"
+        if _re.search(r"[-–]\s*(ep|album)\s*$", lower):
+            return "album"
+
+        # 3. Track-count heuristic: < 5 tracks = single, >= 5 = album
+        if track_count is not None:
+            if track_count < 5:
+                return "single"
+            return "album"
+
+        # 4. Default for releases tab
+        return "album"
+
     async def get_info(self, url: str) -> dict:
         """Extract metadata without downloading."""
         opts = self._get_base_ydl_opts()

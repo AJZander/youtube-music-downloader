@@ -77,3 +77,65 @@ class FormatListResponse(BaseModel):
 
 class ErrorDetail(BaseModel):
     detail: str
+
+
+# ── Channel / playlist-import schemas ─────────────────────────────────────────
+
+class ChannelRequest(BaseModel):
+    """Request body for channel playlist discovery."""
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("URL must not be empty")
+        if not is_valid_youtube_url(v):
+            raise ValueError("Only YouTube / YouTube Music URLs are accepted")
+        return v
+
+
+class PlaylistInfo(BaseModel):
+    """Metadata for a single playlist discovered on a channel."""
+    id: Optional[str] = None
+    title: str
+    url: str
+    thumbnail: Optional[str] = None
+    track_count: Optional[int] = None
+    channel: Optional[str] = None
+    channel_url: Optional[str] = None
+    source_tab: Optional[str] = None
+    # Classified release type: album | ep | single | playlist
+    release_type: Optional[str] = None
+    # 'releases' = albums/singles tab, 'playlists' = playlists tab
+    source_tab: Optional[str] = None
+
+
+class ChannelPlaylistsResponse(BaseModel):
+    """All playlists found on a channel."""
+    playlists: list[PlaylistInfo]
+    channel: Optional[str] = None
+    total: int
+
+
+class ChannelQueueRequest(BaseModel):
+    """Request body to queue a set of playlists for download."""
+    playlists: list[PlaylistInfo]
+
+
+class ChannelQueueResponse(BaseModel):
+    """Result of bulk-queuing channel playlists."""
+    queued: int
+    download_ids: list[int]
+
+
+class StatsResponse(BaseModel):
+    """Per-status counts for the dashboard."""
+    queued: int = 0
+    downloading: int = 0
+    processing: int = 0
+    completed: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    total: int = 0
