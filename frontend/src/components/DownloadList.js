@@ -145,7 +145,9 @@ function Paginator({ page, totalPages, pageSize, onPage, onPageSize, totalItems 
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function DownloadList({ downloads, loading, onCancel, onRetry, onBulkDelete, onRetryAll }) {
+export default function DownloadList({ 
+  downloads, loading, pagination, onCancel, onRetry, onBulkDelete, onRetryAll, onLoadMore 
+}) {
   const [tab,      setTab]      = useState('all');
   const [search,   setSearch]   = useState('');
   const [page,     setPage]     = useState(1);
@@ -352,6 +354,47 @@ export default function DownloadList({ downloads, loading, onCancel, onRetry, on
             onPage={setPage}
             onPageSize={setPageSize}
           />
+
+          {/* Load More button for backend pagination */}
+          {pagination?.hasMore && (
+            <Box sx={{ 
+              display: 'flex', 
+              justifyContent: 'center', 
+              mt: 2,
+              pt: 2,
+              borderTop: '1px solid rgba(255,255,255,0.07)' 
+            }}>
+              <Button
+                variant="outlined"
+                onClick={onLoadMore}
+                disabled={loading}
+                sx={{
+                  textTransform: 'none',
+                  color: 'rgba(255,255,255,0.7)',
+                  borderColor: 'rgba(255,255,255,0.2)',
+                  '&:hover': {
+                    borderColor: '#8B5CF6',
+                    color: '#A78BFA',
+                  }
+                }}
+              >
+                {loading ? 'Loading...' : `Load More (${pagination.total - downloads.length} remaining)`}
+              </Button>
+            </Box>
+          )}
+
+          {/* Total count info */}
+          {pagination?.total && (
+            <Box sx={{ 
+              textAlign: 'center', 
+              mt: 1,
+              pt: 1,
+            }}>
+              <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.3)' }}>
+                Showing {downloads.length} of {pagination.total} total downloads
+              </Typography>
+            </Box>
+          )}
         </>
       )}
     </Box>

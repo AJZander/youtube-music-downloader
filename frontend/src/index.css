@@ -5,34 +5,113 @@
   box-sizing: border-box;
 }
 
+html {
+  overflow-x: hidden;
+  width: 100%;
+}
+
 body {
   font-family: "Inter", "Segoe UI", system-ui, sans-serif;
   background: #0f0f1a;
   color: #fff;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   min-height: 100vh;
-  /* Prevent text size adjustment on mobile */
   -webkit-text-size-adjust: 100%;
-  /* Smooth scrolling */
   scroll-behavior: smooth;
+  overflow-x: hidden;
+  width: 100%;
+  position: relative;
+}
+
+/* Animated gradient background (subtle) */
+@keyframes gradientShift {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
 }
 
 /* Thin, subtle scrollbars */
-::-webkit-scrollbar        { width: 6px; height: 6px; }
+::-webkit-scrollbar        { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track  { background: #1a1a24; }
-::-webkit-scrollbar-thumb  { background: #252530; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+::-webkit-scrollbar-thumb  { 
+  background: linear-gradient(180deg, #8B5CF6 0%, #EC4899 100%);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { 
+  background: linear-gradient(180deg, #A78BFA 0%, #F472B6 100%);
+}
+
+/* Selection color */
+::selection {
+  background: rgba(139, 92, 246, 0.3);
+  color: #fff;
+}
+
+/* Focus visible styles */
+*:focus-visible {
+  outline: 2px solid #8B5CF6;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Smooth transitions for interactive elements */
+button, a, input, select, textarea {
+  transition: all 0.2s ease;
+}
+
+/* Fade-in animation for page load */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+#root {
+  animation: fadeIn 0.5s ease-out;
+}
 
 /* Mobile touch improvements */
 @media (max-width: 600px) {
   /* Prevent horizontal scrolling */
   html, body {
     overflow-x: hidden;
+    max-width: 100vw;
   }
   
-  /* Improve touch targets */
-  button, a, input, select, textarea {
+  /* Improve touch targets - ensure minimum 44x44px */
+  button:not(.MuiIconButton-root), 
+  a:not(.MuiIconButton-root), 
+  input, 
+  select, 
+  textarea {
     min-height: 44px;
+  }
+  
+  /* Make icon buttons touch-friendly */
+  .MuiIconButton-root {
+    padding: 12px;
+  }
+  
+  /* Better spacing for mobile */
+  .MuiCard-root {
+    border-radius: 12px !important;
+  }
+  
+  /* Improve tap highlight */
+  button, a {
+    -webkit-tap-highlight-color: rgba(139, 92, 246, 0.2);
   }
   
   /* Reduce motion for mobile */
@@ -43,4 +122,37 @@ body {
       transition-duration: 0.01ms !important;
     }
   }
+}
+
+/* Tablet improvements */
+@media (min-width: 601px) and (max-width: 960px) {
+  /* Optimize for touch on tablets */
+  button, a {
+    -webkit-tap-highlight-color: rgba(139, 92, 246, 0.2);
+  }
+}
+
+/* Loading spinner */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-spinner {
+  animation: spin 1s linear infinite;
+}
+
+/* Pulse animation for badges */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.badge-pulse {
+  animation: pulse 2s ease-in-out infinite;
 }

@@ -214,6 +214,76 @@ class DownloadManager:
 
         return recommendations
 
+    async def get_playlist_full_metadata(self, playlist_url: str) -> dict:
+        """
+        Extract FULL metadata for a single playlist/album to get accurate track count
+        and other detailed information.
+        
+        Returns dict with complete metadata including:
+        - track_count: accurate number of tracks
+        - duration: total duration if available
+        - release_date/release_year: release information if available
+        - description: playlist description
+        """
+        opts = self._get_base_ydl_opts()
+        opts.update({
+            "quiet": False if settings.debug else True,
+            "no_warnings": False if settings.debug else True,
+            "extract_flat": False,  # Full extraction for accurate track counts
+            "skip_download": True,
+            "playlistend": 100,  # Limit to first 100 tracks for performance
+            "ignoreerrors": True,  # Continue even if some videos are unavailable
+        })
+
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(playlist_url, download=False)
+
+        try:
+            raw = await loop.run_in_executor(None, _run)
+        except Exception as exc:
+            logger.warning("Could not extract full metadata for %s: %s", playlist_url, exc)
+            return {}
+
+        if not raw:
+            return {}
+
+        # Extract all available metadata
+        entries = raw.get("entries") or []
+        # Filter out None entries (unavailable videos) and ensure valid entries
+        valid_entries = [e for e in entries if e and e.get("id")]
+        
+        metadata = {
+            "track_count": len(valid_entries),
+            "playlist_count": raw.get("playlist_count"),
+            "release_date": raw.get("release_date"),
+            "release_year": raw.get("release_year"),
+            "description": raw.get("description"),
+            "availability": raw.get("availability"),
+            "modified_date": raw.get("modified_date"),
+            "view_count": raw.get("view_count"),
+            "like_count": raw.get("like_count"),
+        }
+        
+        # Calculate total duration if available
+        total_duration = 0
+        for entry in valid_entries:
+            duration = entry.get("duration")
+            if duration:
+                total_duration += duration
+        
+        if total_duration > 0:
+            metadata["total_duration"] = total_duration
+            
+        logger.debug(
+            "Extracted full metadata for %s: %d valid tracks (from %d total), duration: %ds",
+            playlist_url, len(valid_entries), len(entries), total_duration
+        )
+        
+        return metadata
+
     async def get_channel_playlists(self, url: str) -> list[dict]:
         """
         Extract all albums AND playlists from a YouTube channel.
@@ -223,7 +293,8 @@ class DownloadManager:
         and user-created playlists under /playlists.  We scan BOTH tabs and merge
         the results so nothing is missed.
 
-        Returns a list of playlist dicts with id, title, url, thumbnail, track_count.
+        Returns a list of playlist dicts with id, title, url, thumbnail, track_count,
+        and additional metadata for proper album/EP/single classification.
         """
         import re as _re
 
@@ -243,10 +314,12 @@ class DownloadManager:
 
         opts = self._get_base_ydl_opts()
         opts.update({
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": "in_playlist",  # Get playlist metadata including track counts
+            "quiet": False if settings.debug else True,
+            "no_warnings": False if settings.debug else True,
+            "extract_flat": True,  # Extract all playlists without going into each one
             "skip_download": True,
+            "playlistend": None,  # Get all items, not just first N
+            "ignoreerrors": True,  # Continue on errors
         })
 
         loop = asyncio.get_event_loop()
@@ -279,6 +352,11 @@ class DownloadManager:
 
             entries = raw.get("entries") or []
             tab_count = 0
+            
+            logger.info(
+                "Tab '%s': found %d entries to process",
+                tab_name, len(entries)
+            )
 
             for entry in entries:
                 if not entry:
@@ -328,26 +406,67 @@ class DownloadManager:
                         track_count = len(entry_entries)
                 
                 title = entry.get("title") or "Unknown Playlist"
+                
+                # Skip live albums and live performances
+                if self._is_live_album(title):
+                    logger.debug("Skipping live album: %s", title)
+                    continue
+                
+                # Extract full metadata for accurate track count and additional info
+                # Only do this for releases tab to get accurate album/single/EP classification
+                full_metadata = {}
+                if tab_name == "releases" and entry_url:
+                    try:
+                        logger.info("Extracting full metadata for: %s", title)
+                        full_metadata = await self.get_playlist_full_metadata(entry_url)
+                        # Use accurate track count from full extraction
+                        if full_metadata.get("track_count") is not None:
+                            track_count = full_metadata["track_count"]
+                            logger.info(
+                                "✓ '%s': %d tracks",
+                                title, track_count
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "✗ Failed to get full metadata for '%s': %s",
+                            title, exc
+                        )
+                        # Continue processing even if full metadata fails
+                        # Use whatever track count we got from flat extraction
+                
                 release_type = self._classify_release_type(
                     entry, tab_name, title, track_count
                 )
 
-                playlists.append({
-                    "id": playlist_id,
-                    "title": title,
-                    "url": entry_url,
-                    "thumbnail": thumb,
-                    "track_count": track_count,
-                    "channel": channel_name,
-                    "channel_url": channel_url_out,
-                    "source_tab": tab_name,
-                    "release_type": release_type,
-                })
-                tab_count += 1
+                # Filter out music videos
+                if release_type != "music_video":
+                    playlist_data = {
+                        "id": playlist_id,
+                        "title": title,
+                        "url": entry_url,
+                        "thumbnail": thumb,
+                        "track_count": track_count,
+                        "channel": channel_name,
+                        "channel_url": channel_url_out,
+                        "source_tab": tab_name,
+                        "release_type": release_type,
+                    }
+                    
+                    # Add additional metadata if available from full extraction
+                    if full_metadata:
+                        for key in ["release_date", "release_year", "description", 
+                                    "total_duration", "view_count", "like_count"]:
+                            if full_metadata.get(key) is not None:
+                                playlist_data[key] = full_metadata[key]
+                    
+                    playlists.append(playlist_data)
+                    tab_count += 1
+                else:
+                    logger.debug("Filtered out music video: %s", title)
 
             logger.info(
-                "Tab '%s': found %d new entries (total so far: %d)",
-                tab_name, tab_count, len(playlists),
+                "Tab '%s': processed %d releases, kept %d after filtering (total: %d)",
+                tab_name, len(entries), tab_count, len(playlists),
             )
 
         if channel_name is None and not playlists:
@@ -357,9 +476,17 @@ class DownloadManager:
             )
 
         logger.info(
-            "Found %d total entries (albums + playlists) on channel %s",
+            "✓ Channel extraction complete: %d releases from %s",
             len(playlists), channel_name or url,
         )
+        
+        # Log summary by release type
+        type_counts = {}
+        for p in playlists:
+            rt = p.get("release_type", "unknown")
+            type_counts[rt] = type_counts.get(rt, 0) + 1
+        logger.info("Release breakdown: %s", type_counts)
+        
         return playlists
 
     @staticmethod
@@ -370,19 +497,28 @@ class DownloadManager:
         track_count: int | None,
     ) -> str:
         """
-        Determine whether a release is an album or single based on track count.
+        Determine whether a release is an album, EP, single, or music video.
 
         Priority:
-        1. Explicit field from yt-dlp  (newer builds populate release_type)
-        2. YouTube Music title suffixes (" - Single", " - EP", " - Album")
-        3. Track-count heuristic        (< 5 tracks → single, >= 5 → album)
-        4. Conservative default         (releases tab → album, other → playlist)
+        1. Filter out music videos first
+        2. Explicit field from yt-dlp  (newer builds populate release_type)
+        3. YouTube Music title suffixes (" - Single", " - EP", " - Album")
+        4. Track-count heuristic:
+           - 1 track → single
+           - 2-4 tracks → single (could be single + remixes)
+           - 5-7 tracks → EP
+           - 8+ tracks → album
+        5. Conservative default (releases tab → album, other → playlist)
         """
         import re as _re
 
         # Non-release tabs are just playlists
         if tab_name != "releases":
             return "playlist"
+
+        # Filter out music videos first
+        if DownloadManager._is_music_video(entry, title, track_count):
+            return "music_video"
 
         # 1. Explicit field (e.g. "Album", "EP", "Single")
         explicit = (
@@ -392,8 +528,9 @@ class DownloadManager:
         )
         if explicit:
             norm = str(explicit).lower().strip()
-            # Treat EP as album
-            if norm == "album" or norm == "ep":
+            if norm == "ep":
+                return "ep"
+            if norm == "album":
                 return "album"
             if norm == "single":
                 return "single"
@@ -402,17 +539,116 @@ class DownloadManager:
         lower = title.lower()
         if _re.search(r"[-–]\s*single\s*$", lower):
             return "single"
-        if _re.search(r"[-–]\s*(ep|album)\s*$", lower):
+        if _re.search(r"[-–]\s*ep\s*$", lower):
+            return "ep"
+        if _re.search(r"[-–]\s*album\s*$", lower):
             return "album"
 
-        # 3. Track-count heuristic: < 5 tracks = single, >= 5 = album
+        # 3. Track-count heuristic with improved classification
         if track_count is not None:
-            if track_count < 5:
+            if track_count <= 4:
                 return "single"
-            return "album"
+            elif track_count <= 7:
+                return "ep"
+            else:  # 8 or more tracks
+                return "album"
 
         # 4. Default for releases tab
         return "album"
+
+    @staticmethod
+    def _is_live_album(title: str) -> bool:
+        """
+        Detect if a release is a live album or live performance.
+        
+        Live albums typically have:
+        - "Live" in the title
+        - "Live at" or "Live from"
+        - "In Concert"
+        - References to venues or dates
+        """
+        import re as _re
+        
+        lower_title = title.lower()
+        
+        # Common patterns for live albums
+        live_patterns = [
+            r"\blive\b",  # Word "live" as standalone word
+            r"\(live\)",  # (Live)
+            r"\blive at\b",  # Live at [venue]
+            r"\blive from\b",  # Live from [venue]
+            r"\blive in\b",  # Live in [city]
+            r"in concert",
+            r"concert at",
+            r"recorded live",
+            r"live recording",
+            r"live session",
+            r"live performance",
+            # Venue indicators
+            r"at.*(?:arena|stadium|hall|center|theatre|theater|opera house|club)",
+        ]
+        
+        for pattern in live_patterns:
+            if _re.search(pattern, lower_title):
+                return True
+        
+        return False
+    
+    @staticmethod
+    def _is_music_video(entry: dict, title: str, track_count: int | None) -> bool:
+        """
+        Identify music videos to filter them out.
+        
+        Music videos typically have:
+        - Track count of 1
+        - Contains "(Official Video)", "(Music Video)", or similar
+        - Duration suggests single track rather than album
+        - Contains video-specific keywords
+        """
+        import re as _re
+        
+        # Music videos almost always have exactly 1 track
+        if track_count is not None and track_count != 1:
+            return False
+            
+        lower_title = title.lower()
+        
+        # Check for video-specific patterns in title
+        video_patterns = [
+            r"\(official\s+video\)",
+            r"\(music\s+video\)",
+            r"\(official\s+music\s+video\)",
+            r"\(lyric\s+video\)",
+            r"\(official\s+lyric\s+video\)",
+            r"\(live\s+video\)",
+            r"\(performance\s+video\)",
+            r"\(visuali[sz]er\)",
+            r"\(official\s+visuali[sz]er\)",
+            r"\bmv\b",  # Common abbreviation for music video
+            r"official\s+mv\b",
+        ]
+        
+        for pattern in video_patterns:
+            if _re.search(pattern, lower_title):
+                return True
+                
+        # Check if entry has video-specific metadata
+        entry_type = entry.get("_type", "")
+        if "video" in entry_type.lower():
+            # Additional check: if it's explicitly marked as a video and has 1 track
+            if track_count == 1:
+                return True
+                
+        # Check duration if available - music videos are typically 2-8 minutes
+        duration = entry.get("duration")
+        if duration is not None and track_count == 1:
+            # If single track and duration is typical for a music video (2-8 min)
+            if 120 <= duration <= 480:  # 2-8 minutes in seconds
+                # Additional heuristic: check if title doesn't indicate album/EP
+                if not _re.search(r"(album|ep)\b", lower_title):
+                    return True
+        
+        return False
 
     async def get_info(self, url: str) -> dict:
         """Extract metadata without downloading."""

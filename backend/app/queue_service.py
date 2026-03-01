@@ -283,7 +283,7 @@ class BatchQueueService:
         self._lock = asyncio.Lock()
         logger.info("BatchQueueService initialized")
 
-    async def create_batch(self, playlists: list[Dict[str, Any]]) -> str:
+    async def create_batch(self, playlists: list[Dict[str, Any]], format_id: str = "bestaudio/best") -> str:
         """
         Create a new batch processing task and return its ID immediately.
         The batch will process in the background.
@@ -299,17 +299,18 @@ class BatchQueueService:
                 "skipped": 0,
                 "failed": 0,
                 "download_ids": [],
+                "format_id": format_id,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
         
         # Start background task
         asyncio.create_task(
-            self._process_batch(batch_id, playlists),
+            self._process_batch(batch_id, playlists, format_id),
             name=f"batch-{batch_id}"
         )
         
-        logger.info("Created batch %s with %d playlists", batch_id, len(playlists))
+        logger.info("Created batch %s with %d playlists (format: %s)", batch_id, len(playlists), format_id)
         return batch_id
 
     async def get_batch_status(self, batch_id: str) -> Optional[Dict[str, Any]]:
@@ -317,7 +318,7 @@ class BatchQueueService:
         async with self._lock:
             return self._active_batches.get(batch_id)
 
-    async def _process_batch(self, batch_id: str, playlists: list[Dict[str, Any]]) -> None:
+    async def _process_batch(self, batch_id: str, playlists: list[Dict[str, Any]], format_id: str) -> None:
         """
         Background task that processes all playlists in a batch.
         This runs asynchronously without blocking the HTTP response.
@@ -331,7 +332,7 @@ class BatchQueueService:
                 
                 # Create download record with retry logic (includes duplicate check)
                 skipped = await self._create_and_queue_download(
-                    batch_id, idx, len(playlists), playlist, info
+                    batch_id, idx, len(playlists), playlist, info, format_id
                 )
                 
                 # Update skipped counter if duplicate was found
@@ -368,7 +369,7 @@ class BatchQueueService:
     @retry_on_db_lock(max_retries=5, base_delay=0.2)
     async def _create_and_queue_download(
         self, batch_id: str, idx: int, total: int, 
-        playlist: Dict[str, Any], info: Dict[str, Any]
+        playlist: Dict[str, Any], info: Dict[str, Any], format_id: str
     ) -> bool:
         """
         Helper method to create and queue a download with retry logic for database locks.
@@ -407,7 +408,7 @@ class BatchQueueService:
                 total_tracks  = info.get("total_tracks"),
                 status        = DownloadStatus.QUEUED,
                 progress      = 0.0,
-                format_id     = "bestaudio/best",
+                format_id     = format_id,
             )
             session.add(dl)
             await session.commit()
@@ -424,8 +425,8 @@ class BatchQueueService:
                     self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
             
             logger.info(
-                "Batch %s: Queued %d/%d - %s (ID: %d)",
-                batch_id[:8], idx, total, playlist["title"], dl.id
+                "Batch %s: Queued %d/%d - %s (ID: %d, format: %s)",
+                batch_id[:8], idx, total, playlist["title"], dl.id, format_id
             )
             return False  # Not skipped
 

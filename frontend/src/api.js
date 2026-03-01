@@ -52,6 +52,28 @@ export const api = {
 	// Get batch processing status
 	getBatchStatus: (batchId) =>
 		http.get(`/channel/batch/${batchId}`).then(r => r.data),
+
+	// ── Metadata Processing ────────────────────────────────────────────────────
+	startMetadataProcessing: (url, options = {}) =>
+		http.post('/metadata/process', { url, ...options }).then(r => r.data),
+
+	getMetadataJob: (jobId) =>
+		http.get(`/metadata/jobs/${jobId}`).then(r => r.data),
+
+	listMetadataJobs: ({ limit = 50, offset = 0 } = {}) =>
+		http.get('/metadata/jobs', { params: { limit, offset } }).then(r => r.data),
+
+	getMetadataJobItems: (jobId, { limit = 1000, offset = 0 } = {}) =>
+		http.get(`/metadata/jobs/${jobId}/items`, { params: { limit, offset } }).then(r => r.data),
+
+	cancelMetadataJob: (jobId) =>
+		http.post(`/metadata/jobs/${jobId}/cancel`),
+
+	updateMetadataItemSelection: (itemIds, selected) =>
+		http.post('/metadata/items/select', { item_ids: itemIds, selected }),
+
+	queueSelectedMetadataItems: (jobId, formatId = 'bestaudio/best') =>
+		http.post(`/metadata/jobs/${jobId}/queue-selected`, { format_id: formatId }).then(r => r.data),
 };
 
 // ── WebSocket service ─────────────────────────────────────────────────────────

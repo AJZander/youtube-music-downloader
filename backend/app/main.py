@@ -15,12 +15,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import AsyncSessionLocal, get_session, init_db, retry_on_db_lock
 from app.downloader import download_manager
-from app.models import Download, DownloadStatus
+from app.models import Download, DownloadStatus, MetadataProcessingJob, MetadataPlaylistItem
 from app.queue_service import batch_queue_service, queue_service
+from app.metadata_service import metadata_service
 from app.schemas import (
     BatchStatusResponse, ChannelPlaylistsResponse, ChannelQueueRequest, ChannelQueueResponse,
-    ChannelRequest, DownloadCreate, DownloadResponse,
+    ChannelRequest, DownloadCreate, DownloadResponse, PaginatedDownloadsResponse,
     FormatListResponse, ErrorDetail, StatsResponse,
+    MetadataProcessingRequest, MetadataProcessingResponse, MetadataProcessingJob as MetadataProcessingJobSchema,
+    MetadataPlaylistItem as MetadataPlaylistItemSchema, MetadataItemSelectionRequest, MetadataQueueSelectedRequest
 )
 
 logging.basicConfig(
@@ -35,9 +38,11 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up…")
     await init_db()
     await queue_service.start()
+    await metadata_service.start()
     yield
     logger.info("Shutting down…")
     await queue_service.stop()
+    await metadata_service.stop()
 
 
 app = FastAPI(
@@ -182,33 +187,53 @@ async def _create_download_with_retry(
 
 @app.get(
     "/downloads",
-    response_model=list[DownloadResponse],
+    response_model=PaginatedDownloadsResponse,
     tags=["Downloads"],
 )
 async def list_downloads(
     status_filter: Optional[str] = Query(None, alias="status"),
-    limit: int = Query(500, le=2000),
+    limit: int = Query(500, le=1000),
     offset: int = 0,
     search: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
 ):
     """
     List downloads with optional status filter, search, and pagination.
-    Returns up to 2000 rows (no hidden 50-item cap).
+    Returns downloads with pagination info and total count.
     """
+    # Build query
     q = select(Download)
+    count_q = select(func.count(Download.id))
+    
     if status_filter:
         q = q.where(Download.status == status_filter)
+        count_q = count_q.where(Download.status == status_filter)
     if search:
         term = f"%{search}%"
-        q = q.where(
+        search_condition = (
             Download.title.ilike(term)
             | Download.artist.ilike(term)
             | Download.album.ilike(term)
         )
+        q = q.where(search_condition)
+        count_q = count_q.where(search_condition)
+
+    # Get total count
+    total_result = await session.execute(count_q)
+    total_count = total_result.scalar()
+
+    # Get paginated results
     q = q.order_by(desc(Download.created_at)).limit(limit).offset(offset)
     rows = await session.execute(q)
-    return [d.to_dict() for d in rows.scalars()]
+    downloads = [d.to_dict() for d in rows.scalars()]
+
+    return {
+        "downloads": downloads,
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(downloads) < total_count
+    }
 
 
 @app.get(
@@ -411,18 +436,189 @@ async def get_batch_status(batch_id: str):
     return batch_status
 
 
+# ── Metadata Processing Endpoints ────────────────────────────────────────────
+
+@app.post(
+    "/metadata/process",
+    response_model=MetadataProcessingResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Metadata"],
+)
+async def start_metadata_processing(body: MetadataProcessingRequest):
+    """
+    Start background metadata processing for a YouTube channel.
+    This will extract all albums/singles metadata including track counts and names.
+    Returns immediately with a job ID to track progress.
+    """
+    try:
+        job_id = await metadata_service.start_metadata_extraction(body.url)
+        return {
+            "job_id": job_id,
+            "message": "Metadata processing started. Check /metadata/jobs/{job_id} for progress."
+        }
+    except Exception as exc:
+        logger.error("Failed to start metadata processing for %s: %s", body.url, exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Could not start metadata processing: {exc}",
+        )
+
+
+@app.get(
+    "/metadata/jobs/{job_id}",
+    response_model=MetadataProcessingJobSchema,
+    tags=["Metadata"],
+)
+async def get_metadata_job(job_id: str):
+    """Get the status and details of a metadata processing job."""
+    job_status = await metadata_service.get_job_status(job_id)
+    if not job_status:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Metadata job {job_id} not found",
+        )
+    return job_status
+
+
+@app.get(
+    "/metadata/jobs",
+    response_model=list[MetadataProcessingJobSchema],
+    tags=["Metadata"],
+)
+async def list_metadata_jobs(
+    limit: int = Query(50, le=200),
+    offset: int = 0,
+):
+    """List metadata processing jobs."""
+    return await metadata_service.list_jobs(limit, offset)
+
+
+@app.get(
+    "/metadata/jobs/{job_id}/items",
+    response_model=list[MetadataPlaylistItemSchema],
+    tags=["Metadata"],
+)
+async def get_metadata_job_items(
+    job_id: str,
+    limit: int = Query(1000, le=5000),
+    offset: int = 0,
+):
+    """Get the discovered playlist items for a metadata processing job."""
+    return await metadata_service.get_job_items(job_id, limit, offset)
+
+
+@app.post(
+    "/metadata/jobs/{job_id}/cancel",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Metadata"],
+)
+async def cancel_metadata_job(job_id: str):
+    """Cancel a metadata processing job."""
+    success = await metadata_service.cancel_job(job_id)
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Metadata job {job_id} not found or already completed",
+        )
+
+
+@app.post(
+    "/metadata/items/select",
+    tags=["Metadata"],
+)
+async def update_metadata_item_selection(body: MetadataItemSelectionRequest):
+    """Update the selection status of metadata items."""
+    updated_count = await metadata_service.update_item_selection(body.item_ids, body.selected)
+    return {"updated_count": updated_count}
+
+
+@app.post(
+    "/metadata/jobs/{job_id}/queue-selected",
+    response_model=ChannelQueueResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Metadata"],
+)
+async def queue_selected_metadata_items(
+    job_id: str,
+    body: MetadataQueueSelectedRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Queue selected metadata items for download.
+    Only items marked as selected_for_download=True will be queued.
+    """
+    # Get selected items
+    result = await session.execute(
+        select(MetadataPlaylistItem)
+        .where(MetadataPlaylistItem.processing_job_id == job_id)
+        .where(MetadataPlaylistItem.selected_for_download == True)
+    )
+    selected_items = result.scalars().all()
+
+    if not selected_items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No items selected for download"
+        )
+
+    # Convert to playlist format for batch queue
+    playlists_data = []
+    for item in selected_items:
+        playlist_data = {
+            "id": item.playlist_id,
+            "title": item.title,
+            "url": item.url,
+            "thumbnail": item.thumbnail,
+            "track_count": item.track_count,
+            "channel": item.channel,
+            "channel_url": item.channel_url,
+            "source_tab": item.source_tab,
+            "release_type": item.release_type,
+        }
+        playlists_data.append(playlist_data)
+
+    # Create batch using existing batch queue service
+    batch_id = await batch_queue_service.create_batch(playlists_data, body.format_id)
+    
+    logger.info(
+        "Created batch %s for %d selected metadata items from job %s",
+        batch_id[:8], len(playlists_data), job_id[:8]
+    )
+    
+    return {
+        "batch_id": batch_id,
+        "total": len(playlists_data),
+        "message": f"Batch queuing started for {len(playlists_data)} selected items. Processing in background.",
+    }
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     queue_service.register_ws(ws)
+    metadata_service.register_ws(ws)
     try:
         async with AsyncSessionLocal() as session:
-            rows = await session.execute(
-                select(Download).order_by(desc(Download.created_at)).limit(2000)
+            # Send initial data with pagination info
+            result = await session.execute(
+                select(func.count(Download.id))
             )
+            total_count = result.scalar()
+
+            rows = await session.execute(
+                select(Download).order_by(desc(Download.created_at)).limit(500)
+            )
+            downloads = [d.to_dict() for d in rows.scalars()]
+
             await ws.send_json({
                 "type": "initial_data",
-                "data": [d.to_dict() for d in rows.scalars()],
+                "data": {
+                    "downloads": downloads,
+                    "total": total_count,
+                    "limit": 500,
+                    "offset": 0,
+                    "has_more": len(downloads) < total_count
+                }
             })
 
         while True:
@@ -436,3 +632,4 @@ async def ws_endpoint(ws: WebSocket):
         logger.debug("WebSocket closed with error", exc_info=True)
     finally:
         queue_service.unregister_ws(ws)
+        metadata_service.unregister_ws(ws)

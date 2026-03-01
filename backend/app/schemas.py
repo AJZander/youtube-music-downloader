@@ -43,6 +43,15 @@ class DownloadResponse(BaseModel):
         from_attributes = True
 
 
+class PaginatedDownloadsResponse(BaseModel):
+    """Paginated downloads response with total count."""
+    downloads: list[DownloadResponse]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+
+
 class FormatOption(BaseModel):
     """Single format option for user selection."""
     format_id: str
@@ -106,10 +115,15 @@ class PlaylistInfo(BaseModel):
     channel: Optional[str] = None
     channel_url: Optional[str] = None
     source_tab: Optional[str] = None
-    # Classified release type: album | ep | single | playlist
+    # Classified release type: album | ep | single | playlist | music_video
     release_type: Optional[str] = None
-    # 'releases' = albums/singles tab, 'playlists' = playlists tab
-    source_tab: Optional[str] = None
+    # Additional metadata for better classification
+    release_date: Optional[str] = None
+    release_year: Optional[int] = None
+    description: Optional[str] = None
+    total_duration: Optional[int] = None  # Total duration in seconds
+    view_count: Optional[int] = None
+    like_count: Optional[int] = None
 
 
 class ChannelPlaylistsResponse(BaseModel):
@@ -153,3 +167,82 @@ class StatsResponse(BaseModel):
     failed: int = 0
     cancelled: int = 0
     total: int = 0
+
+
+# ── Metadata Processing Schemas ──────────────────────────────────────────────
+
+class MetadataProcessingRequest(BaseModel):
+    """Request to start background metadata processing for a channel."""
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("URL must not be empty")
+        if not is_valid_youtube_url(v):
+            raise ValueError("Only YouTube / YouTube Music URLs are accepted")
+        return v
+
+
+class MetadataProcessingResponse(BaseModel):
+    """Response when starting metadata processing."""
+    job_id: str
+    message: str
+
+
+class MetadataProcessingJob(BaseModel):
+    """Metadata processing job status."""
+    id: str
+    channel_url: str
+    channel_name: Optional[str]
+    status: str
+    progress: float
+    total_items: Optional[int]
+    processed_items: int
+    error_message: Optional[str]
+    metadata_results: Optional[list]
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class MetadataPlaylistItem(BaseModel):
+    """Individual playlist item from metadata processing."""
+    id: int
+    processing_job_id: str
+    playlist_id: Optional[str]
+    title: str
+    url: str
+    thumbnail: Optional[str]
+    track_count: Optional[int]
+    channel: Optional[str]
+    channel_url: Optional[str]
+    source_tab: Optional[str]
+    release_type: Optional[str]
+    selected_for_download: bool
+    # Additional metadata fields
+    release_date: Optional[str]
+    release_year: Optional[int]
+    description: Optional[str]
+    total_duration: Optional[int]
+    view_count: Optional[int]
+    like_count: Optional[int]
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class MetadataItemSelectionRequest(BaseModel):
+    """Request to update selection status of metadata items."""
+    item_ids: list[int]
+    selected: bool
+
+
+class MetadataQueueSelectedRequest(BaseModel):
+    """Request to queue selected metadata items for download."""
+    format_id: str = "bestaudio/best"
