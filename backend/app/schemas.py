@@ -126,8 +126,22 @@ class ChannelQueueRequest(BaseModel):
 
 class ChannelQueueResponse(BaseModel):
     """Result of bulk-queuing channel playlists."""
+    batch_id: str
+    total: int
+    message: str
+
+
+class BatchStatusResponse(BaseModel):
+    """Status of a background batch operation."""
+    id: str
+    status: str  # processing | completed
+    total: int
     queued: int
+    skipped: int
+    failed: int
     download_ids: list[int]
+    created_at: datetime
+    updated_at: datetime
 
 
 class StatsResponse(BaseModel):

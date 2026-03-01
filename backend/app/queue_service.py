@@ -1,13 +1,15 @@
 # backend/app/queue_service.py
 import asyncio
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, retry_on_db_lock
 from app.downloader import download_manager
 from app.models import Download, DownloadStatus
 
@@ -104,6 +106,12 @@ class QueueService:
         if task:
             task.cancel()
 
+        await self._cancel_in_db(download_id)
+        return True
+
+    @retry_on_db_lock(max_retries=5, base_delay=0.2)
+    async def _cancel_in_db(self, download_id: int) -> None:
+        """Cancel download in database with retry logic."""
         async with AsyncSessionLocal() as session:
             await session.execute(
                 update(Download)
@@ -114,7 +122,6 @@ class QueueService:
             dl = await session.get(Download, download_id)
             if dl:
                 await self._broadcast(dl)
-        return True
 
     async def _loop(self) -> None:
         logger.debug("Queue worker loop started")
@@ -166,27 +173,41 @@ class QueueService:
                 logger.info("Download %d was cancelled before it started — skipping", download_id)
                 return
 
-            download.status    = DownloadStatus.DOWNLOADING
-            download.progress  = 0.0
-            download.updated_at = datetime.utcnow()
-            await session.commit()
-            await session.refresh(download)
-            await self._broadcast(download)
+            # Update to DOWNLOADING status with retry
+            try:
+                await self._update_download_status(
+                    session, download, DownloadStatus.DOWNLOADING, 0.0
+                )
+            except Exception as e:
+                logger.error("Failed to update download %d status: %s", download_id, e)
+                return
 
             async def on_progress(pct: float) -> None:
-                download.progress   = min(pct, 99.9)
-                download.updated_at = datetime.utcnow()
-                await session.commit()
-                await session.refresh(download)
-                await self._broadcast(download)
+                try:
+                    # Use a fresh session for each progress update to avoid transaction conflicts
+                    async with AsyncSessionLocal() as progress_session:
+                        progress_dl = await progress_session.get(Download, download_id)
+                        if progress_dl:
+                            progress_dl.progress   = min(pct, 99.9)
+                            progress_dl.updated_at = datetime.utcnow()
+                            await self._commit_with_retry(progress_session, progress_dl)
+                            await self._broadcast(progress_dl)
+                except Exception as e:
+                    logger.warning("Failed to update progress for download %d: %s", download_id, e)
 
             async def on_status(st: DownloadStatus, pct: float) -> None:
-                download.status     = st
-                download.progress   = pct
-                download.updated_at = datetime.utcnow()
-                await session.commit()
-                await session.refresh(download)
-                await self._broadcast(download)
+                try:
+                    # Use a fresh session for each status update to avoid transaction conflicts
+                    async with AsyncSessionLocal() as status_session:
+                        status_dl = await status_session.get(Download, download_id)
+                        if status_dl:
+                            status_dl.status     = st
+                            status_dl.progress   = pct
+                            status_dl.updated_at = datetime.utcnow()
+                            await self._commit_with_retry(status_session, status_dl)
+                            await self._broadcast(status_dl)
+                except Exception as e:
+                    logger.warning("Failed to update status for download %d: %s", download_id, e)
 
             try:
                 # Use the stored format_id
@@ -208,8 +229,7 @@ class QueueService:
                 download.progress     = 100.0
                 download.file_path    = str(download_manager._root)
                 download.updated_at   = datetime.utcnow()
-                await session.commit()
-                await session.refresh(download)
+                await self._commit_with_retry(session, download)
                 await self._broadcast(download)
                 logger.info("Download %d completed (%s track(s))", 
                           download_id, result.get("done_tracks"))
@@ -222,9 +242,192 @@ class QueueService:
                 download.status        = DownloadStatus.FAILED
                 download.error_message = str(exc)[:2048]
                 download.updated_at    = datetime.utcnow()
-                await session.commit()
-                await session.refresh(download)
-                await self._broadcast(download)
+                try:
+                    await self._commit_with_retry(session, download)
+                    await self._broadcast(download)
+                except Exception as e:
+                    logger.error("Failed to save error state for download %d: %s", download_id, e)
+
+    @retry_on_db_lock(max_retries=5, base_delay=0.1)
+    async def _update_download_status(
+        self, session: AsyncSession, download: Download, 
+        status: DownloadStatus, progress: float
+    ) -> None:
+        """Update download status with retry on lock."""
+        download.status = status
+        download.progress = progress
+        download.updated_at = datetime.utcnow()
+        await session.commit()
+        await session.refresh(download)
+        await self._broadcast(download)
+
+    @retry_on_db_lock(max_retries=3, base_delay=0.05)
+    async def _commit_with_retry(self, session: AsyncSession, download: Download) -> None:
+        """Commit session changes with retry on lock."""
+        await session.commit()
+        await session.refresh(download)
 
 
 queue_service = QueueService(max_concurrent=settings.max_concurrent_downloads)
+
+
+# ── Background Batch Queue Service ──────────────────────────────────────────
+
+class BatchQueueService:
+    """
+    Manages background batch processing of multiple playlists.
+    Supports concurrent batch operations safely with asyncio locks.
+    """
+    def __init__(self) -> None:
+        self._active_batches: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        logger.info("BatchQueueService initialized")
+
+    async def create_batch(self, playlists: list[Dict[str, Any]]) -> str:
+        """
+        Create a new batch processing task and return its ID immediately.
+        The batch will process in the background.
+        """
+        batch_id = str(uuid.uuid4())
+        
+        async with self._lock:
+            self._active_batches[batch_id] = {
+                "id": batch_id,
+                "status": "processing",
+                "total": len(playlists),
+                "queued": 0,
+                "skipped": 0,
+                "failed": 0,
+                "download_ids": [],
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+        
+        # Start background task
+        asyncio.create_task(
+            self._process_batch(batch_id, playlists),
+            name=f"batch-{batch_id}"
+        )
+        
+        logger.info("Created batch %s with %d playlists", batch_id, len(playlists))
+        return batch_id
+
+    async def get_batch_status(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        """Get the current status of a batch operation."""
+        async with self._lock:
+            return self._active_batches.get(batch_id)
+
+    async def _process_batch(self, batch_id: str, playlists: list[Dict[str, Any]]) -> None:
+        """
+        Background task that processes all playlists in a batch.
+        This runs asynchronously without blocking the HTTP response.
+        """
+        logger.info("Starting batch processing for %s (%d playlists)", batch_id, len(playlists))
+        
+        for idx, playlist in enumerate(playlists, 1):
+            try:
+                # Get playlist info
+                info = await download_manager.get_info(playlist["url"])
+                
+                # Create download record with retry logic (includes duplicate check)
+                skipped = await self._create_and_queue_download(
+                    batch_id, idx, len(playlists), playlist, info
+                )
+                
+                # Update skipped counter if duplicate was found
+                if skipped:
+                    async with self._lock:
+                        if batch_id in self._active_batches:
+                            self._active_batches[batch_id]["skipped"] += 1
+                            self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+                
+            except Exception as exc:
+                logger.warning(
+                    "Batch %s: Failed to queue playlist %s (%s): %s",
+                    batch_id[:8], playlist.get("title", "Unknown"), playlist["url"], exc
+                )
+                async with self._lock:
+                    if batch_id in self._active_batches:
+                        self._active_batches[batch_id]["failed"] += 1
+                        self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+        
+        # Mark batch as completed
+        async with self._lock:
+            if batch_id in self._active_batches:
+                self._active_batches[batch_id]["status"] = "completed"
+                self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+                queued = self._active_batches[batch_id]["queued"]
+                skipped = self._active_batches[batch_id]["skipped"]
+                failed = self._active_batches[batch_id]["failed"]
+        
+        logger.info(
+            "Batch %s completed: %d queued, %d skipped, %d failed",
+            batch_id[:8], queued, skipped, failed
+        )
+
+    @retry_on_db_lock(max_retries=5, base_delay=0.2)
+    async def _create_and_queue_download(
+        self, batch_id: str, idx: int, total: int, 
+        playlist: Dict[str, Any], info: Dict[str, Any]
+    ) -> bool:
+        """
+        Helper method to create and queue a download with retry logic for database locks.
+        Returns True if skipped (duplicate), False if queued.
+        """
+        async with AsyncSessionLocal() as session:
+            # Check for duplicates first
+            result = await session.execute(
+                select(Download)
+                .where(Download.url == playlist["url"])
+                .where(Download.status.in_([
+                    DownloadStatus.QUEUED,
+                    DownloadStatus.DOWNLOADING,
+                    DownloadStatus.PROCESSING,
+                    DownloadStatus.COMPLETED,
+                ]))
+                .limit(1)
+            )
+            existing = result.scalar_one_or_none()
+            
+            if existing:
+                logger.info(
+                    "Batch %s: Skipped %d/%d - %s (already %s, ID: %d)",
+                    batch_id[:8], idx, total, playlist["title"], 
+                    existing.status, existing.id
+                )
+                return True  # Skipped
+            
+            # Create new download
+            dl = Download(
+                url           = playlist["url"],
+                title         = info["title"],
+                artist        = info["artist"],
+                album         = info["album"],
+                download_type = info["download_type"],
+                total_tracks  = info.get("total_tracks"),
+                status        = DownloadStatus.QUEUED,
+                progress      = 0.0,
+                format_id     = "bestaudio/best",
+            )
+            session.add(dl)
+            await session.commit()
+            await session.refresh(dl)
+            
+            # Enqueue for download
+            await queue_service.enqueue(dl.id)
+            
+            # Update batch status
+            async with self._lock:
+                if batch_id in self._active_batches:
+                    self._active_batches[batch_id]["queued"] += 1
+                    self._active_batches[batch_id]["download_ids"].append(dl.id)
+                    self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+            
+            logger.info(
+                "Batch %s: Queued %d/%d - %s (ID: %d)",
+                batch_id[:8], idx, total, playlist["title"], dl.id
+            )
+            return False  # Not skipped
+
+
+batch_queue_service = BatchQueueService()

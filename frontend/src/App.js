@@ -13,6 +13,7 @@ import DownloadForm    from './components/DownloadForm';
 import DownloadList    from './components/DownloadList';
 import FormatSelector  from './components/FormatSelector';
 import ChannelImporter from './components/ChannelImporter';
+import BatchStatusViewer from './components/BatchStatusViewer';
 
 // ── MUI dark theme ────────────────────────────────────────────────────────────
 const theme = createTheme({
@@ -52,6 +53,7 @@ export default function App() {
 	const [downloads, setDownloads]           = useState([]);
 	const [loading,   setLoading]             = useState(true);
 	const [mode,      setMode]                = useState('download');  // 'download' | 'channel'
+	const [activeBatches, setActiveBatches]   = useState([]);
 
 	// Format selection state
 	const [formatDialogOpen,  setFormatDialogOpen]  = useState(false);
@@ -88,6 +90,34 @@ export default function App() {
 
 		return () => { offInit(); offUpdate(); svc.disconnect(); };
 	}, [showToast, upsert]);
+
+	// ── Poll batch status ───────────────────────────────────────────────────────
+	useEffect(() => {
+		if (activeBatches.length === 0) return;
+
+		const pollBatches = async () => {
+			const updates = await Promise.all(
+				activeBatches.map(async (batch) => {
+					try {
+						const status = await api.getBatchStatus(batch.id);
+						return status;
+					} catch (err) {
+						return batch; // Keep existing data on error
+					}
+				})
+			);
+			setActiveBatches(updates);
+
+			// Refresh downloads when batches are processing
+			if (updates.some(b => b.status === 'processing')) {
+				api.getDownloads().then(setDownloads).catch(() => {});
+			}
+		};
+
+		// Poll every 2 seconds
+		const interval = setInterval(pollBatches, 2000);
+		return () => clearInterval(interval);
+	}, [activeBatches]);
 
 	// ── URL submit: open format selector ───────────────────────────────────────
 	const handleUrlSubmit = useCallback(async (url) => {
@@ -175,12 +205,32 @@ export default function App() {
 	}, [showToast]);
 
 	// ── Channel queued callback ─────────────────────────────────────────────────
-	const handleChannelQueued = useCallback((count, channelName) => {
-		showToast(`Queued ${count} playlist${count !== 1 ? 's' : ''}${channelName ? ` from ${channelName}` : ''}!`);
+	const handleChannelQueued = useCallback((count, channelName, batchId) => {
+		const message = `Queuing ${count} playlist${count !== 1 ? 's' : ''}${channelName ? ` from ${channelName}` : ''} in background...`;
+		showToast(message);
 		setMode('download');
-		// Refresh full list so new items appear
+		
+		// Add new batch to tracking
+		setActiveBatches(prev => [...prev, {
+			id: batchId,
+			status: 'processing',
+			total: count,
+			queued: 0,
+			skipped: 0,
+			failed: 0,
+			download_ids: [],
+			created_at: new Date().toISOString(),
+			updated_at: new Date().toISOString(),
+		}]);
+		
+		// Refresh full list so new items appear as they're queued
 		api.getDownloads().then(setDownloads).catch(() => {});
 	}, [showToast]);
+
+	// ── Remove batch from tracking ──────────────────────────────────────────────
+	const handleRemoveBatch = useCallback((batchId) => {
+		setActiveBatches(prev => prev.filter(b => b.id !== batchId));
+	}, []);
 
 	// ── Render ──────────────────────────────────────────────────────────────────
 	return (
@@ -226,6 +276,12 @@ export default function App() {
 							/>
 						)}
 					</Box>
+
+					{/* Batch Status Viewer */}
+					<BatchStatusViewer 
+						batches={activeBatches} 
+						onRemove={handleRemoveBatch} 
+					/>
 
 					{/* Queue / history card */}
 					<Box sx={{ ...cardSx, mt: 2 }}>

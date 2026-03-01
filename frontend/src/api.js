@@ -48,6 +48,10 @@ export const api = {
 
 	queueChannelPlaylists: (playlists) =>
 		http.post('/channel/queue-all', { playlists }).then(r => r.data),
+
+	// Get batch processing status
+	getBatchStatus: (batchId) =>
+		http.get(`/channel/batch/${batchId}`).then(r => r.data),
 };
 
 // ── WebSocket service ─────────────────────────────────────────────────────────

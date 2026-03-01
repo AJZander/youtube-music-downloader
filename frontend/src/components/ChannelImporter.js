@@ -258,7 +258,8 @@ export default function ChannelImporter({ onQueued, onError }) {
     try {
       const { api } = await import('../api');
       const result = await api.queueChannelPlaylists(toQueue);
-      onQueued?.(result.queued, channelName);
+      // Result now contains: { batch_id, total, message }
+      onQueued?.(result.total, channelName, result.batch_id);
       // Reset after successful queue
       setPlaylists(null);
       setUrl('');

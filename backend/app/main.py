@@ -13,12 +13,12 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import AsyncSessionLocal, get_session, init_db
+from app.database import AsyncSessionLocal, get_session, init_db, retry_on_db_lock
 from app.downloader import download_manager
 from app.models import Download, DownloadStatus
-from app.queue_service import queue_service
+from app.queue_service import batch_queue_service, queue_service
 from app.schemas import (
-    ChannelPlaylistsResponse, ChannelQueueRequest, ChannelQueueResponse,
+    BatchStatusResponse, ChannelPlaylistsResponse, ChannelQueueRequest, ChannelQueueResponse,
     ChannelRequest, DownloadCreate, DownloadResponse,
     FormatListResponse, ErrorDetail, StatsResponse,
 )
@@ -57,6 +57,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
+
+async def check_duplicate_download(session: AsyncSession, url: str) -> Optional[Download]:
+    """
+    Check if a URL already exists in the database with an active status.
+    Returns the existing download if found, None otherwise.
+    Active statuses: queued, downloading, processing, completed
+    """
+    result = await session.execute(
+        select(Download)
+        .where(Download.url == url)
+        .where(Download.status.in_([
+            DownloadStatus.QUEUED,
+            DownloadStatus.DOWNLOADING,
+            DownloadStatus.PROCESSING,
+            DownloadStatus.COMPLETED,
+        ]))
+        .order_by(desc(Download.created_at))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+# ── API Routes ────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["Health"])
 async def root():
@@ -102,7 +127,17 @@ async def create_download(
     """
     Create a new download job.
     If format_id is not provided, uses 'bestaudio/best' (auto-select).
+    Skips if URL is already queued/downloading/processing/completed.
     """
+    # Check for duplicates first
+    existing = await check_duplicate_download(session, body.url)
+    if existing:
+        logger.info(
+            "Skipping duplicate URL %s - already %s (ID: %d)",
+            body.url, existing.status, existing.id
+        )
+        return existing.to_dict()
+    
     try:
         info = await download_manager.get_info(body.url)
     except Exception as exc:
@@ -115,6 +150,16 @@ async def create_download(
     # Store the selected format
     format_id = body.format_id or "bestaudio/best"
 
+    # Use retry wrapper for database operation
+    return await _create_download_with_retry(session, body, info, format_id)
+
+
+@retry_on_db_lock(max_retries=5, base_delay=0.2)
+async def _create_download_with_retry(
+    session: AsyncSession, body: DownloadCreate, 
+    info: dict, format_id: str
+) -> dict:
+    """Helper to create download with retry logic."""
     dl = Download(
         url           = body.url,
         title         = info["title"],
@@ -228,6 +273,13 @@ async def retry_download(download_id: int, session: AsyncSession = Depends(get_s
             status_code=status.HTTP_409_CONFLICT,
             detail="Only failed or cancelled downloads can be retried",
         )
+    
+    return await _retry_download_with_retry(session, dl)
+
+
+@retry_on_db_lock(max_retries=5, base_delay=0.2)
+async def _retry_download_with_retry(session: AsyncSession, dl: Download) -> dict:
+    """Helper to retry download with database retry logic."""
     dl.status        = DownloadStatus.QUEUED
     dl.progress      = 0.0
     dl.error_message = None
@@ -235,7 +287,7 @@ async def retry_download(download_id: int, session: AsyncSession = Depends(get_s
     await session.commit()
     await session.refresh(dl)
     await queue_service.enqueue(dl.id)
-    logger.info("Retrying download %d", download_id)
+    logger.info("Retrying download %d", dl.id)
     return dl.to_dict()
 
 
@@ -309,7 +361,7 @@ async def get_channel_playlists(body: ChannelRequest):
 @app.post(
     "/channel/queue-all",
     response_model=ChannelQueueResponse,
-    status_code=status.HTTP_201_CREATED,
+    status_code=status.HTTP_202_ACCEPTED,
     tags=["Channel"],
 )
 async def queue_channel_playlists(
@@ -318,40 +370,45 @@ async def queue_channel_playlists(
 ):
     """
     Queue every playlist in the request body for download.
+    Returns immediately with a batch ID. The playlists are queued in the background.
+    Use GET /channel/batch/{batch_id} to check progress.
     All playlists are queued with 'bestaudio/best' (top quality audio).
     """
-    download_ids: list[int] = []
+    # Convert Pydantic models to dicts for the background task
+    playlists_data = [p.model_dump() for p in body.playlists]
+    
+    # Create batch and start background processing
+    batch_id = await batch_queue_service.create_batch(playlists_data)
+    
+    logger.info(
+        "Created batch %s for %d playlists (processing in background)",
+        batch_id[:8], len(playlists_data)
+    )
+    
+    return {
+        "batch_id": batch_id,
+        "total": len(playlists_data),
+        "message": f"Batch queuing started for {len(playlists_data)} playlists. Processing in background.",
+    }
 
-    for playlist in body.playlists:
-        try:
-            info = await download_manager.get_info(playlist.url)
-        except Exception as exc:
-            logger.warning(
-                "Skipping playlist %s (%s): %s", playlist.title, playlist.url, exc
-            )
-            continue
 
-        dl = Download(
-            url           = playlist.url,
-            title         = info["title"],
-            artist        = info["artist"],
-            album         = info["album"],
-            download_type = info["download_type"],
-            total_tracks  = info.get("total_tracks"),
-            status        = DownloadStatus.QUEUED,
-            progress      = 0.0,
-            format_id     = "bestaudio/best",
+@app.get(
+    "/channel/batch/{batch_id}",
+    response_model=BatchStatusResponse,
+    tags=["Channel"],
+)
+async def get_batch_status(batch_id: str):
+    """
+    Get the current status of a background batch operation.
+    Returns information about how many playlists have been queued, failed, etc.
+    """
+    batch_status = await batch_queue_service.get_batch_status(batch_id)
+    if not batch_status:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Batch {batch_id} not found",
         )
-        session.add(dl)
-        await session.commit()
-        await session.refresh(dl)
-        await queue_service.enqueue(dl.id)
-        download_ids.append(dl.id)
-        logger.info(
-            "Queued channel playlist %d — %s (bestaudio/best)", dl.id, playlist.url
-        )
-
-    return {"queued": len(download_ids), "download_ids": download_ids}
+    return batch_status
 
 
 @app.websocket("/ws")
