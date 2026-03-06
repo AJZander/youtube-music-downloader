@@ -5,7 +5,8 @@ import {
 	LinearProgress, Chip, Alert, List, ListItem, ListItemText,
 	ListItemSecondaryAction, Checkbox, FormControl, InputLabel,
 	Select, MenuItem, Divider, IconButton, Tooltip, ToggleButtonGroup,
-	ToggleButton, Badge, alpha, ButtonGroup,
+	ToggleButton, Badge, alpha, ButtonGroup, Dialog, DialogTitle,
+	DialogContent, DialogActions,
 } from '@mui/material';
 import {
 	PlaylistAdd as PlaylistAddIcon,
@@ -51,6 +52,7 @@ export default function MetadataProcessor({ onError, onJobStarted }) {
 	const [formatId, setFormatId] = useState('bestaudio/best');
 	const [loadingItems, setLoadingItems] = useState(false);
 	const [queueing, setQueueing] = useState(false);
+	const [modalOpen, setModalOpen] = useState(false);
 	
 	// Filter state - tracks which types to show
 	const [activeFilters, setActiveFilters] = useState(['album', 'ep', 'single', 'playlist']);
@@ -147,9 +149,15 @@ export default function MetadataProcessor({ onError, onJobStarted }) {
 	const handleJobSelect = useCallback(async (job) => {
 		setSelectedJob(job);
 		if (job.status === 'completed') {
+			setModalOpen(true);
 			await loadJobItems(job.id);
 		}
 	}, [loadJobItems]);
+
+	const handleModalClose = useCallback(() => {
+		setModalOpen(false);
+		setSelectedItems(new Set());
+	}, []);
 
 	const handleItemToggle = useCallback((itemId) => {
 		setSelectedItems(prev => {
@@ -382,110 +390,107 @@ export default function MetadataProcessor({ onError, onJobStarted }) {
 				</CardContent>
 			</Card>
 
-			{/* Job Items (when job is selected and completed) */}
-			{selectedJob && selectedJob.status === 'completed' && (
-				<Card>
-					<CardContent>
-						{/* Header with title and format selector */}
-					<Box sx={{ mb: 2 }}>
-						<Box sx={{ mb: 2 }}>
-							<Typography variant="h6">
-								{selectedJob.channel_name} - Releases
-							</Typography>
-							<Typography variant="caption" color="text.secondary">
-								Showing {filteredItems.length} of {jobItems.length} releases
-							</Typography>
-						</Box>
-						<Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
-							<FormControl size="small" sx={{ minWidth: { xs: 120, sm: 140 }, flexGrow: { xs: 1, sm: 0 } }}>
-								<InputLabel>Format</InputLabel>
-								<Select
-									value={formatId}
-									label="Format"
-									onChange={(e) => setFormatId(e.target.value)}
-								>
-									<MenuItem value="bestaudio/best">Best Audio</MenuItem>
-									<MenuItem value="320">MP3 320k</MenuItem>
-									<MenuItem value="256">MP3 256k</MenuItem>
-									<MenuItem value="192">MP3 192k</MenuItem>
-								</Select>
-							</FormControl>
-							
-							<Button
-								variant="contained"
-								startIcon={<DownloadIcon />}
-								onClick={handleQueueSelected}
-								disabled={selectedItems.size === 0 || queueing}
-								sx={{ minWidth: { xs: 120, sm: 140 }, flexGrow: { xs: 1, sm: 0 } }}
-							>
-								{queueing ? 'Queueing...' : `Queue (${selectedItems.size})`}
-							</Button>
-					</Box>
-
-					{/* Filter Toggles */}
-					<Box sx={{ mb: 2 }}>
-						<Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-							<FilterIcon fontSize="small" color="action" />
-							<Typography variant="body2" color="text.secondary">
-								Show:
-							</Typography>
-						</Box>
-						<ToggleButtonGroup
-							value={activeFilters}
-							onChange={handleFilterToggle}
-							size="small"
-							aria-label="release type filter"
-							sx={{ 
-								display: 'flex', 
-								flexWrap: 'wrap', 
-								gap: 0.5,
-								'& .MuiToggleButtonGroup-grouped': {
-									border: '1px solid rgba(255,255,255,0.12)',
-									marginLeft: 0,
-									'&:not(:first-of-type)': {
-										borderRadius: 1,
-									},
-									'&:first-of-type': {
-										borderRadius: 1,
-									},
-								}
-							}}
-						>
-							<ToggleButton value="album" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
-								<Badge badgeContent={stats.album} color="primary" sx={{ mr: { xs: 0.5, sm: 1 } }}>
-									<AlbumIcon fontSize="small" />
-								</Badge>
-								<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>Albums</Box>
-							</ToggleButton>
-							<ToggleButton value="ep" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
-								<Badge badgeContent={stats.ep} color="info" sx={{ mr: { xs: 0.5, sm: 1 } }}>
-									<EPIcon fontSize="small" />
-								</Badge>
-								<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>EPs</Box>
-							</ToggleButton>
-							<ToggleButton value="single" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
-								<Badge badgeContent={stats.single} color="secondary" sx={{ mr: { xs: 0.5, sm: 1 } }}>
-									<SingleIcon fontSize="small" />
-								</Badge>
-								<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>Singles</Box>
-							</ToggleButton>
-							<ToggleButton value="playlist" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
-								<Badge badgeContent={stats.playlist} color="default" sx={{ mr: { xs: 0.5, sm: 1 } }}>
-									<PlaylistIcon fontSize="small" />
-								</Badge>
-								<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>Playlists</Box>
-						</ToggleButton>
-					</ToggleButtonGroup>
-				</Box>
-						bgcolor: alpha('#8B5CF6', 0.05),
-						borderRadius: 2,
-						border: '1px solid',
-						borderColor: alpha('#8B5CF6', 0.1),
-					}}>
-						<Typography variant="body2" sx={{ mb: 1.5, fontWeight: 600, fontSize: { xs: '0.8125rem', sm: '0.875rem' } }}>
-							Quick Selection:
+{/* Job Items Modal */}
+		<Dialog
+			open={modalOpen}
+			onClose={handleModalClose}
+			maxWidth="md"
+			fullWidth
+			PaperProps={{
+				sx: {
+					height: '90vh',
+					maxHeight: '90vh',
+				}
+			}}
+		>
+			<DialogTitle>
+				<Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+					<Box>
+						<Typography variant="h6">
+							{selectedJob?.channel_name} - Releases
 						</Typography>
-						<Box sx={{ display: 'flex', gap: { xs: 0.75, sm: 1 }, flexWrap: 'wrap' }}>
+						<Typography variant="caption" color="text.secondary">
+							Showing {filteredItems.length} of {jobItems.length} releases
+						</Typography>
+					</Box>
+					<IconButton onClick={handleModalClose} size="small">
+						<CancelIcon />
+					</IconButton>
+				</Box>
+			</DialogTitle>
+			
+			<DialogContent dividers sx={{ p: 2 }}>
+				{loadingItems ? (
+					<Box sx={{ textAlign: 'center', py: 4 }}>
+						<LinearProgress />
+						<Typography variant="body2" sx={{ mt: 2 }}>
+							Loading items...
+						</Typography>
+					</Box>
+				) : (
+					<>
+						{/* Filter Toggles */}
+						<Box sx={{ mb: 2 }}>
+							<Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+								<FilterIcon fontSize="small" color="action" />
+								<Typography variant="body2" color="text.secondary">
+									Show:
+								</Typography>
+							</Box>
+							<ToggleButtonGroup
+								value={activeFilters}
+								onChange={handleFilterToggle}
+								size="small"
+								aria-label="release type filter"
+								sx={{ 
+									display: 'flex', 
+									flexWrap: 'wrap', 
+									gap: 0.5,
+									'& .MuiToggleButtonGroup-grouped': {
+										border: '1px solid rgba(255,255,255,0.12)',
+										marginLeft: 0,
+										'&:not(:first-of-type)': {
+											borderRadius: 1,
+										},
+										'&:first-of-type': {
+											borderRadius: 1,
+										},
+									}
+								}}
+							>
+								<ToggleButton value="album" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
+									<Badge badgeContent={stats.album} color="primary" sx={{ mr: { xs: 0.5, sm: 1 } }}>
+										<AlbumIcon fontSize="small" />
+									</Badge>
+									<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>Albums</Box>
+								</ToggleButton>
+								<ToggleButton value="ep" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
+									<Badge badgeContent={stats.ep} color="info" sx={{ mr: { xs: 0.5, sm: 1 } }}>
+										<EPIcon fontSize="small" />
+									</Badge>
+									<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>EPs</Box>
+								</ToggleButton>
+								<ToggleButton value="single" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
+									<Badge badgeContent={stats.single} color="secondary" sx={{ mr: { xs: 0.5, sm: 1 } }}>
+										<SingleIcon fontSize="small" />
+									</Badge>
+									<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>Singles</Box>
+								</ToggleButton>
+								<ToggleButton value="playlist" sx={{ textTransform: 'none', px: { xs: 1, sm: 2 } }}>
+									<Badge badgeContent={stats.playlist} color="default" sx={{ mr: { xs: 0.5, sm: 1 } }}>
+										<PlaylistIcon fontSize="small" />
+									</Badge>
+									<Box component="span" sx={{ display: { xs: 'none', sm: 'inline' } }}>Playlists</Box>
+								</ToggleButton>
+							</ToggleButtonGroup>
+						</Box>
+
+						{/* Quick Selection */}
+						<Box sx={{ mb: 2 }}>
+							<Typography variant="body2" sx={{ mb: 1.5, fontWeight: 600, fontSize: { xs: '0.8125rem', sm: '0.875rem' } }}>
+								Quick Selection:
+							</Typography>
+							<Box sx={{ display: 'flex', gap: { xs: 0.75, sm: 1 }, flexWrap: 'wrap' }}>
 								{/* Albums */}
 								{stats.album > 0 && (
 									<Chip
@@ -564,14 +569,8 @@ export default function MetadataProcessor({ onError, onJobStarted }) {
 							</Box>
 						</Box>
 
-						{loadingItems ? (
-							<Box sx={{ textAlign: 'center', py: 2 }}>
-								<LinearProgress />
-								<Typography variant="body2" sx={{ mt: 1 }}>
-									Loading items...
-								</Typography>
-							</Box>
-						) : filteredItems.length === 0 ? (
+						{/* Items List */}
+						{filteredItems.length === 0 ? (
 							<Alert severity="info" sx={{ mt: 2 }}>
 								No items match the current filters. Try enabling more release types or clearing your filters.
 							</Alert>
@@ -630,9 +629,40 @@ export default function MetadataProcessor({ onError, onJobStarted }) {
 								))}
 							</List>
 						)}
-					</CardContent>
-				</Card>
-			)}
+					</>
+				)}
+			</DialogContent>
+			
+			<DialogActions sx={{ px: 3, py: 2, gap: 1 }}>
+				<FormControl size="small" sx={{ minWidth: 140 }}>
+					<InputLabel>Format</InputLabel>
+					<Select
+						value={formatId}
+						label="Format"
+						onChange={(e) => setFormatId(e.target.value)}
+					>
+						<MenuItem value="bestaudio/best">Best Audio</MenuItem>
+						<MenuItem value="320">MP3 320k</MenuItem>
+						<MenuItem value="256">MP3 256k</MenuItem>
+						<MenuItem value="192">MP3 192k</MenuItem>
+					</Select>
+				</FormControl>
+				
+				<Box sx={{ flex: 1 }} />
+				
+				<Button onClick={handleModalClose}>
+					Cancel
+				</Button>
+				<Button
+					variant="contained"
+					startIcon={<DownloadIcon />}
+					onClick={handleQueueSelected}
+					disabled={selectedItems.size === 0 || queueing}
+				>
+					{queueing ? 'Queueing...' : `Queue ${selectedItems.size} Item${selectedItems.size !== 1 ? 's' : ''}`}
+				</Button>
+			</DialogActions>
+		</Dialog>
 		</Box>
 	);
 }

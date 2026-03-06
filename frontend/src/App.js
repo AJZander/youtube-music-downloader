@@ -22,7 +22,6 @@ import Header             from './components/Header';
 import DownloadForm       from './components/DownloadForm';
 import DownloadList       from './components/DownloadList';
 import FormatSelector     from './components/FormatSelector';
-import ChannelImporter    from './components/ChannelImporter';
 import BatchStatusViewer  from './components/BatchStatusViewer';
 import MetadataProcessor  from './components/MetadataProcessor';
 
