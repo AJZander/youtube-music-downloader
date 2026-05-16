@@ -24,6 +24,17 @@ import DownloadList       from './components/DownloadList';
 import FormatSelector     from './components/FormatSelector';
 import BatchStatusViewer  from './components/BatchStatusViewer';
 import MetadataProcessor  from './components/MetadataProcessor';
+import SearchBar          from './components/SearchBar';
+
+// Request browser notification permission once on module load
+if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+	Notification.requestPermission();
+}
+
+function fireNotification(title, body) {
+	if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+	try { new Notification(title, { body, icon: '/favicon.ico' }); } catch { /* ignore */ }
+}
 
 // ── Enhanced MUI dark theme with gradients ───────────────────────────────────
 const theme = createTheme({
@@ -238,7 +249,15 @@ export default function App() {
 			}
 			setLoading(false);
 		});
-		const offUpdate = svc.on('download_update',       upsert);
+		const offUpdate = svc.on('download_update', (item) => {
+			upsert(item);
+			if (item.status === 'completed') {
+				fireNotification(
+					'Download complete',
+					[item.title, item.artist].filter(Boolean).join(' — ')
+				);
+			}
+		});
 		const offMeta   = svc.on('metadata_job_update',   (job) => {
 			setMetadataJobs(prev => {
 				const idx = prev.findIndex(j => j.id === job.id);
@@ -317,6 +336,30 @@ export default function App() {
 		setCurrentUrl('');
 		setAvailableFormats(null);
 	}, []);
+
+	// ── Bulk URL submit: queue all without format selector ──────────────────────
+	const handleBulkUrlSubmit = useCallback(async (urls) => {
+		let queued = 0, skipped = 0, failed = 0;
+		for (const url of urls) {
+			try {
+				const dl = await api.createDownload(url, 'bestaudio/best');
+				// 'completed' status means it was a duplicate that already existed
+				if (dl.status === 'queued' || dl.status === 'downloading') {
+					queued++;
+					upsert(dl);
+				} else {
+					skipped++;
+				}
+			} catch {
+				failed++;
+			}
+		}
+		const parts = [];
+		if (queued)  parts.push(`${queued} queued`);
+		if (skipped) parts.push(`${skipped} skipped`);
+		if (failed)  parts.push(`${failed} failed`);
+		showToast(parts.join(', ') || 'Nothing to queue', queued > 0 ? 'success' : 'warning');
+	}, [showToast, upsert]);
 
 	// ── Cancel ─────────────────────────────────────────────────────────────────
 	const handleCancel = useCallback(async (id) => {
@@ -398,7 +441,7 @@ export default function App() {
 	// ── Metadata processing handlers ────────────────────────────────────────────
 	const handleMetadataJobStarted = useCallback((jobId) => {
 		showToast(`Started metadata processing (Job: ${jobId.slice(0, 8)}...)`);
-		setMode('metadata');  // Switch to metadata tab
+		setMode('channel');
 	}, [showToast]);
 
 	const handleMetadataError = useCallback((message, severity = 'error') => {
@@ -819,7 +862,8 @@ export default function App() {
 								{!isMobile && <Header stats={stats} />}
 								
 								<Box sx={cardSx}>
-									<DownloadForm onSubmit={handleUrlSubmit} />
+									<SearchBar onAdd={handleUrlSubmit} />
+									<DownloadForm onSubmit={handleUrlSubmit} onBulkSubmit={handleBulkUrlSubmit} />
 								</Box>
 								
 								{/* Queue / history card */}

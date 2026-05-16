@@ -1,11 +1,12 @@
 // frontend/src/components/DownloadItem.js
 import React, { memo, useState } from 'react';
 import {
-  Box, Chip, Collapse, IconButton, LinearProgress,
+  Box, Chip, CircularProgress, Collapse, IconButton, LinearProgress,
   Tooltip, Typography,
 } from '@mui/material';
 import AlbumIcon        from '@mui/icons-material/Album';
 import AudiotrackIcon   from '@mui/icons-material/Audiotrack';
+import AutoFixHighIcon  from '@mui/icons-material/AutoFixHigh';
 import CancelIcon       from '@mui/icons-material/Cancel';
 import CheckCircleIcon  from '@mui/icons-material/CheckCircle';
 import ContentCopyIcon  from '@mui/icons-material/ContentCopy';
@@ -16,6 +17,7 @@ import PersonIcon       from '@mui/icons-material/Person';
 import PlaylistPlayIcon from '@mui/icons-material/PlaylistPlay';
 import QueueIcon        from '@mui/icons-material/Queue';
 import RefreshIcon      from '@mui/icons-material/Refresh';
+import { api } from '../api';
 
 // ── Colour / icon mappings ────────────────────────────────────────────────────
 
@@ -38,13 +40,23 @@ const TYPE_ICON = {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 function DownloadItem({ download: d, onCancel, onRetry }) {
-  const [copied,   setCopied]   = useState(false);
-  const [errOpen,  setErrOpen]  = useState(false);
+  const [copied,    setCopied]    = useState(false);
+  const [errOpen,   setErrOpen]   = useState(false);
+  const [enriching, setEnriching] = useState(false);
 
   const canCancel  = d.status === 'queued' || d.status === 'downloading';
   const canRetry   = d.status === 'failed' || d.status === 'cancelled';
   const isActive   = d.status === 'downloading' || d.status === 'processing';
   const hasError   = !!d.error_message;
+
+  const enrichStatus = d.enrichment_status;
+  const canEnrich    = d.status === 'completed' && enrichStatus !== 'enriching';
+
+  const handleEnrich = async () => {
+    setEnriching(true);
+    try { await api.enrichDownload(d.id); } catch { /* ignore */ }
+    finally { setEnriching(false); }
+  };
 
   const meta       = STATUS[d.status] || STATUS.queued;
   const color      = meta.color;
@@ -251,6 +263,44 @@ function DownloadItem({ download: d, onCancel, onRetry }) {
                 }}
               />
             )}
+
+            {/* Enrichment status badge */}
+            {enrichStatus === 'enriched' && (
+              <Chip
+                label="MB Enriched"
+                size="small"
+                sx={{
+                  height: 17, fontSize: '0.58rem', fontWeight: 600,
+                  color: '#34D399', bgcolor: 'transparent',
+                  border: '1px solid rgba(52,211,153,0.3)',
+                  '& .MuiChip-label': { px: 0.75 },
+                }}
+              />
+            )}
+            {(enrichStatus === 'enriching' || enriching) && (
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                <CircularProgress size={9} sx={{ color: '#A78BFA' }} />
+                <Typography sx={{ fontSize: '0.58rem', color: '#A78BFA' }}>Enriching…</Typography>
+              </Box>
+            )}
+
+            {/* Re-enrich button (completed, not currently enriching) */}
+            {canEnrich && enrichStatus !== 'enriching' && !enriching && (
+              <Tooltip title={enrichStatus === 'enriched' ? 'Re-enrich metadata' : 'Enrich with MusicBrainz'}>
+                <IconButton
+                  size="small"
+                  onClick={handleEnrich}
+                  sx={{
+                    width: 20, height: 20, p: 0,
+                    color: enrichStatus === 'enriched' ? 'rgba(52,211,153,0.5)' : 'rgba(167,139,250,0.4)',
+                    '&:hover': { color: '#A78BFA', bgcolor: 'rgba(139,92,246,0.08)' },
+                  }}
+                >
+                  <AutoFixHighIcon sx={{ fontSize: 12 }} />
+                </IconButton>
+              </Tooltip>
+            )}
+
             <Typography sx={{ fontSize: '0.63rem', color: 'rgba(255,255,255,0.2)', ml: 'auto' }}>
               {dateStr}
             </Typography>

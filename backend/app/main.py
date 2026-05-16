@@ -1,4 +1,5 @@
 # backend/app/main.py
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -18,12 +19,14 @@ from app.downloader import download_manager
 from app.models import Download, DownloadStatus, MetadataProcessingJob, MetadataPlaylistItem
 from app.queue_service import batch_queue_service, queue_service
 from app.metadata_service import metadata_service
+from app.enrichment_service import enrichment_service
 from app.schemas import (
     BatchStatusResponse, ChannelPlaylistsResponse, ChannelQueueRequest, ChannelQueueResponse,
     ChannelRequest, DownloadCreate, DownloadResponse, PaginatedDownloadsResponse,
     FormatListResponse, ErrorDetail, StatsResponse,
     MetadataProcessingRequest, MetadataProcessingResponse, MetadataProcessingJob as MetadataProcessingJobSchema,
-    MetadataPlaylistItem as MetadataPlaylistItemSchema, MetadataItemSelectionRequest, MetadataQueueSelectedRequest
+    MetadataPlaylistItem as MetadataPlaylistItemSchema, MetadataItemSelectionRequest, MetadataQueueSelectedRequest,
+    SearchResponse, ReorderRequest,
 )
 
 logging.basicConfig(
@@ -96,6 +99,27 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health():
     return {"status": "healthy", "ts": datetime.utcnow().isoformat()}
+
+
+@app.get(
+    "/search",
+    response_model=SearchResponse,
+    tags=["Search"],
+)
+async def search_youtube_music(
+    q: str = Query(..., min_length=1, description="Search query"),
+    limit: int = Query(10, ge=1, le=30, description="Max results"),
+):
+    """Search YouTube Music for tracks, albums, or artists."""
+    try:
+        results = await download_manager.search(q, limit)
+        return {"results": results, "query": q, "total": len(results)}
+    except Exception as exc:
+        logger.error("Search failed for '%s': %s", q, exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Search failed: {exc}",
+        )
 
 
 @app.post(
@@ -258,6 +282,24 @@ async def get_stats(session: AsyncSession = Depends(get_session)):
     }
 
 
+@app.post(
+    "/downloads/reorder",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Downloads"],
+)
+async def reorder_downloads(
+    body: ReorderRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Bulk-update priority values for queued downloads to change their processing order."""
+    for item in body.items:
+        dl = await session.get(Download, item.id)
+        if dl and dl.status == DownloadStatus.QUEUED:
+            dl.priority    = item.priority
+            dl.updated_at  = datetime.utcnow()
+    await session.commit()
+
+
 @app.get(
     "/downloads/{download_id}",
     response_model=DownloadResponse,
@@ -314,6 +356,51 @@ async def _retry_download_with_retry(session: AsyncSession, dl: Download) -> dic
     await queue_service.enqueue(dl.id)
     logger.info("Retrying download %d", dl.id)
     return dl.to_dict()
+
+
+@app.post(
+    "/downloads/{download_id}/enrich",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Downloads"],
+)
+async def enrich_download(download_id: int, session: AsyncSession = Depends(get_session)):
+    """Manually trigger AcoustID/MusicBrainz metadata enrichment for a completed download."""
+    dl = await session.get(Download, download_id)
+    if not dl:
+        raise HTTPException(status_code=404, detail="Not found")
+    if dl.status != DownloadStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Enrichment is only available for completed downloads",
+        )
+    asyncio.create_task(
+        enrichment_service.enrich_download(download_id),
+        name=f"enrich-{download_id}",
+    )
+    return {"message": f"Enrichment started for download {download_id}"}
+
+
+@app.post(
+    "/downloads/enrich-all",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Downloads"],
+)
+async def enrich_all_downloads(session: AsyncSession = Depends(get_session)):
+    """Re-enrich all completed downloads that haven't been enriched yet."""
+    from sqlalchemy import select as sa_select
+    result = await session.execute(
+        sa_select(Download).where(
+            Download.status == DownloadStatus.COMPLETED,
+            Download.enrichment_status.notin_(["enriched", "enriching"]),
+        )
+    )
+    pending = result.scalars().all()
+    for dl in pending:
+        asyncio.create_task(
+            enrichment_service.enrich_download(dl.id),
+            name=f"enrich-{dl.id}",
+        )
+    return {"message": f"Enrichment started for {len(pending)} downloads"}
 
 
 @app.delete(

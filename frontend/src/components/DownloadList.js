@@ -1,5 +1,5 @@
 // frontend/src/components/DownloadList.js
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Box, Button, CircularProgress,
   InputAdornment, MenuItem, Select, Tab, Tabs,
@@ -8,11 +8,21 @@ import {
 import ClearAllIcon        from '@mui/icons-material/ClearAll';
 import ChevronLeftIcon     from '@mui/icons-material/ChevronLeft';
 import ChevronRightIcon    from '@mui/icons-material/ChevronRight';
+import DragIndicatorIcon   from '@mui/icons-material/DragIndicator';
 import FirstPageIcon       from '@mui/icons-material/FirstPage';
 import LastPageIcon        from '@mui/icons-material/LastPage';
 import RefreshIcon         from '@mui/icons-material/Refresh';
 import SearchIcon          from '@mui/icons-material/Search';
+import {
+  DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors,
+} from '@dnd-kit/core';
+import {
+  arrayMove, SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy,
+  useSortable,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import DownloadItem from './DownloadItem';
+import { api } from '../api';
 
 // ── Tab definition ────────────────────────────────────────────────────────────
 
@@ -75,22 +85,18 @@ function Paginator({ page, totalPages, pageSize, onPage, onPageSize, totalItems 
       display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       mt: 1.5, flexWrap: 'wrap', gap: 1,
     }}>
-      {/* Left: item range */}
       <Typography sx={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.25)', minWidth: 90 }}>
         {from}–{to} of {totalItems}
       </Typography>
 
-      {/* Centre: page nav */}
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
         <Button variant="text" disabled={page === 1}          onClick={() => onPage(1)}           sx={btnSx(page === 1)}><FirstPageIcon   sx={{ fontSize: 16 }} /></Button>
         <Button variant="text" disabled={page === 1}          onClick={() => onPage(page - 1)}    sx={btnSx(page === 1)}><ChevronLeftIcon  sx={{ fontSize: 16 }} /></Button>
 
-        {/* Page number pills */}
         {Array.from({ length: totalPages }, (_, i) => i + 1)
           .filter(p => p === 1 || p === totalPages || Math.abs(p - page) <= 2)
           .reduce((acc, p, idx, arr) => {
-            if (idx > 0 && p - arr[idx - 1] > 1)
-              acc.push('…');
+            if (idx > 0 && p - arr[idx - 1] > 1) acc.push('…');
             acc.push(p);
             return acc;
           }, [])
@@ -121,7 +127,6 @@ function Paginator({ page, totalPages, pageSize, onPage, onPageSize, totalItems 
         <Button variant="text" disabled={page === totalPages} onClick={() => onPage(totalPages)} sx={btnSx(page === totalPages)}><LastPageIcon    sx={{ fontSize: 16 }} /></Button>
       </Box>
 
-      {/* Right: page-size selector */}
       <Select
         value={pageSize}
         onChange={e => { onPageSize(Number(e.target.value)); onPage(1); }}
@@ -143,24 +148,78 @@ function Paginator({ page, totalPages, pageSize, onPage, onPageSize, totalItems 
   );
 }
 
+// ── Sortable item wrapper (queued tab only) ───────────────────────────────────
+
+function SortableDownloadItem({ download, onCancel, onRetry }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: download.id });
+
+  return (
+    <Box
+      ref={setNodeRef}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.45 : 1,
+        position: 'relative',
+        zIndex: isDragging ? 10 : 'auto',
+      }}
+      sx={{ display: 'flex', alignItems: 'stretch', gap: 0 }}
+    >
+      {/* Drag handle */}
+      <Box
+        {...attributes}
+        {...listeners}
+        sx={{
+          display: 'flex', alignItems: 'center', px: 0.5,
+          cursor: 'grab', color: 'rgba(255,255,255,0.18)',
+          '&:hover': { color: 'rgba(255,255,255,0.45)' },
+          flexShrink: 0,
+          touchAction: 'none',
+        }}
+      >
+        <DragIndicatorIcon sx={{ fontSize: 18 }} />
+      </Box>
+      <Box sx={{ flex: 1, minWidth: 0 }}>
+        <DownloadItem download={download} onCancel={onCancel} onRetry={onRetry} />
+      </Box>
+    </Box>
+  );
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function DownloadList({ 
-  downloads, loading, pagination, onCancel, onRetry, onBulkDelete, onRetryAll, onLoadMore 
+export default function DownloadList({
+  downloads, loading, pagination, onCancel, onRetry, onBulkDelete, onRetryAll, onLoadMore
 }) {
-  const [tab,      setTab]      = useState('all');
-  const [search,   setSearch]   = useState('');
-  const [page,     setPage]     = useState(1);
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [tab,         setTab]         = useState('all');
+  const [search,      setSearch]      = useState('');
+  const [page,        setPage]        = useState(1);
+  const [pageSize,    setPageSize]    = useState(DEFAULT_PAGE_SIZE);
+  const [queuedOrder, setQueuedOrder] = useState(null); // ordered id list for queued tab
 
   // Reset to page 1 whenever tab or search changes
   useEffect(() => { setPage(1); }, [tab, search]);
 
+  // Sync queued order when filtered list or tab changes
+  useEffect(() => {
+    if (tab !== 'queued') {
+      setQueuedOrder(null);
+      return;
+    }
+    setQueuedOrder(prev => {
+      const allQueuedIds = downloads.filter(d => d.status === 'queued').map(d => d.id);
+      if (!prev) return allQueuedIds;
+      const idSet = new Set(allQueuedIds);
+      const kept  = prev.filter(id => idSet.has(id));
+      const added = allQueuedIds.filter(id => !prev.includes(id));
+      return [...kept, ...added];
+    });
+  }, [downloads, tab]);
+
   const counts = useCounts(downloads);
 
-  // Active = downloading + processing
-  const activeCount    = (counts.downloading ?? 0) + (counts.processing ?? 0);
-  const tabCount = (t) => {
+  const activeCount = (counts.downloading ?? 0) + (counts.processing ?? 0);
+  const tabCount    = (t) => {
     if (t.key === 'all')    return downloads.length;
     if (t.key === 'active') return activeCount;
     return counts[t.statuses[0]] ?? 0;
@@ -184,17 +243,51 @@ export default function DownloadList({
     return list;
   }, [downloads, tab, search]);
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
-  const safePage   = Math.min(page, totalPages);
-  const visible    = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
+  // For queued tab: apply user-defined sort order; for others: use filtered as-is
+  const orderedList = useMemo(() => {
+    if (tab !== 'queued' || !queuedOrder) return filtered;
+    const idMap = new Map(filtered.map(d => [d.id, d]));
+    return queuedOrder.map(id => idMap.get(id)).filter(Boolean);
+  }, [tab, queuedOrder, filtered]);
 
-  const failedCount     = counts.failed    ?? 0;
-  const completedCount  = counts.completed ?? 0;
-  const cancelledCount  = counts.cancelled ?? 0;
-  const canRetryAll     = failedCount > 0 && tab === 'failed';
-  const canClearTab     = (tab === 'completed' && completedCount > 0)
-                       || (tab === 'failed'    && failedCount    > 0)
-                       || (tab === 'cancelled' && cancelledCount > 0);
+  // Pagination only applies to non-queued tabs (queued shows all for drag accuracy)
+  const totalPages = tab === 'queued' ? 1 : Math.max(1, Math.ceil(orderedList.length / pageSize));
+  const safePage   = Math.min(page, totalPages);
+  const visible    = tab === 'queued'
+    ? orderedList
+    : orderedList.slice((safePage - 1) * pageSize, safePage * pageSize);
+
+  const failedCount    = counts.failed    ?? 0;
+  const completedCount = counts.completed ?? 0;
+  const cancelledCount = counts.cancelled ?? 0;
+  const canRetryAll    = failedCount > 0 && tab === 'failed';
+  const canClearTab    = (tab === 'completed' && completedCount > 0)
+                      || (tab === 'failed'    && failedCount    > 0)
+                      || (tab === 'cancelled' && cancelledCount > 0);
+
+  // ── DnD ──────────────────────────────────────────────────────────────────────
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  const handleDragEnd = useCallback((event) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    setQueuedOrder(prev => {
+      if (!prev) return prev;
+      const oldIndex = prev.indexOf(active.id);
+      const newIndex = prev.indexOf(over.id);
+      if (oldIndex === -1 || newIndex === -1) return prev;
+      const next = arrayMove(prev, oldIndex, newIndex);
+      // Persist to backend (fire-and-forget)
+      const items = next.map((id, idx) => ({ id, priority: idx * 10 }));
+      api.reorderDownloads(items).catch(() => {});
+      return next;
+    });
+  }, []);
 
   if (loading) {
     return (
@@ -211,8 +304,6 @@ export default function DownloadList({
         display: 'flex', alignItems: 'center', gap: 1.5,
         mb: 1.5, flexWrap: 'wrap',
       }}>
-
-        {/* Search */}
         <TextField
           size="small"
           placeholder="Search title, artist, album…"
@@ -240,7 +331,6 @@ export default function DownloadList({
           }}
         />
 
-        {/* Retry all failed */}
         {canRetryAll && (
           <Tooltip title="Re-queue all failed downloads">
             <Button
@@ -259,7 +349,6 @@ export default function DownloadList({
           </Tooltip>
         )}
 
-        {/* Clear tab */}
         {canClearTab && (
           <Tooltip title={`Delete all ${tab} downloads`}>
             <Button
@@ -298,7 +387,7 @@ export default function DownloadList({
         }}
       >
         {TABS.map(t => {
-          const n = tabCount(t);
+          const n      = tabCount(t);
           const accent = TAB_COLORS[t.key] ?? '#8B5CF6';
           return (
             <Tab
@@ -334,35 +423,43 @@ export default function DownloadList({
               : EMPTY_MESSAGES[tab]}
           </Typography>
         </Box>
+      ) : tab === 'queued' ? (
+        /* Queued tab: drag-and-drop sortable list (no pagination) */
+        <>
+          <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.2)', display: 'block', mb: 0.75 }}>
+            Drag to reorder — downloads are processed top to bottom
+          </Typography>
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <SortableContext items={visible.map(d => d.id)} strategy={verticalListSortingStrategy}>
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                {visible.map(d => (
+                  <SortableDownloadItem key={d.id} download={d} onCancel={onCancel} onRetry={onRetry} />
+                ))}
+              </Box>
+            </SortableContext>
+          </DndContext>
+        </>
       ) : (
+        /* All other tabs: standard paginated list */
         <>
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
             {visible.map(d => (
-              <DownloadItem
-                key={d.id}
-                download={d}
-                onCancel={onCancel}
-                onRetry={onRetry}
-              />
+              <DownloadItem key={d.id} download={d} onCancel={onCancel} onRetry={onRetry} />
             ))}
           </Box>
           <Paginator
             page={safePage}
             totalPages={totalPages}
             pageSize={pageSize}
-            totalItems={filtered.length}
+            totalItems={orderedList.length}
             onPage={setPage}
             onPageSize={setPageSize}
           />
 
-          {/* Load More button for backend pagination */}
           {pagination?.hasMore && (
-            <Box sx={{ 
-              display: 'flex', 
-              justifyContent: 'center', 
-              mt: 2,
-              pt: 2,
-              borderTop: '1px solid rgba(255,255,255,0.07)' 
+            <Box sx={{
+              display: 'flex', justifyContent: 'center',
+              mt: 2, pt: 2, borderTop: '1px solid rgba(255,255,255,0.07)',
             }}>
               <Button
                 variant="outlined"
@@ -372,24 +469,16 @@ export default function DownloadList({
                   textTransform: 'none',
                   color: 'rgba(255,255,255,0.7)',
                   borderColor: 'rgba(255,255,255,0.2)',
-                  '&:hover': {
-                    borderColor: '#8B5CF6',
-                    color: '#A78BFA',
-                  }
+                  '&:hover': { borderColor: '#8B5CF6', color: '#A78BFA' },
                 }}
               >
-                {loading ? 'Loading...' : `Load More (${pagination.total - downloads.length} remaining)`}
+                {loading ? 'Loading…' : `Load More (${pagination.total - downloads.length} remaining)`}
               </Button>
             </Box>
           )}
 
-          {/* Total count info */}
           {pagination?.total && (
-            <Box sx={{ 
-              textAlign: 'center', 
-              mt: 1,
-              pt: 1,
-            }}>
+            <Box sx={{ textAlign: 'center', mt: 1 }}>
               <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.3)' }}>
                 Showing {downloads.length} of {pagination.total} total downloads
               </Typography>
@@ -400,4 +489,3 @@ export default function DownloadList({
     </Box>
   );
 }
-

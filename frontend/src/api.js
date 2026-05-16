@@ -42,6 +42,22 @@ export const api = {
 	bulkDelete: (statusValue) =>
 		http.delete('/downloads', { params: { status: statusValue } }),
 
+	// Reorder queued downloads by updating their priorities
+	reorderDownloads: (items) =>
+		http.post('/downloads/reorder', { items }),
+
+	// Trigger AcoustID/MusicBrainz enrichment for a completed download
+	enrichDownload: (id) =>
+		http.post(`/downloads/${id}/enrich`).then(r => r.data),
+
+	// Re-enrich all completed downloads not yet enriched
+	enrichAllDownloads: () =>
+		http.post('/downloads/enrich-all').then(r => r.data),
+
+	// ── Search ─────────────────────────────────────────────────────────────────
+	search: (q, limit = 10) =>
+		http.get('/search', { params: { q, limit } }).then(r => r.data),
+
 	// ── Channel Import ──────────────────────────────────────────────────────────
 	getChannelPlaylists: (url) =>
 		http.post('/channel/playlists', { url }).then(r => r.data),

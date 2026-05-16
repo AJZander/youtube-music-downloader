@@ -11,7 +11,7 @@ import yt_dlp
 
 from app.config import settings
 from app.models import DownloadStatus
-from app.utils import clean_artist_for_folder
+from app.utils import clean_artist_for_folder, strip_channel_suffixes
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,72 @@ class DownloadManager:
         self._root: Path = settings.download_dir
         self._root.mkdir(parents=True, exist_ok=True)
         self._last_download_time: float = 0.0
+
+    async def search(self, query: str, limit: int = 10) -> list[dict]:
+        """Search YouTube Music and return matching tracks/albums."""
+        loop = asyncio.get_event_loop()
+
+        opts = self._get_base_ydl_opts()
+        opts.update({
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+        })
+
+        def _run():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                # ytsearch works reliably; ytmsearch scheme is not supported by this yt-dlp build
+                return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+
+        try:
+            raw = await loop.run_in_executor(None, _run)
+        except Exception as exc:
+            logger.error("Search failed for '%s': %s", query, exc)
+            raise RuntimeError(f"Search failed: {exc}")
+
+        if not raw or not raw.get("entries"):
+            return []
+
+        results = []
+        for entry in (raw.get("entries") or []):
+            if not entry:
+                continue
+
+            # Skip channel/playlist entries — only keep individual video results
+            if entry.get("ie_key") != "Youtube":
+                continue
+
+            thumbnails = entry.get("thumbnails") or []
+            # Prefer highest-resolution thumbnail (last in list)
+            thumb = thumbnails[-1].get("url") if thumbnails else entry.get("thumbnail")
+
+            video_id = entry.get("id")
+            url_out = (
+                entry.get("url")
+                or entry.get("webpage_url")
+                or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
+            )
+            if not url_out:
+                continue
+
+            results.append({
+                "id": video_id,
+                "title": entry.get("title", "Unknown"),
+                "artist": strip_channel_suffixes(
+                    entry.get("artist")
+                    or entry.get("uploader")
+                    or entry.get("channel")
+                    or "Unknown Artist"
+                ),
+                "album": entry.get("album"),
+                "duration": int(entry["duration"]) if entry.get("duration") else None,
+                "thumbnail": thumb,
+                "url": url_out,
+                "view_count": entry.get("view_count"),
+            })
+
+        return results
 
     async def get_formats(self, url: str) -> dict:
         """
@@ -683,6 +749,7 @@ class DownloadManager:
         format_id: str = "bestaudio/best",
         on_progress: Optional[Callable[[float], None]] = None,
         on_status: Optional[Callable[[DownloadStatus, float], None]] = None,
+        artist_hint: Optional[str] = None,
     ) -> dict:
         """Download audio from URL with user-selected format."""
         await self._enforce_rate_limit()
@@ -692,8 +759,8 @@ class DownloadManager:
 
         while True:
             try:
-                logger.info("Starting download (format: %s)", format_id)
-                result = await self._attempt_download(url, format_id, on_progress, on_status)
+                logger.info("Starting download (format: %s, artist_hint: %r)", format_id, artist_hint)
+                result = await self._attempt_download(url, format_id, on_progress, on_status, artist_hint)
                 self._last_download_time = time.time()
                 return result
 
@@ -743,6 +810,7 @@ class DownloadManager:
         format_id: str,
         on_progress: Optional[Callable],
         on_status: Optional[Callable],
+        artist_hint: Optional[str] = None,
     ) -> dict:
         """Perform the actual download with selected format."""
         loop = asyncio.get_event_loop()
@@ -754,12 +822,19 @@ class DownloadManager:
         info = await self.get_info(url)
         normalised = info
 
-        # Build output template
-        clean_artist = normalised["folder_artist"]
+        # Build output template.
+        # artist_hint comes from the DB record (which may have been set from the channel
+        # scan — more reliable than the flat-extract uploader for official YTM playlists).
+        # Prefer it over the flat-extract result when it's a real name.
+        if artist_hint and strip_channel_suffixes(artist_hint) not in ("", "Unknown Artist"):
+            clean_artist = clean_artist_for_folder(strip_channel_suffixes(artist_hint))
+            logger.info("[download] using artist_hint for folder: %r → %r", artist_hint, clean_artist)
+        else:
+            clean_artist = normalised["folder_artist"]
         outtmpl = str(
             self._root
             / clean_artist
-            / "%(album,playlist,Unknown Album)s"
+            / "%(playlist|album|Unknown Album)s"
             / "%(playlist_index&{:02d} - |)s%(title)s.%(ext)s"
         )
 
@@ -768,26 +843,56 @@ class DownloadManager:
         dl_opts.update({
             # USER-SELECTED FORMAT
             "format": format_id,
-            
+
             # Output template
             "outtmpl": outtmpl,
-            
+
             # Thumbnail handling
             "writethumbnail": True,
             "embedthumbnail": True,
-            
+
             # Progress hook
             "progress_hooks": [self._make_progress_hook(on_progress, loop)],
-            
+
+            # Postprocessor hook — logs per-track metadata as each PP stage completes
+            "postprocessor_hooks": [self._make_pp_hook()],
+
             # Quiet mode
             "quiet": not settings.debug,
             "no_warnings": not settings.debug,
-            
+
             # Continue on errors in playlists
             "ignoreerrors": True,
-            
+
             # Post-processing
             "postprocessors": self._get_postprocessors(),
+
+            # Fix metadata tags before embedding.
+            # Rules run in order; each modifies the info_dict before FFmpegMetadata embeds tags.
+            #
+            # Key insight for channel imports:
+            #   - playlist_uploader = the channel owner (the artist) — same for ALL tracks
+            #   - uploader          = per-track uploader (often the record label, NOT the artist)
+            #   - playlist          = playlist/album title — same for ALL tracks
+            #   - album             = per-track album field — may be empty or inconsistent
+            "parse_metadata": [
+                # 1. Ensure artist tag is set: prefer per-track artist, fall back to channel owner
+                #    (avoids using the record label's name as artist)
+                r"%(artist|playlist_uploader|uploader|channel)s:^(?P<artist>.+)$",
+                # 2. Set album_artist from the channel owner (consistent across all tracks)
+                #    playlist_uploader is the artist channel, not the per-track label uploader
+                r"%(playlist_uploader|uploader|channel)s:^(?P<album_artist>.+)$",
+                # 3. Set album from playlist title (same for every track in the album)
+                #    Falls back to per-track album field for single-song downloads
+                r"%(playlist|album)s:^(?P<album>.+)$",
+                # 4-9. Strip YouTube auto-channel suffixes from artist/album_artist tags
+                r"%(artist)s:^(?P<artist>.+?)\s+-\s+Topic\s*$",
+                r"%(artist)s:^(?P<artist>.+?)\s*VEVO\s*$",
+                r"%(artist)s:^(?P<artist>.+?)\s+Official(?:\s+Channel)?\s*$",
+                r"%(album_artist)s:^(?P<album_artist>.+?)\s+-\s+Topic\s*$",
+                r"%(album_artist)s:^(?P<album_artist>.+?)\s*VEVO\s*$",
+                r"%(album_artist)s:^(?P<album_artist>.+?)\s+Official(?:\s+Channel)?\s*$",
+            ],
         })
 
         def _do_download():
@@ -846,7 +951,18 @@ class DownloadManager:
             "retries": 3,
             "fragment_retries": 3,
             "socket_timeout": 30,
+            # Sanitize album/track names from outtmpl substitutions (removes :?<> etc.)
+            "windowsfilenames": True,
         }
+
+        # Load YouTube cookies for Premium quality and authenticated content
+        cookies_file = settings.cookies_dir / "cookies.txt"
+        if cookies_file.exists():
+            opts["cookiefile"] = str(cookies_file)
+            logger.info("Using cookies from %s", cookies_file)
+
+        # Skip re-downloading videos already in the archive
+        opts["download_archive"] = str(settings.archive_file)
 
         return opts
 
@@ -887,6 +1003,43 @@ class DownloadManager:
         })
 
         return postprocessors
+
+    def _make_pp_hook(self) -> Callable:
+        """Postprocessor hook — logs per-track metadata after parse_metadata and FFmpegMetadata run."""
+        def _pp_hook(d: dict) -> None:
+            if d.get("status") != "finished":
+                return
+            pp = d.get("postprocessor", "")
+            info = d.get("info_dict", {})
+            title = info.get("title", "?")
+
+            if "MetadataFromField" in pp:
+                logger.debug(
+                    "[PP:MetadataFromField] '%s' → artist=%r album_artist=%r album=%r | "
+                    "src: playlist_uploader=%r uploader=%r channel=%r playlist=%r",
+                    title,
+                    info.get("artist"), info.get("album_artist"), info.get("album"),
+                    info.get("playlist_uploader"), info.get("uploader"),
+                    info.get("channel"), info.get("playlist"),
+                )
+            elif pp == "FFmpegMetadata":
+                logger.info(
+                    "[PP:FFmpegMetadata] '%s' — embedding: artist=%r albumartist=%r album=%r "
+                    "title=%r date=%r genre=%r | file=%s",
+                    title,
+                    info.get("artist"), info.get("album_artist"), info.get("album"),
+                    info.get("title"), info.get("release_date") or info.get("upload_date"),
+                    info.get("genre"),
+                    info.get("filepath") or info.get("filename", "?"),
+                )
+            elif pp == "FFmpegExtractAudio":
+                logger.debug(
+                    "[PP:ExtractAudio] '%s' → %s",
+                    title,
+                    info.get("filepath") or info.get("filename", "?"),
+                )
+
+        return _pp_hook
 
     def _make_progress_hook(
         self,
@@ -941,18 +1094,22 @@ class DownloadManager:
         """Normalize metadata from yt-dlp."""
         from app.utils import detect_download_type
 
-        if raw.get("_type") == "playlist":
+        is_playlist = raw.get("_type") == "playlist"
+
+        if is_playlist:
             entries = raw.get("entries", [])
             first_entry = next((e for e in entries if e), {})
-            
+
             raw_artist = (
-                raw.get("uploader")
+                raw.get("artist")                 # YTM playlists sometimes have top-level artist
+                or raw.get("uploader")
                 or raw.get("channel")
                 or first_entry.get("artist")
                 or first_entry.get("uploader")
+                or first_entry.get("channel")
                 or "Unknown Artist"
             )
-            
+
             raw_album = raw.get("title", "Unknown Album")
             total_tracks = len([e for e in entries if e])
         else:
@@ -962,11 +1119,14 @@ class DownloadManager:
                 or raw.get("channel")
                 or "Unknown Artist"
             )
-            
+
             raw_album = raw.get("album") or raw.get("title", "Unknown Album")
             total_tracks = 1
 
-        return {
+        # Strip YouTube auto-channel suffixes ("- Topic", "VEVO", "Official") from artist name
+        raw_artist = strip_channel_suffixes(raw_artist)
+
+        result = {
             "title": raw.get("title", "Unknown"),
             "artist": raw_artist,
             "folder_artist": clean_artist_for_folder(raw_artist),
@@ -974,6 +1134,105 @@ class DownloadManager:
             "download_type": detect_download_type(url, raw),
             "total_tracks": total_tracks,
         }
+
+        logger.info(
+            "[normalise_info] type=%s title=%r artist=%r album=%r tracks=%d | "
+            "raw: uploader=%r channel=%r playlist_uploader=%r playlist=%r album_field=%r",
+            "playlist" if is_playlist else "single",
+            result["title"], result["artist"], result["album"], total_tracks,
+            raw.get("uploader"), raw.get("channel"), raw.get("playlist_uploader"),
+            raw.get("playlist"), raw.get("album"),
+        )
+
+        return result
+
+
+    async def fix_tags_after_download(self, artist: str) -> int:
+        """
+        Post-download tag fixer — runs in thread pool.
+        Walks every album subfolder under the artist directory and writes:
+          - albumartist (critical for Plex — must be consistent across all tracks)
+          - album tag (from folder name when missing, common for non-official playlists)
+          - cleaned artist tag (strips 'Official', 'VEVO', '- Topic')
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: self._fix_tags_sync(artist))
+
+    def _fix_tags_sync(self, artist: str) -> int:
+        import mutagen
+
+        AUDIO_EXTS = {'.opus', '.m4a', '.mp3', '.flac', '.ogg', '.wav', '.aac', '.webm'}
+
+        # The album artist tag should be the clean display name (no 'Official' etc.)
+        display_artist = strip_channel_suffixes(artist)
+        clean = clean_artist_for_folder(artist)
+        artist_dir = self._root / clean
+
+        if not artist_dir.exists():
+            # Folder may have been created before suffix-stripping was added (e.g. "Salmo Official").
+            # Search for any directory whose name contains the display artist name.
+            for d in self._root.iterdir():
+                if d.is_dir() and display_artist.lower() in d.name.lower():
+                    artist_dir = d
+                    logger.info("[tag_fixer] found pre-strip folder: %s", artist_dir)
+                    break
+            else:
+                logger.warning("[tag_fixer] artist dir not found: %s (no fuzzy match for %r)", artist_dir, display_artist)
+                return 0
+
+        fixed = 0
+        for album_dir in artist_dir.iterdir():
+            if not album_dir.is_dir():
+                continue
+            album_name = album_dir.name
+
+            audio_files: list[Path] = []
+            for ext in AUDIO_EXTS:
+                audio_files.extend(album_dir.glob(f"*{ext}"))
+
+            for fpath in audio_files:
+                try:
+                    audio = mutagen.File(str(fpath), easy=True)
+                    if audio is None:
+                        continue
+
+                    changed = False
+
+                    # 1. albumartist — must be identical on every track for Plex to group correctly
+                    existing_aa = (audio.get("albumartist") or [""])[0]
+                    if existing_aa != display_artist:
+                        audio["albumartist"] = [display_artist]
+                        changed = True
+
+                    # 2. album — fill from folder name when yt-dlp didn't embed it
+                    existing_album = (audio.get("album") or [""])[0]
+                    if not existing_album:
+                        audio["album"] = [album_name]
+                        changed = True
+
+                    # 3. artist — strip YouTube channel suffixes (Official, VEVO, - Topic)
+                    existing_artist = (audio.get("artist") or [""])[0]
+                    if existing_artist:
+                        cleaned = strip_channel_suffixes(existing_artist)
+                        if cleaned != existing_artist:
+                            audio["artist"] = [cleaned]
+                            changed = True
+
+                    if changed:
+                        audio.save()
+                        fixed += 1
+                        logger.info(
+                            "[tag_fixer] %-50s → albumartist=%-20r album=%-25r artist=%r",
+                            fpath.name[:50],
+                            (audio.get("albumartist") or ["?"])[0],
+                            (audio.get("album") or ["?"])[0],
+                            (audio.get("artist") or ["?"])[0],
+                        )
+                except Exception as exc:
+                    logger.warning("[tag_fixer] failed on %s: %s", fpath.name, exc)
+
+        logger.info("[tag_fixer] %d file(s) fixed for artist %r in %s", fixed, display_artist, artist_dir)
+        return fixed
 
 
 download_manager = DownloadManager()

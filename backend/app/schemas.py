@@ -237,6 +237,25 @@ class MetadataPlaylistItem(BaseModel):
         from_attributes = True
 
 
+# ── Search Schemas ───────────────────────────────────────────────────────────
+
+class SearchResult(BaseModel):
+    id: Optional[str] = None
+    title: str
+    artist: str
+    album: Optional[str] = None
+    duration: Optional[int] = None
+    thumbnail: Optional[str] = None
+    url: str
+    view_count: Optional[int] = None
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResult]
+    query: str
+    total: int
+
+
 class MetadataItemSelectionRequest(BaseModel):
     """Request to update selection status of metadata items."""
     item_ids: list[int]
@@ -246,3 +265,13 @@ class MetadataItemSelectionRequest(BaseModel):
 class MetadataQueueSelectedRequest(BaseModel):
     """Request to queue selected metadata items for download."""
     format_id: str = "bestaudio/best"
+
+
+# ── Queue Reorder Schemas ────────────────────────────────────────────────────
+
+class ReorderItem(BaseModel):
+    id: int
+    priority: int
+
+class ReorderRequest(BaseModel):
+    items: list[ReorderItem]

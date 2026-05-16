@@ -48,10 +48,18 @@ async def init_db() -> None:
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Enable WAL mode for better concurrency
             from sqlalchemy import text
             await conn.execute(text("PRAGMA journal_mode=WAL"))
-            await conn.execute(text("PRAGMA busy_timeout=30000"))  # 30 seconds
+            await conn.execute(text("PRAGMA busy_timeout=30000"))
+            # Safe migrations: add new columns to existing downloads table
+            for ddl in [
+                "ALTER TABLE downloads ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE downloads ADD COLUMN enrichment_status TEXT",
+            ]:
+                try:
+                    await conn.execute(text(ddl))
+                except Exception:
+                    pass  # Column already exists
         logger.info("Database ready at %s", _db_file)
     except Exception:
         logger.exception("Failed to initialise database")

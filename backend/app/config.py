@@ -1,6 +1,6 @@
 # backend/app/config.py
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 from pydantic_settings import BaseSettings
 
 
@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     download_dir: Path = Path("/downloads")
     database_url: str = "sqlite+aiosqlite:////app/data/downloads.db"
     cookies_dir: Path = Path("/app/data/cookies")
+    archive_file: Path = Path("/app/data/download_archive.txt")
+
+    # AcoustID API key for audio fingerprint lookups (https://acoustid.org/api-key)
+    acoustid_api_key: Optional[str] = None
 
     max_concurrent_downloads: int = 1
     

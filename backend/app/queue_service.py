@@ -12,6 +12,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal, retry_on_db_lock
 from app.downloader import download_manager
 from app.models import Download, DownloadStatus
+from app.enrichment_service import enrichment_service
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +52,11 @@ class QueueService:
             )
             await session.commit()
 
-            # Load all QUEUED rows ordered oldest-first
+            # Load all QUEUED rows ordered by priority then oldest-first
             result = await session.execute(
                 select(Download)
                 .where(Download.status == DownloadStatus.QUEUED)
-                .order_by(Download.created_at)
+                .order_by(Download.priority, Download.created_at)
             )
             pending = result.scalars().all()
 
@@ -212,12 +213,15 @@ class QueueService:
             try:
                 # Use the stored format_id
                 format_id = download.format_id or "bestaudio/best"
-                
+
                 result = await download_manager.download(
                     download.url,
                     format_id=format_id,
                     on_progress=on_progress,
                     on_status=on_status,
+                    # Pass DB artist as hint — may have been resolved from channel scan
+                    # which is more reliable than the flat-extract uploader field
+                    artist_hint=download.artist,
                 )
 
                 download.title        = result.get("title", download.title)
@@ -231,8 +235,27 @@ class QueueService:
                 download.updated_at   = datetime.utcnow()
                 await self._commit_with_retry(session, download)
                 await self._broadcast(download)
-                logger.info("Download %d completed (%s track(s))", 
-                          download_id, result.get("done_tracks"))
+                logger.info(
+                    "Download %d completed — stored: title=%r artist=%r album=%r "
+                    "tracks=%s/%s type=%s",
+                    download_id,
+                    download.title, download.artist, download.album,
+                    download.done_tracks, download.total_tracks,
+                    download.download_type,
+                )
+
+                # Fix tags immediately (albumartist, album, clean artist) — blocks briefly but safe
+                try:
+                    fixed = await download_manager.fix_tags_after_download(download.artist)
+                    logger.info("Tag fixer: %d file(s) updated for download %d", fixed, download_id)
+                except Exception as exc:
+                    logger.warning("Tag fixer failed for download %d: %s", download_id, exc)
+
+                # Auto-enrich in background (non-blocking)
+                asyncio.create_task(
+                    enrichment_service.enrich_download(download_id),
+                    name=f"enrich-{download_id}",
+                )
 
             except asyncio.CancelledError:
                 logger.info("Download %d was cancelled", download_id)
@@ -398,11 +421,25 @@ class BatchQueueService:
                 )
                 return True  # Skipped
             
+            # Resolve best artist name.
+            # playlist["channel"] comes from the channel scan and is more reliable than
+            # the flat-extract uploader (which can be a label/distributor like "Release").
+            # strip_channel_suffixes cleans "Salmo Official" → "Salmo", "- Topic" etc.
+            from app.utils import strip_channel_suffixes as _strip
+            channel_artist = _strip(playlist.get("channel") or "").strip()
+            resolved_artist = channel_artist or info["artist"]
+
+            if resolved_artist != info["artist"]:
+                logger.info(
+                    "Batch %s: artist override for '%s': %r → %r (from channel)",
+                    batch_id[:8], playlist["title"], info["artist"], resolved_artist,
+                )
+
             # Create new download
             dl = Download(
                 url           = playlist["url"],
                 title         = info["title"],
-                artist        = info["artist"],
+                artist        = resolved_artist,
                 album         = info["album"],
                 download_type = info["download_type"],
                 total_tracks  = info.get("total_tracks"),

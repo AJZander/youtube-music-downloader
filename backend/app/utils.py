@@ -19,6 +19,18 @@ _FEAT_PATTERNS = re.compile(
 
 _AMPERSAND_SPLIT = re.compile(r"\s*&\s*")
 
+_TOPIC_SUFFIX    = re.compile(r"\s*-\s*Topic\s*$",              re.IGNORECASE)
+_VEVO_SUFFIX     = re.compile(r"\s*VEVO\s*$",                   re.IGNORECASE)
+_OFFICIAL_SUFFIX = re.compile(r"\s+Official(?:\s+Channel)?\s*$", re.IGNORECASE)
+
+
+def strip_channel_suffixes(name: str) -> str:
+    """Remove YouTube auto-channel suffixes ('- Topic', 'VEVO', 'Official') from a name."""
+    name = _TOPIC_SUFFIX.sub("", name).strip()
+    name = _VEVO_SUFFIX.sub("", name).strip()
+    name = _OFFICIAL_SUFFIX.sub("", name).strip()
+    return name
+
 
 def clean_artist_for_folder(raw: str | None) -> str:
     """
@@ -42,14 +54,17 @@ def clean_artist_for_folder(raw: str | None) -> str:
 
     artist = raw.strip()
 
-    # Step 1 – take only primary artist (before first comma or ampersand)
+    # Step 1 – remove YouTube auto-channel suffixes before any further splitting
+    artist = strip_channel_suffixes(artist)
+
+    # Step 2 – take only primary artist (before first comma or ampersand)
     artist = re.split(r"\s*,\s*", artist)[0].strip()
     artist = re.split(r"\s*&\s*", artist)[0].strip()
 
-    # Step 2 – remove feat. / ft. / featuring tail
+    # Step 3 – remove feat. / ft. / featuring tail
     artist = _FEAT_PATTERNS.sub("", artist).strip()
 
-    # Step 3 – remove filesystem-unsafe characters
+    # Step 4 – remove filesystem-unsafe characters
     artist = sanitize_path_component(artist)
 
     return artist or "Unknown Artist"
