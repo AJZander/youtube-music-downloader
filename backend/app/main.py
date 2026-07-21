@@ -98,7 +98,7 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health():
-    return {"status": "healthy", "ts": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get(
@@ -296,7 +296,7 @@ async def reorder_downloads(
         dl = await session.get(Download, item.id)
         if dl and dl.status == DownloadStatus.QUEUED:
             dl.priority    = item.priority
-            dl.updated_at  = datetime.utcnow()
+            dl.updated_at  = datetime.now(timezone.utc)
     await session.commit()
 
 
@@ -350,7 +350,7 @@ async def _retry_download_with_retry(session: AsyncSession, dl: Download) -> dic
     dl.status        = DownloadStatus.QUEUED
     dl.progress      = 0.0
     dl.error_message = None
-    dl.updated_at    = datetime.utcnow()
+    dl.updated_at    = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(dl)
     await queue_service.enqueue(dl.id)
