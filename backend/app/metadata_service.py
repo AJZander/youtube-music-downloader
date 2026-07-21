@@ -96,7 +96,7 @@ class MetadataProcessingService:
                 # Update status to processing
                 job.status = MetadataProcessingStatus.PROCESSING
                 job.progress = 0.0
-                job.updated_at = datetime.utcnow()
+                job.updated_at = datetime.now(timezone.utc)
                 await session.commit()
                 await session.refresh(job)
                 await self._broadcast_job_update(job)
@@ -298,7 +298,7 @@ class MetadataProcessingService:
                 # Mark as complete
                 job.progress = 100.0
                 job.status = MetadataProcessingStatus.COMPLETED
-                job.updated_at = datetime.utcnow()
+                job.updated_at = datetime.now(timezone.utc)
                 await session.commit()
                 await session.refresh(job)
                 
@@ -318,7 +318,7 @@ class MetadataProcessingService:
                 logger.error("Metadata processing job %s failed: %s", job_id[:8], exc)
                 job.status = MetadataProcessingStatus.FAILED
                 job.error_message = str(exc)
-                job.updated_at = datetime.utcnow()
+                job.updated_at = datetime.now(timezone.utc)
                 await session.commit()
                 await session.refresh(job)
 
@@ -389,7 +389,7 @@ class MetadataProcessingService:
             
             if job.status in (MetadataProcessingStatus.PENDING, MetadataProcessingStatus.PROCESSING):
                 job.status = MetadataProcessingStatus.CANCELLED
-                job.updated_at = datetime.utcnow()
+                job.updated_at = datetime.now(timezone.utc)
                 await session.commit()
                 await session.refresh(job)
                 await self._broadcast_job_update(job)
