@@ -48,7 +48,7 @@ class QueueService:
                 update(Download)
                 .where(Download.status == DownloadStatus.DOWNLOADING)
                 .values(status=DownloadStatus.QUEUED, progress=0.0,
-                        updated_at=datetime.utcnow())
+                        updated_at=datetime.now(timezone.utc))
             )
             await session.commit()
 
@@ -117,7 +117,7 @@ class QueueService:
             await session.execute(
                 update(Download)
                 .where(Download.id == download_id)
-                .values(status=DownloadStatus.CANCELLED, updated_at=datetime.utcnow())
+                .values(status=DownloadStatus.CANCELLED, updated_at=datetime.now(timezone.utc))
             )
             await session.commit()
             dl = await session.get(Download, download_id)
@@ -190,7 +190,7 @@ class QueueService:
                         progress_dl = await progress_session.get(Download, download_id)
                         if progress_dl:
                             progress_dl.progress   = min(pct, 99.9)
-                            progress_dl.updated_at = datetime.utcnow()
+                            progress_dl.updated_at = datetime.now(timezone.utc)
                             await self._commit_with_retry(progress_session, progress_dl)
                             await self._broadcast(progress_dl)
                 except Exception as e:
@@ -204,7 +204,7 @@ class QueueService:
                         if status_dl:
                             status_dl.status     = st
                             status_dl.progress   = pct
-                            status_dl.updated_at = datetime.utcnow()
+                            status_dl.updated_at = datetime.now(timezone.utc)
                             await self._commit_with_retry(status_session, status_dl)
                             await self._broadcast(status_dl)
                 except Exception as e:
@@ -232,7 +232,7 @@ class QueueService:
                 download.status       = DownloadStatus.COMPLETED
                 download.progress     = 100.0
                 download.file_path    = str(download_manager._root)
-                download.updated_at   = datetime.utcnow()
+                download.updated_at   = datetime.now(timezone.utc)
                 await self._commit_with_retry(session, download)
                 await self._broadcast(download)
                 logger.info(
@@ -264,7 +264,7 @@ class QueueService:
                 logger.exception("Download %d failed", download_id)
                 download.status        = DownloadStatus.FAILED
                 download.error_message = str(exc)[:2048]
-                download.updated_at    = datetime.utcnow()
+                download.updated_at    = datetime.now(timezone.utc)
                 try:
                     await self._commit_with_retry(session, download)
                     await self._broadcast(download)
@@ -279,7 +279,7 @@ class QueueService:
         """Update download status with retry on lock."""
         download.status = status
         download.progress = progress
-        download.updated_at = datetime.utcnow()
+        download.updated_at = datetime.now(timezone.utc)
         await session.commit()
         await session.refresh(download)
         await self._broadcast(download)
@@ -323,8 +323,8 @@ class BatchQueueService:
                 "failed": 0,
                 "download_ids": [],
                 "format_id": format_id,
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
             }
         
         # Start background task
@@ -363,7 +363,7 @@ class BatchQueueService:
                     async with self._lock:
                         if batch_id in self._active_batches:
                             self._active_batches[batch_id]["skipped"] += 1
-                            self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+                            self._active_batches[batch_id]["updated_at"] = datetime.now(timezone.utc)
                 
             except Exception as exc:
                 logger.warning(
@@ -373,13 +373,13 @@ class BatchQueueService:
                 async with self._lock:
                     if batch_id in self._active_batches:
                         self._active_batches[batch_id]["failed"] += 1
-                        self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+                        self._active_batches[batch_id]["updated_at"] = datetime.now(timezone.utc)
         
         # Mark batch as completed
         async with self._lock:
             if batch_id in self._active_batches:
                 self._active_batches[batch_id]["status"] = "completed"
-                self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+                self._active_batches[batch_id]["updated_at"] = datetime.now(timezone.utc)
                 queued = self._active_batches[batch_id]["queued"]
                 skipped = self._active_batches[batch_id]["skipped"]
                 failed = self._active_batches[batch_id]["failed"]
@@ -459,7 +459,7 @@ class BatchQueueService:
                 if batch_id in self._active_batches:
                     self._active_batches[batch_id]["queued"] += 1
                     self._active_batches[batch_id]["download_ids"].append(dl.id)
-                    self._active_batches[batch_id]["updated_at"] = datetime.utcnow()
+                    self._active_batches[batch_id]["updated_at"] = datetime.now(timezone.utc)
             
             logger.info(
                 "Batch %s: Queued %d/%d - %s (ID: %d, format: %s)",
