@@ -1,153 +1,117 @@
-# backend/app/models.py
-from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, JSON, Boolean
-from sqlalchemy.orm import DeclarativeBase
+from pydantic import BaseModel
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-class DownloadStatus(str, Enum):
-    QUEUED      = "queued"
+class JobStatus(StrEnum):
+    QUEUED = "queued"
+    RESOLVING = "resolving"
     DOWNLOADING = "downloading"
-    PROCESSING  = "processing"
-    COMPLETED   = "completed"
-    FAILED      = "failed"
-    CANCELLED   = "cancelled"
+    IMPORTING = "importing"
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
-class MetadataProcessingStatus(str, Enum):
-    PENDING     = "pending"
-    PROCESSING  = "processing" 
-    COMPLETED   = "completed"
-    FAILED      = "failed"
-    CANCELLED   = "cancelled"
+class TrackStatus(StrEnum):
+    PENDING = "pending"
+    DOWNLOADING = "downloading"
+    DOWNLOADED = "downloaded"
+    VALIDATING = "validating"
+    IMPORTING = "importing"
+    COMPLETED = "completed"
+    SKIPPED_DUPLICATE = "skipped_duplicate"
+    IMPORT_FAILED = "import_failed"
+    NEEDS_REVIEW = "needs_review"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
-class Download(Base):
-    __tablename__ = "downloads"
-
-    id            = Column(Integer, primary_key=True, index=True)
-    url           = Column(String(2048), nullable=False)
-    title         = Column(String(512),  nullable=True)
-    artist        = Column(String(512),  nullable=True)
-    album         = Column(String(512),  nullable=True)
-    # song | album | playlist | artist
-    download_type = Column(String(32),   nullable=False, default="song")
-    status        = Column(String(32),   nullable=False, default=DownloadStatus.QUEUED)
-    progress      = Column(Float,        nullable=False, default=0.0)
-    error_message = Column(Text,         nullable=True)
-    file_path     = Column(String(1024), nullable=True)
-    # Total tracks for playlist/album display
-    total_tracks  = Column(Integer,      nullable=True)
-    done_tracks   = Column(Integer,      nullable=True, default=0)
-    # User-selected format ID
-    format_id     = Column(String(128),  nullable=True, default="bestaudio/best")
-    # Queue priority: lower number = processed first (0 = default/normal)
-    priority           = Column(Integer,   nullable=False, default=0)
-    # AcoustID/MusicBrainz enrichment: null | enriching | enriched | no_match | failed | skipped
-    enrichment_status  = Column(String(32), nullable=True)
-    created_at    = Column(DateTime,     default=datetime.utcnow)
-    updated_at    = Column(DateTime,     default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    def to_dict(self) -> dict:
-        return {
-            "id":            self.id,
-            "url":           self.url,
-            "title":         self.title,
-            "artist":        self.artist,
-            "album":         self.album,
-            "download_type": self.download_type,
-            "status":        self.status,
-            "progress":      round(self.progress, 1),
-            "error_message": self.error_message,
-            "file_path":     self.file_path,
-            "total_tracks":  self.total_tracks,
-            "done_tracks":   self.done_tracks,
-            "format_id":          self.format_id,
-            "enrichment_status":  self.enrichment_status,
-            "created_at":         self.created_at.isoformat() if self.created_at else None,
-            "updated_at":         self.updated_at.isoformat() if self.updated_at else None,
-        }
+TERMINAL_TRACK_STATUSES = {
+    TrackStatus.COMPLETED,
+    TrackStatus.SKIPPED_DUPLICATE,
+    TrackStatus.FAILED,
+    TrackStatus.CANCELLED,
+    TrackStatus.NEEDS_REVIEW,
+    TrackStatus.IMPORT_FAILED,
+}
 
 
-class MetadataProcessingJob(Base):
-    __tablename__ = "metadata_processing_jobs"
-
-    id               = Column(String(36), primary_key=True)  # UUID
-    channel_url      = Column(String(2048), nullable=False)
-    channel_name     = Column(String(512), nullable=True)
-    status           = Column(String(32), nullable=False, default=MetadataProcessingStatus.PENDING)
-    progress         = Column(Float, nullable=False, default=0.0)
-    total_items      = Column(Integer, nullable=True)
-    processed_items  = Column(Integer, nullable=False, default=0)
-    error_message    = Column(Text, nullable=True)
-    metadata_results = Column(JSON, nullable=True)  # Store the discovered playlists
-    created_at       = Column(DateTime, default=datetime.utcnow)
-    updated_at       = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "channel_url": self.channel_url,
-            "channel_name": self.channel_name,
-            "status": self.status,
-            "progress": round(self.progress, 1),
-            "total_items": self.total_items,
-            "processed_items": self.processed_items,
-            "error_message": self.error_message,
-            "metadata_results": self.metadata_results,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+class ErrorClass(StrEnum):
+    TRANSIENT = "transient"
+    RATE_LIMITED = "rate_limited"
+    BOT_FLAGGED = "bot_flagged"
+    FORBIDDEN = "forbidden"
+    PERMANENT = "permanent"
+    NO_CONFIDENT_MATCH = "no_confident_match"
+    VALIDATION_FAILED = "validation_failed"
+    IMPORT_FAILED = "import_failed"
 
 
-class MetadataPlaylistItem(Base):
-    __tablename__ = "metadata_playlist_items"
+class TrackOut(BaseModel):
+    id: str
+    job_id: str
+    position: int | None = None
+    provider: str | None = None
+    provider_track_id: str | None = None
+    source_url: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    album_artist: str | None = None
+    title: str | None = None
+    track_number: int | None = None
+    disc_number: int | None = None
+    isrc: str | None = None
+    status: TrackStatus
+    stage: str | None = None
+    progress_pct: float | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    match_candidates: str | None = None
+    library_path: str | None = None
+    format: str | None = None
+    bitrate_kbps: int | None = None
+    below_target: bool = False
+    duration_sec: float | None = None
+    plex_verified: bool = False
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
 
-    id                    = Column(Integer, primary_key=True, index=True)
-    processing_job_id     = Column(String(36), nullable=False, index=True)
-    playlist_id           = Column(String(128), nullable=True)
-    title                 = Column(String(512), nullable=False)
-    url                   = Column(String(2048), nullable=False)
-    thumbnail             = Column(String(2048), nullable=True)
-    track_count           = Column(Integer, nullable=True)
-    channel               = Column(String(512), nullable=True)
-    channel_url           = Column(String(2048), nullable=True)
-    source_tab            = Column(String(64), nullable=True)
-    release_type          = Column(String(64), nullable=True)
-    selected_for_download = Column(Boolean, nullable=False, default=False)
-    # Additional metadata fields for better classification
-    release_date          = Column(String(32), nullable=True)
-    release_year          = Column(Integer, nullable=True)
-    description           = Column(Text, nullable=True)
-    total_duration        = Column(Integer, nullable=True)  # Total duration in seconds
-    view_count            = Column(Integer, nullable=True)
-    like_count            = Column(Integer, nullable=True)
-    created_at            = Column(DateTime, default=datetime.utcnow)
 
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "processing_job_id": self.processing_job_id,
-            "playlist_id": self.playlist_id,
-            "title": self.title,
-            "url": self.url,
-            "thumbnail": self.thumbnail,
-            "track_count": self.track_count,
-            "channel": self.channel,
-            "channel_url": self.channel_url,
-            "source_tab": self.source_tab,
-            "release_type": self.release_type,
-            "selected_for_download": self.selected_for_download,
-            "release_date": self.release_date,
-            "release_year": self.release_year,
-            "description": self.description,
-            "total_duration": self.total_duration,
-            "view_count": self.view_count,
-            "like_count": self.like_count,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
+class JobOut(BaseModel):
+    id: str
+    source_url: str
+    provider: str
+    source_type: str
+    title: str | None = None
+    artist: str | None = None
+    force: bool = False
+    status: JobStatus
+    error_code: str | None = None
+    error_message: str | None = None
+    total_tracks: int = 0
+    completed_tracks: int = 0
+    failed_tracks: int = 0
+    skipped_tracks: int = 0
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    tracks: list[TrackOut] | None = None
+
+
+def row_to_track(row) -> TrackOut:
+    d = dict(row)
+    d["below_target"] = bool(d.get("below_target"))
+    d["plex_verified"] = bool(d.get("plex_verified"))
+    return TrackOut(**{k: v for k, v in d.items() if k in TrackOut.model_fields})
+
+
+def row_to_job(row, tracks=None) -> JobOut:
+    d = dict(row)
+    d["force"] = bool(d.get("force"))
+    job = JobOut(**{k: v for k, v in d.items() if k in JobOut.model_fields})
+    if tracks is not None:
+        job.tracks = [row_to_track(t) for t in tracks]
+    return job

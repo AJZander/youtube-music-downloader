@@ -1,57 +1,87 @@
-# backend/app/config.py
 from pathlib import Path
-from typing import Optional, Union
+
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    app_name: str = "YouTube Music Downloader"
-    debug: bool = False
+    # Paths (container-side)
+    data_dir: Path = Path("/app/data")
+    staging_dir: Path = Path("/staging")
+    library_dir: Path = Path("/library")
 
-    download_dir: Path = Path("/downloads")
-    database_url: str = "sqlite+aiosqlite:////app/data/downloads.db"
-    cookies_dir: Path = Path("/app/data/cookies")
-    archive_file: Path = Path("/app/data/download_archive.txt")
+    # Plex
+    plex_url: str = "http://host.docker.internal:32400"
+    plex_token: str = ""
+    plex_section_id: int = 5
+    # Plex's own path for library_dir (host CIFS mount seen by the Plex container)
+    plex_library_root: str = "/data/Music"
 
-    # AcoustID API key for audio fingerprint lookups (https://acoustid.org/api-key)
-    acoustid_api_key: Optional[str] = None
+    # Spotify API
+    spotify_client_id: str = ""
+    spotify_client_secret: str = ""
+    spotify_redirect_uri: str = ""
 
-    max_concurrent_downloads: int = 1
-    
-    # Audio format: "best" preserves original, or specify: mp3, m4a, opus, flac, wav
-    audio_format: str = "best"
-    
-    # Quality for MP3 (only used when audio_format=mp3):
-    # VBR: 0 (best) to 10 (worst)
-    # CBR: 128, 192, 256, 320 (320 = highest quality)
-    mp3_quality: str = "0"
-    
-    # Rate limiting settings
-    download_interval_seconds: int = 5
-    rate_limit_backoff_seconds: int = 60
-    max_rate_limit_retries: int = 5
-    
-    # User-Agent - CRITICAL: Must match browser cookies came from!
-    user_agent: str = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    )
+    # Rate governor
+    tracks_per_hour: int = 60
+    tracks_per_day: int = 300
+    inter_track_delay_min: float = 5.0
+    inter_track_delay_max: float = 20.0
+    long_pause_every: int = 25
+    long_pause_min: float = 120.0
+    long_pause_max: float = 300.0
 
-    cors_origins: Union[str, list[str]] = "*"
+    # Staging guardrails
+    staging_max_gb: float = 30.0
+    staging_min_free_gb: float = 5.0
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    # Engine
+    ytdlp_min_version: str = "2026.07.04"
+    download_timeout_sec: int = 900
+    pot_provider_url: str = "http://mdl-pot:4416"
+    ytdlp_sleep_min: float = 5.0        # pre-download sleep, uniform(min, max)
+    ytdlp_sleep_max: float = 15.0
+    ytdlp_sleep_requests: float = 1.0   # between innertube API requests
+    ratelimit_bytes: int = 3_000_000    # transfer cap (bytes/sec)
+
+    # Matching
+    duration_tolerance_sec: float = 3.0
+
+    log_level: str = "INFO"
+
+    model_config = {"env_file": ".env", "extra": "ignore"}
+
+    # Derived paths
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "mdl.db"
 
     @property
-    def cors_list(self) -> list[str]:
-        """Parse CORS origins into a list."""
-        if isinstance(self.cors_origins, str):
-            if self.cors_origins.strip() == "*":
-                return ["*"]
-            return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
-        return self.cors_origins
+    def cookies_master(self) -> Path:
+        return self.data_dir / "cookies" / "youtube-cookies.txt"
+
+    @property
+    def cookies_working(self) -> Path:
+        return self.data_dir / "cookies" / ".working-copy.txt"
+
+    @property
+    def staging_jobs_dir(self) -> Path:
+        return self.staging_dir / "jobs"
+
+    @property
+    def quarantine_dir(self) -> Path:
+        return self.staging_dir / "quarantine"
+
+    @property
+    def library_sentinel(self) -> Path:
+        return self.library_dir / ".mdl-library-online"
+
+    @property
+    def backups_dir(self) -> Path:
+        return self.data_dir / "backups"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.data_dir / "logs"
 
 
 settings = Settings()

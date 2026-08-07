@@ -1,31 +1,17 @@
-# Core Framework
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-python-multipart==0.0.12
-
-# YouTube downloading - Always use latest for format compatibility
-yt-dlp>=2024.12.23
-
-# Database
-sqlalchemy==2.0.35
-aiosqlite==0.20.0
-
-# Configuration & Validation
-pydantic==2.10.3
-pydantic-settings==2.6.1
-python-dotenv==1.0.1
-
-# WebSockets
-websockets==14.1
-
-# SSL/TLS Certificates
-certifi>=2024.8.30
-urllib3>=2.2.3
-
-# Additional reliability improvements
-brotli>=1.1.0
-mutagen>=1.47.0
-
-# MusicBrainz / AcoustID metadata enrichment
-pyacoustid>=1.3.0
-musicbrainzngs>=0.7.1
+# Floors are deliberately loose where spotdl pins its own versions.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+aiosqlite>=0.20
+pydantic>=2.9
+pydantic-settings>=2.6
+mutagen>=1.47
+httpx>=0.27
+Pillow>=10
+spotipy>=2.24
+ytmusicapi>=1.8
+# NOTE: spotdl is NOT installed — v4.5.2 pins fastapi<0.104 which conflicts.
+# The matcher uses its own ISRC + duration/title verification gate (ytmusicapi);
+# app/engine/matcher.py imports spotdl defensively and skips it when absent.
+# yt-dlp floor for image build; entrypoint upgrades to nightly (--pre) at runtime.
+yt-dlp[default]>=2026.7.4
+bgutil-ytdlp-pot-provider>=1.0
