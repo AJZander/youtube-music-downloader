@@ -5,12 +5,15 @@ import json
 import logging
 from pathlib import Path
 
+from .config import settings
 from .engine import tagger
 from .models import ErrorClass
 
 log = logging.getLogger("mdl.validator")
 
-MIN_SIZE_BYTES = 200 * 1024
+MIN_SIZE_BYTES = 200 * 1024          # floor for a normal-length track
+ABSOLUTE_MIN_SIZE_BYTES = 16 * 1024  # below this nothing is real audio
+MIN_BYTES_PER_SEC = 4 * 1024         # ~32 kbps — the floor for short files
 ALLOWED_CODECS = {"aac", "opus", "flac", "mp3", "vorbis"}
 ALLOWED_SUFFIXES = {".m4a", ".opus", ".mp3", ".ogg", ".flac"}
 
@@ -34,9 +37,15 @@ async def ffprobe(path: Path) -> dict:
     return json.loads(out)
 
 
-async def validate_track(track_dir: Path, expected_duration: float | None) -> dict:
+async def validate_track(track_dir: Path, expected_duration: float | None,
+                         force: bool = False) -> dict:
     """Returns {path, format, codec, bitrate_kbps, sample_rate, duration_sec,
-    filesize_bytes, tags} or raises ValidationError."""
+    filesize_bytes, tags} or raises ValidationError.
+
+    force=True is the reviewer saying "I've looked at this file, take it": the
+    duration judgements are downgraded to warnings. The integrity checks (is
+    there a decodable audio file at all) still hold — forcing past those would
+    only put a broken file in the library."""
     leftovers = [p for p in track_dir.rglob("*")
                  if p.suffix.lower() in (".part", ".ytdl", ".tmp") or p.name.endswith(".part")]
     if leftovers:
@@ -51,7 +60,7 @@ async def validate_track(track_dir: Path, expected_duration: float | None) -> di
     audio = audio_files[0]
 
     size = audio.stat().st_size
-    if size < MIN_SIZE_BYTES:
+    if size < ABSOLUTE_MIN_SIZE_BYTES:
         raise ValidationError("too_small", f"file is {size} bytes — likely an error stub")
 
     info = await ffprobe(audio)
@@ -64,12 +73,35 @@ async def validate_track(track_dir: Path, expected_duration: float | None) -> di
         raise ValidationError("bad_codec", f"unexpected codec {codec!r}")
 
     duration = float(info.get("format", {}).get("duration") or stream.get("duration") or 0)
-    if duration < 30:
-        raise ValidationError("too_short", f"duration {duration:.0f}s < 30s")
-    if expected_duration and abs(duration - expected_duration) > max(3.0, expected_duration * 0.05):
+
+    # The size floor scales with duration: a 10s interlude is a few tens of KB
+    # and must not be judged by a threshold built for 3-minute tracks.
+    size_floor = min(MIN_SIZE_BYTES, int(duration * MIN_BYTES_PER_SEC)) if duration else MIN_SIZE_BYTES
+    if size < size_floor:
         raise ValidationError(
-            "duration_mismatch",
-            f"duration {duration:.0f}s vs expected {expected_duration:.0f}s")
+            "too_small", f"file is {size} bytes for {duration:.0f}s — likely truncated")
+
+    if expected_duration:
+        # An authoritative duration is the only real length check. Intros,
+        # interludes and skits are legitimately a few seconds long; when the
+        # source says 13s and we got 13s, that is a correct download.
+        tolerance = max(settings.duration_tolerance_sec, expected_duration * 0.05)
+        if abs(duration - expected_duration) > tolerance:
+            if not force:
+                raise ValidationError(
+                    "duration_mismatch",
+                    f"duration {duration:.0f}s vs expected {expected_duration:.0f}s")
+            log.warning("%s: forced past duration_mismatch (%.0fs vs expected %.0fs)",
+                        audio.name, duration, expected_duration)
+    elif duration < settings.min_duration_sec:
+        # Nothing authoritative to compare against, so only a floor low enough
+        # to catch stubs and dead air — not a judgement on track length.
+        if not force:
+            raise ValidationError(
+                "too_short",
+                f"duration {duration:.1f}s < {settings.min_duration_sec:g}s "
+                f"and the source gave no expected duration to check it against")
+        log.warning("%s: forced past too_short (%.1fs)", audio.name, duration)
 
     # Tag completeness is checked by the worker AFTER merging authoritative
     # expansion metadata (ytmusicapi/Spotify) over the file tags.

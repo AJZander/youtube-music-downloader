@@ -9,12 +9,22 @@ import MusicNoteIcon from '@mui/icons-material/MusicNote'
 
 import { api, subscribeEvents } from './api.js'
 import HealthBanner from './components/HealthBanner.jsx'
+import DownloadDetails, { STATS_BAR_HEIGHT } from './components/DownloadDetails.jsx'
 import JobList from './components/JobList.jsx'
+import Library from './components/Library.jsx'
 import NeedsReview from './components/NeedsReview.jsx'
+import Queue from './components/Queue.jsx'
+import SkippedList from './components/SkippedList.jsx'
 import SpotifyBrowser from './components/SpotifyBrowser.jsx'
 import ArtistBrowser from './components/ArtistBrowser.jsx'
+import Discover from './components/Discover.jsx'
 import StatsBar from './components/StatsBar.jsx'
 import SubmitBar from './components/SubmitBar.jsx'
+
+const TERMINAL_TRACK = new Set([
+  'completed', 'skipped_duplicate', 'failed', 'cancelled', 'needs_review',
+  'import_failed',
+])
 
 export default function App() {
   const [dark, setDark] = useState(
@@ -26,9 +36,27 @@ export default function App() {
   const [tab, setTab] = useState(0)
   const [jobs, setJobs] = useState([])
   const [trackEvents, setTrackEvents] = useState({})   // track_id -> latest track
+  // Transient transfer stats: speed/ETA/bytes, never persisted server-side.
+  const [trackProgress, setTrackProgress] = useState({})
   const [health, setHealth] = useState(null)
   const [stats, setStats] = useState(null)
   const [reviewCount, setReviewCount] = useState(0)
+  const [queueToken, setQueueToken] = useState(0)
+  const [selectedJobId, setSelectedJobId] = useState(null)
+  const [detailsHeight, setDetailsHeight] = useState(
+    () => Number(localStorage.getItem('mdl-details-height')) || 320)
+
+  const setHeight = useCallback((h) => {
+    setDetailsHeight(h)
+    localStorage.setItem('mdl-details-height', String(h))
+  }, [])
+  const [skippedCount, setSkippedCount] = useState(0)
+  // An artist link pasted into the main bar, handed to the Artists tab.
+  const [artistRequest, setArtistRequest] = useState(null)
+  const browseArtist = useCallback((ref) => {
+    setArtistRequest({ ref, at: Date.now() })
+    setTab(4)
+  }, [])
 
   const refreshJobs = useCallback(() => {
     api.listJobs({ limit: 100 }).then(setJobs).catch(() => {})
@@ -37,6 +65,7 @@ export default function App() {
     api.health().then(setHealth).catch(() => setHealth(null))
     api.stats().then(setStats).catch(() => {})
     api.needsReview().then((t) => setReviewCount(t.length)).catch(() => {})
+    api.skipped({ limit: 1 }).then((d) => setSkippedCount(d.total)).catch(() => {})
   }, [])
 
   useEffect(() => { refreshJobs(); refreshMeta() }, [refreshJobs, refreshMeta])
@@ -46,16 +75,31 @@ export default function App() {
   }, [refreshMeta])
 
   useEffect(() => subscribeEvents({
-    'job.updated': (job) => setJobs((prev) => {
-      const i = prev.findIndex((j) => j.id === job.id)
-      if (i === -1) return [job, ...prev]
-      const next = [...prev]; next[i] = { ...next[i], ...job }; return next
-    }),
+    'job.updated': (job) => {
+      setJobs((prev) => {
+        const i = prev.findIndex((j) => j.id === job.id)
+        if (i === -1) return [job, ...prev]
+        const next = [...prev]; next[i] = { ...next[i], ...job }; return next
+      })
+      setQueueToken((n) => n + 1)
+    },
     'track.updated': (track) => {
       setTrackEvents((prev) => ({ ...prev, [track.id]: track }))
+      // Transfer stats mean nothing once a track stops moving, and a session
+      // that runs for days would otherwise accumulate one entry per track.
+      if (TERMINAL_TRACK.has(track.status)) {
+        setTrackProgress((prev) => {
+          if (!(track.id in prev)) return prev
+          const next = { ...prev }
+          delete next[track.id]
+          return next
+        })
+      }
       if (track.status === 'needs_review') refreshMeta()
     },
+    'track.progress': (p) => setTrackProgress((prev) => ({ ...prev, [p.track_id]: p })),
     'queue.stats': () => refreshMeta(),
+    'queue.reordered': () => setQueueToken((n) => n + 1),
   }), [refreshMeta])
 
   const toggleTheme = () => {
@@ -82,25 +126,58 @@ export default function App() {
         </Toolbar>
       </AppBar>
 
-      <Container maxWidth="lg" sx={{ py: 2, pb: 10 }}>
+      <Container maxWidth="lg" sx={{
+        py: 2,
+        // Keep the last row reachable above the detail pane and the stats bar.
+        pb: `${(selectedJobId ? detailsHeight : 0) + STATS_BAR_HEIGHT + 32}px`,
+      }}>
         <HealthBanner health={health} stats={stats}
           onResume={() => api.governorResume().then(refreshMeta)} />
-        <SubmitBar onQueued={refreshJobs} />
+        <SubmitBar onQueued={refreshJobs} onBrowseArtist={browseArtist} />
         <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 2 }}
           variant="scrollable" allowScrollButtonsMobile>
           <Tab label="Queue & History" />
           <Tab label={reviewCount ? `Needs Review (${reviewCount})` : 'Needs Review'} />
+          <Tab label={skippedCount ? `Skipped (${skippedCount})` : 'Skipped'} />
           <Tab label="Spotify" />
           <Tab label="Artists" />
+          <Tab label="Discover" />
+          <Tab label="Library" />
         </Tabs>
         {tab === 0 && (
-          <JobList jobs={jobs} trackEvents={trackEvents} onChanged={refreshJobs} />
+          <>
+            <Queue onChanged={refreshJobs} refreshToken={queueToken}
+              trackProgress={trackProgress}
+              selectedJobId={selectedJobId} onSelect={setSelectedJobId} />
+            <JobList jobs={jobs} onChanged={refreshJobs}
+              selectedJobId={selectedJobId} onSelect={setSelectedJobId} />
+          </>
         )}
         {tab === 1 && <NeedsReview onChanged={refreshMeta} />}
-        {tab === 2 && <SpotifyBrowser onQueued={refreshJobs} />}
-        {tab === 3 && <ArtistBrowser onQueued={refreshJobs} />}
+        {tab === 2 && <SkippedList onChanged={refreshMeta} />}
+        {tab === 3 && <SpotifyBrowser onQueued={refreshJobs} />}
+        {/* Kept mounted: a half-made selection survives a look at the queue. */}
+        <Box sx={{ display: tab === 4 ? 'block' : 'none' }}>
+          <ArtistBrowser request={artistRequest} onQueued={refreshJobs} stats={stats}
+            bottomOffset={(selectedJobId ? detailsHeight : 0) + STATS_BAR_HEIGHT} />
+        </Box>
+        <Box sx={{ display: tab === 5 ? 'block' : 'none' }}>
+          <Discover onQueued={refreshJobs} onBrowseArtist={browseArtist} stats={stats}
+            bottomOffset={(selectedJobId ? detailsHeight : 0) + STATS_BAR_HEIGHT} />
+        </Box>
+        {tab === 6 && <Library />}
       </Container>
 
+      {selectedJobId && (
+        <DownloadDetails
+          jobId={selectedJobId}
+          trackEvents={trackEvents}
+          trackProgress={trackProgress}
+          height={detailsHeight}
+          onHeight={setHeight}
+          onClose={() => setSelectedJobId(null)}
+          onChanged={refreshJobs} />
+      )}
       <StatsBar stats={stats} />
     </ThemeProvider>
   )

@@ -43,8 +43,42 @@ class Settings(BaseSettings):
     ytdlp_sleep_requests: float = 1.0   # between innertube API requests
     ratelimit_bytes: int = 3_000_000    # transfer cap (bytes/sec)
 
+    # Library management
+    # Scan concurrency. Tag reads are worker *processes*, not threads: mutagen
+    # parsing is pure Python and threads plateau at one core's worth of GIL.
+    # Past that the ceiling is the NAS, not us — cold scattered reads off this
+    # CIFS mount land at roughly 13 file-opens/sec in total however wide the
+    # pool goes, so raising this much above 32 buys latency, not throughput.
+    library_scan_workers: int = 32
+    trash_retention_days: int = 30
+
+    # Artist catalogue browsing — YouTube Music metadata, not downloads, so
+    # it has its own budget rather than spending the download caps. It still
+    # shares the governor's backoff: YouTube throttles the address.
+    catalog_requests_per_hour: int = 600
+    # Spacing for background tracklist prefetch. Someone waiting on an answer
+    # (a search, an album they just expanded) jumps ahead with a shorter gap.
+    catalog_prefetch_delay_min: float = 2.0
+    catalog_prefetch_delay_max: float = 4.0
+
+    # Discover: background scan of the library's artists for new releases.
+    # One YouTube Music request per interval — 12s is ~300 an hour, half the
+    # browsing budget, so the artist browser always has room.
+    discover_enabled: bool = True
+    discover_request_interval: float = 12.0
+    # How many recommended artists ("fans also like", counted across the
+    # library) are scanned for new releases as well.
+    discover_suggested_artists: int = 40
+    # Default chart country (YouTube Music codes: AU, US, GB… or ZZ = global).
+    discover_country: str = "ZZ"
+
     # Matching
     duration_tolerance_sec: float = 3.0
+
+    # Validation — the absolute length floor applies ONLY when the source gave
+    # us no expected duration. Anything the source vouches for (intros,
+    # interludes, skits) is checked against that duration, not against a floor.
+    min_duration_sec: float = 5.0
 
     log_level: str = "INFO"
 
@@ -74,6 +108,12 @@ class Settings(BaseSettings):
     @property
     def library_sentinel(self) -> Path:
         return self.library_dir / ".mdl-library-online"
+
+    @property
+    def trash_dir(self) -> Path:
+        # Inside the library so removal is a rename, not a copy; dot-prefixed
+        # so Plex (and our own scanner) walk straight past it.
+        return self.library_dir / ".mdl-trash"
 
     @property
     def backups_dir(self) -> Path:

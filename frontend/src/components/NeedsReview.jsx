@@ -63,8 +63,9 @@ export default function NeedsReview({ onChanged }) {
               <Button size="small" variant="outlined" onClick={() => act(t.id, 'retry')}>
                 Retry
               </Button>
-              <Button size="small" variant="outlined" onClick={() => act(t.id, 'force_import')}>
-                Force
+              <Button size="small" variant="outlined" onClick={() => act(t.id, 'force_import')}
+                title="Import this exact file as-is, keeping its duration">
+                Force import
               </Button>
               <Button size="small" color="error" onClick={() => act(t.id, 'discard')}>
                 Discard

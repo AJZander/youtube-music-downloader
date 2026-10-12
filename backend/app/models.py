@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 class JobStatus(StrEnum):
     QUEUED = "queued"
+    PAUSED = "paused"
     RESOLVING = "resolving"
     DOWNLOADING = "downloading"
     IMPORTING = "importing"
@@ -80,6 +81,14 @@ class TrackOut(BaseModel):
     finished_at: str | None = None
 
 
+# Statuses that keep a job in the queue. A job leaves the queue by finishing,
+# failing or being cancelled — not by being paused.
+ACTIVE_JOB_STATUSES = (
+    JobStatus.QUEUED, JobStatus.PAUSED, JobStatus.RESOLVING,
+    JobStatus.DOWNLOADING, JobStatus.IMPORTING,
+)
+
+
 class JobOut(BaseModel):
     id: str
     source_url: str
@@ -88,6 +97,7 @@ class JobOut(BaseModel):
     title: str | None = None
     artist: str | None = None
     force: bool = False
+    queue_position: int | None = None
     status: JobStatus
     error_code: str | None = None
     error_message: str | None = None

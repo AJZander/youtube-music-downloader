@@ -25,10 +25,12 @@ EIO_RETRY_DELAYS = [1, 5, 15, 60, 120]
 
 
 class ImportError_(Exception):
-    def __init__(self, code: str, message: str, error_class=ErrorClass.IMPORT_FAILED):
+    def __init__(self, code: str, message: str, error_class=ErrorClass.IMPORT_FAILED,
+                 path: str | None = None):
         super().__init__(message)
         self.code = code
         self.error_class = error_class
+        self.path = path   # the library file in the way, for dest_exists
 
 
 def library_online() -> bool:
@@ -105,8 +107,12 @@ async def import_track(staging_file: Path, validated: dict, track_meta: dict,
     dest_dir = dest.parent
     checksum = await asyncio.get_running_loop().run_in_executor(None, _blake2b, staging_file)
 
-    if dest.exists() and not force:
-        raise ImportError_("dest_exists", f"file already exists: {relpath}")
+    overwrote = dest.exists()
+    if overwrote and not force:
+        raise ImportError_("dest_exists", f"file already exists: {relpath}",
+                           path=str(relpath))
+    if overwrote:
+        log.warning("force: overwriting existing library file %s", relpath)
 
     await _retry_io(lambda: dest_dir.mkdir(parents=True, exist_ok=True), "mkdir album dir")
 
@@ -150,6 +156,7 @@ async def import_track(staging_file: Path, validated: dict, track_meta: dict,
         "library_path": str(relpath),
         "checksum_blake2b": checksum,
         "meta": meta,
+        "overwrote": overwrote,
     }
 
 

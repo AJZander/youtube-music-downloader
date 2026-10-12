@@ -7,10 +7,11 @@ services:
     volumes:
       - ./data:/app/data                                  # DB, cookies, backups, logs
       - ./staging:/staging                                # local disk staging
-      - /home/awisely/Docker/plex/media/music:/library    # CIFS import target
+      # Your music library (local disk or a NAS mount). Set in .env.
+      - ${MUSIC_LIBRARY_PATH:?set MUSIC_LIBRARY_PATH in .env to your music library folder}:/library
       - engine-venv:/opt/engine-venv                      # yt-dlp self-updates persist here
     extra_hosts:
-      - "host.docker.internal:host-gateway"               # Plex runs host-network on this box
+      - "host.docker.internal:host-gateway"               # reach a Plex server on the host
     depends_on:
       - mdl-pot
     healthcheck:

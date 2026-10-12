@@ -25,6 +25,11 @@ class RateGovernor:
         self._backoff_level = 0
         self._pause_until = 0.0
         self._pause_reason = ""
+        # The part of a pause YouTube asked for, as opposed to our own caps.
+        # Kept apart because the artist catalogue honours the one and not the
+        # other: browsing must stop when the address is being throttled, but
+        # has nothing to do with how many tracks we chose to fetch this hour.
+        self._backoff_until = 0.0
         self._recent_flags: deque[float] = deque()  # rate-limit/bot events for breaker
         self._needs_canary = False
 
@@ -39,6 +44,10 @@ class RateGovernor:
             "tracks_last_day": round(self._weight_since(now - 86400), 1),
             "needs_canary": self._needs_canary,
         }
+
+    def backoff_remaining(self) -> float:
+        """Seconds left on a backoff or circuit-breaker pause, 0 if none."""
+        return max(0.0, self._backoff_until - time.time())
 
     def _weight_since(self, cutoff: float) -> float:
         return sum(w for ts, w in self._history if ts >= cutoff)
@@ -111,11 +120,13 @@ class RateGovernor:
         if len(self._recent_flags) >= 3:
             # circuit breaker: hard 6h pause, canary required before resume
             self._needs_canary = True
+            self._backoff_until = max(self._backoff_until, now + 6 * 3600)
             self._set_pause(now + 6 * 3600, f"circuit breaker ({error_class})")
             log.warning("circuit breaker tripped: 3 flags in 30min, pausing 6h")
             return
         self._backoff_level = min(self._backoff_level + 1, 6)
         delay = min(6 * 3600, 60 * (4 ** (self._backoff_level - 1))) * random.uniform(0.5, 1.0)
+        self._backoff_until = max(self._backoff_until, now + delay)
         self._set_pause(now + delay, f"backoff after {error_class} (level {self._backoff_level})")
         log.warning("global backoff level %d: pausing %.0fs after %s",
                     self._backoff_level, delay, error_class)
@@ -123,12 +134,14 @@ class RateGovernor:
     def clear_canary(self) -> None:
         self._needs_canary = False
         self._pause_until = 0.0
+        self._backoff_until = 0.0
         self._recent_flags.clear()
 
     def resume(self) -> None:
         """Manual unpause from the API."""
         self._pause_until = 0.0
         self._pause_reason = ""
+        self._backoff_until = 0.0
         bus.publish("queue.stats", self.snapshot())
 
 

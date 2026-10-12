@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from .api import router
 from .config import settings
 from .db import db
+from .discover import scanner
 from .engine import ytdlp_engine
 from .worker import worker
 
@@ -43,7 +44,9 @@ async def lifespan(app: FastAPI):
                     "Export cookies to %s", settings.cookies_master)
 
     await worker.start()
+    scanner.start()
     yield
+    await scanner.stop()
     await worker.stop()
     await db.close()
 

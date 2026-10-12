@@ -8,8 +8,12 @@ import DownloadIcon from '@mui/icons-material/Download'
 import { api } from '../api.js'
 
 const isUrl = (s) => /^https?:\/\//i.test(s.trim())
+// A YouTube / YouTube Music artist (channel or @handle) — the Artists tab
+// shows the whole discography to choose from, instead of queueing all of it.
+const ARTIST_URL = /^https?:\/\/(?:www\.|m\.|music\.)?youtube\.com\/(?:channel\/UC[\w-]+|@[\w.-]+)\/?(?:[?#].*)?$/i
+const isArtistUrl = (s) => ARTIST_URL.test(s.trim())
 
-export default function SubmitBar({ onQueued }) {
+export default function SubmitBar({ onQueued, onBrowseArtist }) {
   const [input, setInput] = useState('')
   const [force, setForce] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -20,6 +24,13 @@ export default function SubmitBar({ onQueued }) {
   const submit = async () => {
     const value = input.trim()
     if (!value) return
+    if (onBrowseArtist && isArtistUrl(value)) {
+      setError(null); setResults([])
+      setNotice('Artist opened in the Artists tab — pick the releases you want there.')
+      setInput('')
+      onBrowseArtist(value)
+      return
+    }
     setBusy(true); setError(null); setNotice(null); setResults([])
     try {
       if (isUrl(value)) {
@@ -71,7 +82,7 @@ export default function SubmitBar({ onQueued }) {
         />
         <Button variant="contained" onClick={submit} disabled={busy}
           startIcon={busy ? <CircularProgress size={16} /> : <DownloadIcon />}>
-          {isUrl(input) ? 'Queue' : 'Search'}
+          {isArtistUrl(input) ? 'Browse' : isUrl(input) ? 'Queue' : 'Search'}
         </Button>
       </Box>
       <FormControlLabel sx={{ mt: 0.5 }}

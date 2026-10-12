@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import catalog
 from .config import settings
 from .db import db, utcnow
 from .engine import spotify, ytdlp_engine
@@ -23,12 +24,63 @@ from .importer import (ImportError_, ensure_sentinel, import_track,
 from .library_index import add_entry, find_duplicate, in_legacy_archive
 from .models import ErrorClass, JobStatus, TrackStatus, TERMINAL_TRACK_STATUSES
 from .plex import plex
-from .validator import ValidationError, validate_track
+from .validator import ALLOWED_SUFFIXES, ValidationError, validate_track
 
 log = logging.getLogger("mdl.worker")
 
 TRANSIENT_RETRY_DELAYS = [30, 120, 600]
 PREMIUM_FORMATS = {"141", "774"}
+
+
+# tracks.force is a level, not a boolean, because "force" means two different
+# things depending on which button the user pressed.
+FORCE_NONE = 0
+FORCE_GUARDS = 1      # skip the dedup lookup, allow overwriting a library file
+FORCE_VALIDATION = 2  # ...and additionally accept a duration the source denies
+
+
+def force_flags(job, track) -> tuple[bool, bool]:
+    """Returns (force_guards, force_validation).
+
+    Only a human who has LOOKED AT the downloaded file may silence validation,
+    and that is exactly one path: Force import on the review screen, where the
+    file already exists in quarantine (FORCE_VALIDATION).
+
+    Everything else is a guards-only override. "Force download" on the skipped
+    list says "that wasn't a duplicate" — a claim about the library, made
+    before the file has even been fetched, so it cannot vouch for the audio.
+    A job-level force ("fetch it even though I have it", chosen when the URL
+    was submitted) is the same kind of claim. Collapsing these into one flag is
+    what let wrong recordings into the library twice."""
+    level = int(track["force"] or FORCE_NONE)
+    guards = bool(job["force"]) or level >= FORCE_GUARDS
+    return guards, level >= FORCE_VALIDATION
+
+
+def _filter_spec(job) -> dict:
+    """jobs.track_filter: a JSON list of the video ids to keep, or
+    {"keep": [...] | null, "force": [...]} when some of them are owned tracks
+    ticked on purpose, which download past the dedup gate."""
+    raw = job["track_filter"] if "track_filter" in job.keys() else None
+    if not raw:
+        return {}
+    try:
+        spec = json.loads(raw)
+    except (TypeError, ValueError):
+        log.warning("job %s has an unreadable track_filter; taking every track", job["id"])
+        return {}
+    return spec if isinstance(spec, dict) else {"keep": spec}
+
+
+def track_filter(job) -> set[str] | None:
+    """The video ids a job was limited to, or None for the whole release."""
+    keep = _filter_spec(job).get("keep")
+    return None if keep is None else {str(v) for v in keep}
+
+
+def forced_tracks(job) -> set[str]:
+    """Video ids the user chose to download although the library has them."""
+    return {str(v) for v in _filter_spec(job).get("force") or []}
 
 
 class Worker:
@@ -59,15 +111,24 @@ class Worker:
         self._wakeup.set()
 
     # ------------------------------------------------------------ enqueue
-    async def enqueue(self, url: str, force: bool = False) -> str:
+    async def enqueue(self, url: str, force: bool = False, *,
+                      title: str | None = None, artist: str | None = None,
+                      track_filter: str | None = None) -> str:
+        """title/artist are a placeholder until expansion fills in the real
+        ones — so a release queued from the browser is named in the queue
+        straight away. track_filter is a JSON list of video ids to keep."""
         routed: RoutedURL = route(url)
         job_id = uuid.uuid4().hex[:12]
+        row = await db.fetchone(
+            "SELECT COALESCE(MAX(queue_position), 0) AS last FROM jobs")
         await db.execute(
             """INSERT INTO jobs (id, source_url, provider, source_type, force,
-                                 status, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
+                                 status, queue_position, created_at, title,
+                                 artist, track_filter)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (job_id, routed.canonical_url, routed.provider, routed.source_type,
-             int(force), JobStatus.QUEUED, utcnow()))
+             int(force), JobStatus.QUEUED, row["last"] + 1, utcnow(), title,
+             artist, track_filter))
         await self._publish_job(job_id)
         self.wake()
         return job_id
@@ -91,17 +152,20 @@ class Worker:
                     pass
 
     async def _step(self) -> bool:
+        # queue_position is the user's ordering; created_at only breaks ties.
         job = await db.fetchone(
-            "SELECT * FROM jobs WHERE status = ? ORDER BY created_at LIMIT 1",
+            "SELECT * FROM jobs WHERE status = ? "
+            "ORDER BY queue_position, created_at LIMIT 1",
             (JobStatus.QUEUED,))
         if job:
             await self._expand_job(job)
             return True
         track = await db.fetchone(
             """SELECT t.* FROM tracks t JOIN jobs j ON j.id = t.job_id
-               WHERE t.status = ? AND j.status NOT IN (?, ?)
-               ORDER BY j.created_at, t.position LIMIT 1""",
-            (TrackStatus.PENDING, JobStatus.CANCELLED, JobStatus.FAILED))
+               WHERE t.status = ? AND j.status NOT IN (?, ?, ?)
+               ORDER BY j.queue_position, j.created_at, t.position LIMIT 1""",
+            (TrackStatus.PENDING, JobStatus.CANCELLED, JobStatus.FAILED,
+             JobStatus.PAUSED))
         if track:
             await self._process_track(track)
             return True
@@ -113,6 +177,18 @@ class Worker:
         await self._update_job(job_id, status=JobStatus.RESOLVING, started_at=utcnow())
         try:
             title, artist, tracks = await self._resolve(job)
+        except catalog.CatalogError as exc:
+            if exc.error_class in catalog.THROTTLED:
+                # YouTube throttling the address says nothing about this job.
+                # Back in the queue; the next attempt waits out the backoff.
+                await self._update_job(job_id, status=JobStatus.QUEUED,
+                                       error_code=exc.error_class,
+                                       error_message=str(exc)[:500])
+                return
+            await self._update_job(job_id, status=JobStatus.FAILED,
+                                   error_code=exc.error_class, error_message=str(exc)[:500],
+                                   finished_at=utcnow())
+            return
         except EngineError as exc:
             await self._update_job(job_id, status=JobStatus.FAILED,
                                    error_code=exc.error_class, error_message=str(exc),
@@ -127,14 +203,22 @@ class Worker:
                                    finished_at=utcnow())
             return
 
+        wanted = track_filter(job)
+        if wanted is not None:
+            tracks = [t for t in tracks
+                      if (t.get("source_video_id") or t.get("provider_track_id")) in wanted]
         if not tracks:
-            await self._update_job(job_id, status=JobStatus.FAILED,
-                                   error_code="empty", error_message="No tracks found",
-                                   finished_at=utcnow())
+            await self._update_job(
+                job_id, status=JobStatus.FAILED, error_code="empty",
+                error_message=("None of the selected tracks are on this release any more"
+                               if wanted is not None else "No tracks found"),
+                finished_at=utcnow())
             return
 
+        forced = forced_tracks(job)
         rows = []
         for position, t in enumerate(tracks, start=1):
+            source_id = t.get("source_video_id") or t.get("provider_track_id")
             rows.append((
                 uuid.uuid4().hex[:12], job_id, position,
                 t.get("provider") or job["provider"],
@@ -142,16 +226,19 @@ class Worker:
                 t.get("artist"), t.get("album"), t.get("album_artist"), t.get("title"),
                 t.get("track_number"), t.get("disc_number"), t.get("release_date"),
                 t.get("isrc"), t.get("cover_url"), t.get("duration_sec"),
-                TrackStatus.PENDING, utcnow()))
+                TrackStatus.PENDING, FORCE_GUARDS if source_id in forced else FORCE_NONE,
+                utcnow()))
         await db.executemany(
             """INSERT INTO tracks (id, job_id, position, provider, provider_track_id,
                  source_url, artist, album, album_artist, title, track_number,
                  disc_number, release_date, isrc, cover_url, expected_duration_sec,
-                 status, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 status, force, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows)
-        await self._update_job(job_id, status=JobStatus.DOWNLOADING, title=title,
-                               artist=artist, total_tracks=len(tracks))
+        await self._update_job(job_id, status=JobStatus.DOWNLOADING,
+                               title=title or job["title"], artist=artist or job["artist"],
+                               total_tracks=len(tracks), error_code=None,
+                               error_message=None)
 
     async def _resolve(self, job) -> tuple[str | None, str | None, list[dict]]:
         provider, source_type = job["provider"], job["source_type"]
@@ -204,106 +291,63 @@ class Worker:
 
         raise EngineError(ErrorClass.PERMANENT, f"unsupported job type {provider}/{source_type}")
 
-    def _album_tracks(self, album: dict, album_artist: str | None) -> list[dict]:
-        album_name = album.get("title")
-        year = str(album.get("year") or "")
-        out = []
-        for i, t in enumerate(album.get("tracks") or [], start=1):
-            if not t.get("videoId"):
-                continue
-            out.append({
-                "provider": "youtube_music",
-                "provider_track_id": t["videoId"],
-                "source_url": f"https://music.youtube.com/watch?v={t['videoId']}",
-                "title": t.get("title"),
-                "artist": ", ".join(a.get("name", "") for a in (t.get("artists") or [])) or album_artist,
-                "album": album_name, "album_artist": album_artist,
-                "track_number": t.get("trackNumber") or i,
-                "release_date": year,
-                "duration_sec": t.get("duration_seconds"),
-            })
-        return out
-
     async def _resolve_ytm_album(self, browse_id: str) -> tuple[str | None, str | None, list[dict]]:
-        from ytmusicapi import YTMusic
+        # Usually a cache hit: the artist browser has already loaded it.
+        album = await catalog.album(browse_id, priority=catalog.BACKGROUND,
+                                    max_age=catalog.WORKER_ALBUM_MAX_AGE)
+        album_artist = ", ".join(album["artists"]) or None
+        tracks = catalog.album_track_rows(album, album_artist)
+        await self._use_album_audio(album, tracks)
+        return album["title"], album_artist, tracks
 
-        loop = asyncio.get_running_loop()
-        await governor.acquire(REQUEST_WEIGHT)
-        album = await loop.run_in_executor(None, YTMusic().get_album, browse_id)
-        album_artist = ", ".join(
-            a.get("name", "") for a in (album.get("artists") or [])) or None
-        tracks = self._album_tracks(album, album_artist)
-        # get_album videoIds sometimes point at the music-video version (longer
-        # than the album track). The album's audioPlaylistId serves the actual
-        # album audio — override ids by position when the counts line up.
-        playlist_id = album.get("audioPlaylistId")
-        if playlist_id and tracks:
-            try:
-                await governor.acquire(REQUEST_WEIGHT)
-                info = await ytdlp_engine.extract_info(
-                    f"https://music.youtube.com/playlist?list={playlist_id}", flat=True)
-                entries = [e for e in (info.get("entries") or []) if e and e.get("id")]
-                if len(entries) == len(tracks):
-                    for t, e in zip(tracks, entries):
-                        t["provider_track_id"] = e["id"]
-                        t["source_url"] = f"https://music.youtube.com/watch?v={e['id']}"
-                else:
-                    log.warning("audio playlist has %d entries vs %d album tracks — keeping album ids",
-                                len(entries), len(tracks))
-            except Exception as exc:
-                log.warning("audioPlaylistId override failed: %s", exc)
-        return album.get("title"), album_artist, tracks
+    async def _use_album_audio(self, album: dict, tracks: list[dict]) -> None:
+        """get_album videoIds sometimes point at the music-video version
+        (longer than the album track). The album's audioPlaylistId serves the
+        actual album audio — override ids by position when the counts line up."""
+        playlist_id = album.get("audio_playlist_id")
+        if not playlist_id or not tracks:
+            return
+        try:
+            await governor.acquire(REQUEST_WEIGHT)
+            info = await ytdlp_engine.extract_info(
+                f"https://music.youtube.com/playlist?list={playlist_id}", flat=True)
+            entries = [e for e in (info.get("entries") or []) if e and e.get("id")]
+            if len(entries) == len(tracks):
+                for t, e in zip(tracks, entries):
+                    t["provider_track_id"] = e["id"]
+                    t["source_url"] = f"https://music.youtube.com/watch?v={e['id']}"
+            else:
+                log.warning("audio playlist has %d entries vs %d album tracks — keeping album ids",
+                            len(entries), len(tracks))
+        except Exception as exc:
+            log.warning("audioPlaylistId override failed: %s", exc)
 
     async def _resolve_yt_artist(self, url: str) -> tuple[str | None, str | None, list[dict]]:
-        from ytmusicapi import YTMusic
-
-        loop = asyncio.get_running_loop()
-        channel_id = None
-        for part in url.split("/"):
-            if part.startswith("UC"):
-                channel_id = part.split("?")[0]
-                break
-        if not channel_id:
-            await governor.acquire(REQUEST_WEIGHT)
-            info = await ytdlp_engine.extract_info(url, flat=True)
-            channel_id = info.get("channel_id") or info.get("uploader_id")
-        if not channel_id:
-            raise EngineError(ErrorClass.PERMANENT, "could not resolve channel id")
-
-        ytm = YTMusic()
-        await governor.acquire(REQUEST_WEIGHT)
-        artist = await loop.run_in_executor(None, ytm.get_artist, channel_id)
-        artist_name = artist.get("name")
+        """A whole artist as one job. The browser is the better way in — it
+        lets you choose — but a pasted artist URL still means everything."""
+        doc = await catalog.discography(url, priority=catalog.BACKGROUND)
+        artist_name = doc["name"]
         tracks: list[dict] = []
-        for section in ("albums", "singles"):
-            sec = artist.get(section) or {}
-            results = sec.get("results") or []
-            # follow browse pages for the full list when available
-            if sec.get("browseId"):
-                try:
-                    await governor.acquire(REQUEST_WEIGHT)
-                    results = await loop.run_in_executor(
-                        None, ytm.get_artist_albums, sec["browseId"], sec.get("params"))
-                except Exception as exc:
-                    log.warning("artist %s full album list failed: %s", section, exc)
-            for release in results:
-                browse_id = release.get("browseId")
-                if not browse_id:
-                    continue
-                try:
-                    await governor.acquire(REQUEST_WEIGHT)
-                    album = await loop.run_in_executor(None, ytm.get_album, browse_id)
-                except Exception as exc:
-                    log.warning("get_album %s failed: %s", browse_id, exc)
-                    continue
-                tracks.extend(self._album_tracks(album, artist_name))
+        for release in doc["releases"]:
+            try:
+                album = await catalog.album(release["browse_id"],
+                                            priority=catalog.BACKGROUND,
+                                            max_age=catalog.WORKER_ALBUM_MAX_AGE)
+            except catalog.CatalogError as exc:
+                if exc.error_class in catalog.THROTTLED:
+                    raise
+                log.warning("get_album %s failed: %s", release["browse_id"], exc)
+                continue
+            album_tracks = catalog.album_track_rows(album, artist_name)
+            await self._use_album_audio(album, album_tracks)
+            tracks.extend(album_tracks)
         return artist_name, artist_name, tracks
 
     # ------------------------------------------------------------ track pipeline
     async def _process_track(self, track) -> None:
         track_id, job_id = track["id"], track["job_id"]
         job = await db.fetchone("SELECT * FROM jobs WHERE id = ?", (job_id,))
-        force = bool(job["force"])
+        force_guards, force_validation = force_flags(job, track)
         self.current_track_id = track_id
         staging = settings.staging_jobs_dir / job_id / track_id
         try:
@@ -311,9 +355,10 @@ class Worker:
                                      stage="preparing", started_at=utcnow())
 
             # -------- pre-download dedup
-            if not force:
+            if not force_guards:
                 dup = await find_duplicate(track["provider_track_id"],
-                                           track["artist"], track["title"])
+                                           track["artist"], track["title"],
+                                           track["album"], track["expected_duration_sec"])
                 if dup:
                     await self._update_track(
                         track_id, status=TrackStatus.SKIPPED_DUPLICATE,
@@ -339,23 +384,29 @@ class Worker:
                     track_id, source_url=source_url,
                     match_candidates=json.dumps(candidates[:8], default=str))
 
-            # -------- download
-            await self._update_track(track_id, stage="downloading")
-            await governor.acquire(1.0)
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            info = await ytdlp_engine.download(
-                source_url, staging, progress_hook=self._make_progress_hook(track_id))
-            governor.mark_download_end()
-            governor.report_success()
+            # -------- download (or re-use the reviewed file on a forced import)
+            if force_validation and self._restore_quarantined(track, staging):
+                below_target = bool(track["below_target"])
+                log.info("track %s: forced import of the reviewed file, no re-download",
+                         track_id)
+            else:
+                await self._update_track(track_id, stage="downloading")
+                await governor.acquire(1.0)
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+                info = await ytdlp_engine.download(
+                    source_url, staging, progress_hook=self._make_progress_hook(track_id))
+                governor.mark_download_end()
+                governor.report_success()
 
-            fmt_id = str(info.get("format_id") or "")
-            below_target = ytdlp_engine.cookies.authenticated and fmt_id not in PREMIUM_FORMATS
+                fmt_id = str(info.get("format_id") or "")
+                below_target = ytdlp_engine.cookies.authenticated and fmt_id not in PREMIUM_FORMATS
 
             # -------- validate
             await self._update_track(track_id, status=TrackStatus.VALIDATING,
                                      stage="validating", progress_pct=100.0)
-            validated = await validate_track(staging, track["expected_duration_sec"])
+            validated = await validate_track(staging, track["expected_duration_sec"],
+                                             force=force_validation)
 
             # -------- tag (merge authoritative row metadata over file tags)
             await self._update_track(track_id, stage="tagging")
@@ -364,8 +415,14 @@ class Worker:
 
             # -------- import
             await self._update_track(track_id, status=TrackStatus.IMPORTING, stage="importing")
-            result = await import_track(validated["path"], validated, final_meta, force=force)
+            result = await import_track(validated["path"], validated, final_meta,
+                                        force=force_guards)
             meta = result["meta"]
+            if result["overwrote"]:
+                await bus.record(
+                    "warning", "force_overwrite",
+                    f"forced import replaced the existing {result['library_path']}",
+                    job_id, track_id)
 
             await add_entry(result["library_path"], meta["artist"], meta["title"],
                             meta["album"], validated["format"],
@@ -386,11 +443,11 @@ class Worker:
                 ytdlp_version=ytdlp_engine.ytdlp_version(),
                 artist=meta["artist"], album=meta["album"],
                 album_artist=meta["album_artist"], title=meta["title"],
-                error_code=None, error_message=None,
+                error_code=None, error_message=None, force=0, staging_path=None,
                 finished_at=utcnow())
             asyncio.create_task(self._verify_in_plex(track_id, meta))
         except ValidationError as exc:
-            await self._handle_validation_failure(track, staging, exc)
+            await self._handle_validation_failure(track, staging, exc, force_validation)
         except ImportError_ as exc:
             await self._handle_import_failure(track, exc)
         except EngineError as exc:
@@ -406,6 +463,29 @@ class Worker:
         finally:
             self.current_track_id = None
             await self._recompute_job(job_id)
+
+    def _restore_quarantined(self, track, staging: Path) -> bool:
+        """Move the quarantined file back into staging for a forced import.
+        Re-downloading would hand back a different file than the one the user
+        actually reviewed — and burn a governor slot to do it. Returns False
+        when there is nothing usable to re-use (swept, or never had audio)."""
+        qpath = track["staging_path"]
+        if not qpath:
+            return False
+        qdir = Path(qpath)
+        try:
+            if not qdir.is_dir() or not any(
+                    p.is_file() and p.suffix.lower() in ALLOWED_SUFFIXES
+                    for p in qdir.iterdir()):
+                return False
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(qdir), str(staging))
+            (staging / "import_error.json").unlink(missing_ok=True)
+            return True
+        except OSError as exc:
+            log.warning("could not re-use quarantined %s: %s", qpath, exc)
+            return False
 
     def _track_row_to_meta(self, track) -> dict:
         artist = track["artist"] or ""
@@ -466,37 +546,61 @@ class Worker:
         return meta
 
     def _make_progress_hook(self, track_id: str):
+        """Two rates, on purpose.
+
+        Speed, ETA and byte counts are worth showing every second but are not
+        worth a row write each time — they are meaningless once the download
+        ends. So they go out as a transient `track.progress` event, while the
+        percentage is persisted more slowly, which is all a page reloaded
+        mid-download needs to draw a sensible bar."""
         loop = asyncio.get_running_loop()
-        state = {"last": 0.0}
+        state = {"event": 0.0, "db": 0.0}
 
         def hook(d: dict) -> None:  # runs on the yt-dlp thread
             if d.get("status") != "downloading":
                 return
             now = time.time()
-            if now - state["last"] < 2.0:
-                return
-            state["last"] = now
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            if not total:
-                return
-            pct = round(100.0 * (d.get("downloaded_bytes") or 0) / total, 1)
-            loop.call_soon_threadsafe(
-                lambda: asyncio.ensure_future(
-                    self._update_track(track_id, progress_pct=pct)))
+            downloaded = d.get("downloaded_bytes") or 0
+            pct = round(100.0 * downloaded / total, 1) if total else None
+
+            if now - state["event"] >= 1.0:
+                state["event"] = now
+                loop.call_soon_threadsafe(bus.publish, "track.progress", {
+                    "track_id": track_id,
+                    "progress_pct": pct,
+                    "downloaded_bytes": downloaded,
+                    "total_bytes": total,
+                    "speed_bps": d.get("speed"),
+                    "eta_sec": d.get("eta"),
+                    "fragment": d.get("fragment_index"),
+                    "fragment_count": d.get("fragment_count"),
+                })
+            if pct is not None and now - state["db"] >= 5.0:
+                state["db"] = now
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        self._update_track(track_id, progress_pct=pct)))
 
         return hook
 
     # ------------------------------------------------------------ failure paths
     async def _handle_validation_failure(self, track, staging: Path,
-                                         exc: ValidationError) -> None:
+                                         exc: ValidationError,
+                                         force: bool = False) -> None:
         track_id = track["id"]
         attempts = (track["attempts"] or 0) + 1
-        if attempts <= 1:
+        if attempts <= 1 and not force:
+            # One free re-download — a forced import gets none, since what it
+            # tripped is a gate force does not lift and a retry cannot change.
             shutil.rmtree(staging, ignore_errors=True)
             await self._update_track(track_id, status=TrackStatus.PENDING,
                                      stage=None, attempts=attempts,
                                      error_code=exc.code, error_message=str(exc)[:500])
             return
+        if force:
+            await bus.record("warning", exc.code,
+                             f"forced import still rejected: {exc}", track["job_id"], track_id)
         qpath = quarantine(track_id, staging,
                            {"code": exc.code, "message": str(exc),
                             "track": {k: track[k] for k in ("title", "artist", "album", "source_url")}})
@@ -506,6 +610,17 @@ class Worker:
                                  finished_at=utcnow())
 
     async def _handle_import_failure(self, track, exc: ImportError_) -> None:
+        if exc.code == "dest_exists":
+            # The file this track would become is already there: the same
+            # track on the same album, which the dedup gate did not recognise
+            # (an index out of date, tags that differ from the source's). A
+            # duplicate, then — not a failure for maintenance to retry forever.
+            shutil.rmtree(settings.staging_jobs_dir / track["job_id"] / track["id"],
+                          ignore_errors=True)
+            await self._update_track(track["id"], status=TrackStatus.SKIPPED_DUPLICATE,
+                                     stage=None, library_path=exc.path,
+                                     finished_at=utcnow())
+            return
         # staging is intact — auto-retried by maintenance when the mount is healthy
         await self._update_track(track["id"], status=TrackStatus.IMPORT_FAILED, stage=None,
                                  error_code=exc.code, error_message=str(exc)[:500])
@@ -574,6 +689,14 @@ class Worker:
 
         job = await db.fetchone("SELECT status FROM jobs WHERE id = ?", (job_id,))
         if job is None or job["status"] in (JobStatus.CANCELLED,):
+            return
+        # A paused job still has its counters updated by the track that was
+        # already in flight when it was paused — but it must not be revived.
+        if job["status"] == JobStatus.PAUSED:
+            await self._update_job(
+                job_id,
+                completed_tracks=completed, failed_tracks=failed,
+                skipped_tracks=skipped, total_tracks=total)
             return
         fields: dict = {"completed_tracks": completed, "failed_tracks": failed,
                         "skipped_tracks": skipped, "total_tracks": total}
@@ -655,6 +778,7 @@ class Worker:
                         log.info("re-queued %d import_failed tracks", len(parked))
                         self.wake()
                 await self._sweep_staging()
+                await catalog.prune_cache()
                 await db.execute(
                     "DELETE FROM events WHERE ts < datetime('now', '-90 days')")
                 bus.publish("queue.stats", governor.snapshot())

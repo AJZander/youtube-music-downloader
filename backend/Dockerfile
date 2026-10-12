@@ -25,6 +25,7 @@ RUN useradd -u 1000 -m appuser \
 
 WORKDIR /app
 COPY --chown=appuser:appuser app /app/app
+COPY --chown=appuser:appuser tests /app/tests
 COPY --chown=appuser:appuser entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

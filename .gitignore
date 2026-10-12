@@ -1,7 +1,28 @@
+# Secrets and local configuration — never commit these.
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime state: database, cookies, Spotify token, logs, backups, downloads.
 data/
 staging/
+*.db
+*.db-wal
+*.db-shm
+*cookies*.txt
+spotify_token.json
+.cache
+*.log
+
+# Build and tooling output.
 node_modules/
 dist/
 __pycache__/
 *.pyc
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
