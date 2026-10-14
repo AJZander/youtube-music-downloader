@@ -40,7 +40,7 @@ function Copy({ file, isKeeper, onMakeKeeper, checked, onToggle }) {
   )
 }
 
-function Group({ group, selection, setSelection, onDismissed }) {
+export function TrackDupeGroup({ group, selection, setSelection, onDismissed }) {
   const [keeper, setKeeper] = useState(group.copies[0].path)
   const [busy, setBusy] = useState(false)
   const [dismissed, setDismissed] = useState(false)
@@ -78,7 +78,7 @@ function Group({ group, selection, setSelection, onDismissed }) {
     return (
       <Alert severity="success" sx={{ mb: 1 }}>
         <strong>{group.title}</strong> — recorded as different recordings.
-        Undo it on the Ignored tab.
+        Undo it under Ignored.
       </Alert>
     )
   }
@@ -129,6 +129,69 @@ function Group({ group, selection, setSelection, onDismissed }) {
   )
 }
 
+/** Trash the picked copies, and record the copies left standing in each
+ *  pruned group as deliberate. Recorded per group — pooling survivors across
+ *  groups would pair unrelated tracks with each other and explode into n² rows. */
+async function trashCopies(groups, selection) {
+  const paths = [...selection.values()].flatMap((s) => [...s])
+  const result = await api.libraryTrash(paths, 'duplicate track')
+  const removing = new Set(paths)
+  for (const group of groups.filter((g) => selection.has(g.id))) {
+    const survivors = group.copies.map((c) => c.path).filter((p) => !removing.has(p))
+    if (survivors.length > 1) {
+      await api.libraryNotDuplicates(
+        'track', survivors, `kept ${survivors.length} copies of ${group.title}`)
+    }
+  }
+  return result
+}
+
+/** A single group with its own selection and remove button — for the
+ *  library pane, where one album's duplicate tracks are shown on their own. */
+export function TrackGroupCard({ group, onChanged }) {
+  const [selection, setSelection] = useState(new Map())
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState(null)
+  const picked = [...selection.values()].flatMap((s) => [...s])
+  const pickedBytes = group.copies.filter((c) => picked.includes(c.path))
+    .reduce((n, c) => n + (c.filesize_bytes || 0), 0)
+
+  const remove = async () => {
+    if (!window.confirm(`Move ${picked.length} file(s) (${bytes(pickedBytes)}) to the `
+      + 'library trash? They stay restorable until you purge.')) return
+    setBusy(true); setError(null)
+    try {
+      const r = await trashCopies([group], selection)
+      setResult(r); onChanged?.(r)
+    } catch (e) { setError(e.message) } finally { setBusy(false) }
+  }
+
+  if (result) {
+    return (
+      <Alert severity="success" sx={{ mb: 1 }}>
+        <strong>{group.title}</strong> — moved {result.trashed} file(s)
+        ({bytes(result.freed_bytes)}) to trash.
+      </Alert>
+    )
+  }
+  return (
+    <Box sx={{ mb: 1 }}>
+      {error && <Alert severity="error" sx={{ mb: 1 }}>{error}</Alert>}
+      <TrackDupeGroup group={group} selection={selection} setSelection={setSelection}
+        onDismissed={onChanged} />
+      {picked.length > 0 && (
+        <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: -0.5, mb: 1 }}>
+          <Button size="small" variant="contained" color="error" disabled={busy}
+            onClick={remove}>
+            Remove {picked.length} selected ({bytes(pickedBytes)})
+          </Button>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
 export default function TrackDupes({ onChanged }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -165,19 +228,7 @@ export default function TrackDupes({ onChanged }) {
       + 'trash? They stay restorable until you purge.')) return
     setBusy(true)
     try {
-      const r = await api.libraryTrash(selectedPaths, 'duplicate track')
-      // Copies left standing in a pruned group are a decision about *those*
-      // copies. Recorded per group — pooling survivors across groups would
-      // pair unrelated tracks with each other and explode into n² rows.
-      const removing = new Set(selectedPaths)
-      for (const group of (data?.items || []).filter((g) => selection.has(g.id))) {
-        const survivors = group.copies
-          .map((c) => c.path).filter((p) => !removing.has(p))
-        if (survivors.length > 1) {
-          await api.libraryNotDuplicates(
-            'track', survivors, `kept ${survivors.length} copies of ${group.title}`)
-        }
-      }
+      const r = await trashCopies(data?.items || [], selection)
       setResult(r); onChanged?.(r); refresh()
     } catch (e) { setError(e.message) } finally { setBusy(false) }
   }
@@ -226,7 +277,7 @@ export default function TrackDupes({ onChanged }) {
       )}
 
       {data?.items.slice(0, shown).map((group) => (
-        <Group key={group.id} group={group} onDismissed={onChanged}
+        <TrackDupeGroup key={group.id} group={group} onDismissed={onChanged}
           selection={selection} setSelection={setSelection} />
       ))}
 

@@ -7,6 +7,18 @@ const json = async (res) => {
   return res.json()
 }
 
+// Query string without the empty values — URLSearchParams would send
+// `artist_dir=undefined` for a missing optional parameter.
+const qs = (params = {}) => new URLSearchParams(
+  Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ''),
+).toString()
+
+const send = (method, url, body) => fetch(url, {
+  method,
+  headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body),
+}).then(json)
+
 export const api = {
   createJob: (url, force = false) =>
     fetch('/api/v1/jobs', {
@@ -81,9 +93,20 @@ export const api = {
   discoverScan: () => fetch('/api/v1/discover/scan', { method: 'POST' }).then(json),
   discoverReleases: (params = {}) =>
     fetch('/api/v1/discover/releases?' + new URLSearchParams(params)).then(json),
-  discoverDismissRelease: (browseId) =>
-    fetch(`/api/v1/discover/releases/${encodeURIComponent(browseId)}/dismiss`,
-      { method: 'POST' }).then(json),
+  discoverReleaseArtists: (params = {}) =>
+    fetch('/api/v1/discover/releases/artists?' + new URLSearchParams(params)).then(json),
+  discoverDismissReleases: (browseIds) =>
+    fetch('/api/v1/discover/releases/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ browse_ids: browseIds }),
+    }).then(json),
+  discoverRestoreReleases: (browseIds) =>
+    fetch('/api/v1/discover/releases/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ browse_ids: browseIds }),
+    }).then(json),
   discoverArtists: (limit = 40) =>
     fetch('/api/v1/discover/artists?' + new URLSearchParams({ limit })).then(json),
   discoverDismissArtist: (channelId, name = '') =>
@@ -129,7 +152,7 @@ export const api = {
       body: JSON.stringify({ ids }),
     }).then(json),
   libraryArtists: (params = {}) =>
-    fetch('/api/v1/library/artists?' + new URLSearchParams(params)).then(json),
+    fetch('/api/v1/library/artists?' + qs(params)).then(json),
   libraryAlbums: (artistDir) =>
     fetch('/api/v1/library/albums?' + new URLSearchParams({ artist_dir: artistDir })).then(json),
   libraryAlbumTracks: (dirpath) =>
@@ -157,6 +180,48 @@ export const api = {
     }).then(json),
   plexEmptyTrash: () =>
     fetch('/api/v1/library/plex/empty-trash', { method: 'POST' }).then(json),
+
+  // --- unified library workspace (browse, issues, metadata)
+  libraryArtist: (artistDir) =>
+    fetch('/api/v1/library/artist?' + qs({ artist_dir: artistDir })).then(json),
+  libraryAlbum: (key) =>
+    fetch('/api/v1/library/album?' + qs({ key })).then(json),
+  libraryAttention: (artistDir) =>
+    fetch('/api/v1/library/attention?' + qs({ artist_dir: artistDir })).then(json),
+  libraryIssues: (params = {}) =>
+    fetch('/api/v1/library/issues?' + qs(params)).then(json),
+  libraryApplyIssues: (body) => send('POST', '/api/v1/library/issues/apply', body),
+  libraryDismissIssues: (ids) => send('POST', '/api/v1/library/issues/dismiss', { ids }),
+  libraryReopenIssues: (ids) => send('POST', '/api/v1/library/issues/reopen', { ids }),
+  libraryChanges: (params = {}) =>
+    fetch('/api/v1/library/changes?' + qs(params)).then(json),
+  libraryRevertChange: (batchId) =>
+    send('POST', `/api/v1/library/changes/${encodeURIComponent(batchId)}/revert`),
+  libraryAlbumRecheck: (key) => send('POST', '/api/v1/library/album/recheck', { key }),
+  libraryAlbumMatch: (key, releaseMbid) =>
+    send('POST', '/api/v1/library/album/match', { key, release_mbid: releaseMbid }),
+  libraryAlbumIgnore: (key, ignored = true) =>
+    send('POST', '/api/v1/library/album/ignore', { key, ignored }),
+  libraryAlbumCandidates: (key, q) =>
+    fetch('/api/v1/library/album/candidates?' + qs({ key, q })).then(json),
+  libraryDownloadMissing: (key) => send('POST', '/api/v1/library/album/download-missing', { key }),
+  libraryAlbumSeed: (key) =>
+    fetch('/api/v1/library/album/seed?' + qs({ key })).then(json),
+  librarySetOverride: (entity, ref, field, value) =>
+    send('PUT', '/api/v1/library/overrides', { entity, ref, field, value }),
+  libraryClearOverride: (entity, ref, field) =>
+    send('DELETE', '/api/v1/library/overrides', { entity, ref, field }),
+  libraryGenres: (q = '') => fetch('/api/v1/library/genres?' + qs({ q })).then(json),
+  libraryMoods: (q = '') => fetch('/api/v1/library/moods?' + qs({ q })).then(json),
+
+  metadataStatus: () => fetch('/api/v1/library/metadata/status').then(json),
+  metadataRun: (full, reportOnly) =>
+    send('POST', '/api/v1/library/metadata/run', { full, report_only: reportOnly }),
+  metadataPause: () => send('POST', '/api/v1/library/metadata/pause'),
+  metadataResume: () => send('POST', '/api/v1/library/metadata/resume'),
+  metadataCancel: () => send('POST', '/api/v1/library/metadata/cancel'),
+  metadataAutoApply: (enabled) =>
+    send('POST', '/api/v1/library/metadata/auto-apply', { enabled }),
 
   health: () => fetch('/api/v1/health').then(json),
   stats: () => fetch('/api/v1/stats').then(json),

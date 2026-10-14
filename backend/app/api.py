@@ -625,15 +625,54 @@ async def discover_scan():
     return await discover.status()
 
 
+def _categories(value: str | None) -> set[str] | None:
+    return {c for c in (value or "").split(",") if c} or None
+
+
 @router.get("/discover/releases")
-async def discover_releases(years: int = Query(2, ge=1, le=10), source: str | None = None,
-                            include_owned: bool = False):
-    releases = await discover.new_releases(years=years, source=source,
-                                           include_owned=include_owned)
+async def discover_releases(years: int = Query(2, ge=0, le=100), source: str | None = None,
+                            include_owned: bool = False, categories: str | None = None,
+                            artist: str | None = None, q: str | None = None,
+                            offset: int = Query(0, ge=0), limit: int = Query(500, ge=1, le=1000)):
+    """A page of new releases. years=0 is every year; categories is a comma
+    list (album,ep,single,live,compilation,soundtrack); artist a channel id."""
+    page = await discover.release_page(
+        years=years, source=source, include_owned=include_owned,
+        categories=_categories(categories), artist=artist, q=q, offset=offset, limit=limit)
     waiting = await _active_urls()
-    for release in releases:
+    for release in page["releases"]:
         release["queued"] = release["url"] in waiting
-    return {"releases": releases, "status": await discover.status()}
+    return {**page, "status": await discover.status()}
+
+
+@router.get("/discover/releases/artists")
+async def discover_release_artists(years: int = Query(2, ge=0, le=100),
+                                   source: str | None = None, include_owned: bool = False,
+                                   categories: str | None = None):
+    """Who those releases are by, with a count each — the sidebar."""
+    return {"artists": await discover.release_artists(
+        years=years, source=source, include_owned=include_owned,
+        categories=_categories(categories))}
+
+
+class BrowseIdsIn(BaseModel):
+    browse_ids: list[str]
+
+
+@router.post("/discover/releases/dismiss")
+async def discover_dismiss_releases(body: BrowseIdsIn):
+    """Not interested: hide these releases from Discover."""
+    if not body.browse_ids:
+        raise HTTPException(422, "nothing selected")
+    return {"dismissed": await discover.dismiss_releases(body.browse_ids)}
+
+
+@router.post("/discover/releases/restore")
+async def discover_restore_releases(body: BrowseIdsIn):
+    """Undo a dismissal."""
+    if not body.browse_ids:
+        raise HTTPException(422, "nothing selected")
+    return {"restored": await discover.dismiss_releases(body.browse_ids, dismissed=False)}
 
 
 @router.post("/discover/releases/{browse_id}/dismiss")
@@ -701,11 +740,6 @@ async def discover_queue_songs(body: SongsQueueIn):
 
 
 # ------------------------------------------------------------------ library
-@router.get("/library/overview")
-async def library_overview():
-    return await library.overview()
-
-
 @router.post("/library/scan")
 async def library_scan(full: bool = False):
     """Kick off a background rescan. Returns immediately — a cold full scan of
@@ -759,12 +793,6 @@ async def library_album_plan(body: AlbumPlanIn):
         return await library.plan_album_merge(body.dirpaths, body.keepers)
     except library.LibraryError as exc:
         raise HTTPException(422, str(exc))
-
-
-@router.get("/library/artists")
-async def library_artists(q: str | None = None, sort: str = "name",
-                          limit: int = Query(500, le=2000), offset: int = 0):
-    return await library.list_artists(q=q, sort=sort, limit=limit, offset=offset)
 
 
 @router.get("/library/albums")

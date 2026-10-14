@@ -9,7 +9,9 @@ import BlockIcon from '@mui/icons-material/Block'
 import { api } from '../../api.js'
 import { bytes } from './shared.jsx'
 
-function Group({ group, onMerged }) {
+/** One split-artist group with its merge controls — also used by the merge
+ *  dialog opened from an artist's page. */
+export function SplitArtistGroup({ group, onMerged }) {
   const [target, setTarget] = useState(group.suggested_keeper)
   const [rewriteTags, setRewriteTags] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -43,7 +45,7 @@ function Group({ group, onMerged }) {
     return (
       <Alert severity="success" sx={{ mb: 1.5 }}>
         Recorded as different artists — this will not be reported again.
-        Undo it on the Ignored tab.
+        Undo it under Ignored.
       </Alert>
     )
   }
@@ -137,7 +139,7 @@ export default function SplitArtists({ onChanged }) {
         matches the old folder name, so featured guests survive.
       </Alert>
       {data.items.map((group) => (
-        <Group key={group.id} group={group} onMerged={onChanged} />
+        <SplitArtistGroup key={group.id} group={group} onMerged={onChanged} />
       ))}
     </Box>
   )

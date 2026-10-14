@@ -51,6 +51,19 @@ class TestBuildPath(unittest.TestCase):
         with self.assertRaises(PathBuildError):
             build_track_relpath("Artist", "", "Song", "mp3")
 
+    def test_year_goes_in_front_of_the_album(self):
+        p = build_track_relpath("Muse", "Absolution", "Hysteria", "m4a", 8, year="2003")
+        self.assertEqual(str(p), "Muse/(2003) Absolution/08 - Hysteria.m4a")
+
+    def test_edition_in_brackets_after_the_album(self):
+        p = build_track_relpath("Fleetwood Mac", "Rumours", "Dreams", "flac", 2,
+                                year=1977, edition="2004 Remaster")
+        self.assertEqual(str(p), "Fleetwood Mac/(1977) Rumours [2004 Remaster]/02 - Dreams.flac")
+
+    def test_junk_year_is_ignored(self):
+        p = build_track_relpath("A", "B", "C", "mp3", year="unknown")
+        self.assertEqual(str(p), "A/B/C.mp3")
+
     def test_bad_extension(self):
         with self.assertRaises(PathBuildError):
             build_track_relpath("A", "B", "C", ".m4a/../..")

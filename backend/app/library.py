@@ -226,11 +226,21 @@ class ScanState:
 scan_state = ScanState()
 _scan_lock = asyncio.Lock()
 
+# Bumped when the reader learns new fields: rows read by an older reader are
+# stale, so the next incremental scan re-reads them without a --full.
+TAGS_VERSION = 1
+
 _COLUMNS = ("norm_artist", "norm_title", "norm_album", "path", "format",
             "duration_sec", "artist", "title", "album", "album_artist",
             "track_number", "disc_number", "year", "bitrate_kbps", "sample_rate",
             "bit_depth", "channels", "filesize_bytes", "mtime", "dirpath",
-            "artist_dir", "scanned_at", "added_at", "unreadable")
+            "artist_dir", "scanned_at", "added_at", "unreadable",
+            "genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
+            "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
+            "releasetype", "label", "originaldate", "junk", "tags_version")
+_EXTENDED = ("genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
+             "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
+             "releasetype", "label", "originaldate", "junk", "tags_version")
 
 _UPSERT = f"""
 INSERT INTO library_index ({','.join(_COLUMNS)})
@@ -246,6 +256,13 @@ ON CONFLICT(path) DO UPDATE SET
   channels=excluded.channels, filesize_bytes=excluded.filesize_bytes,
   mtime=excluded.mtime, dirpath=excluded.dirpath, artist_dir=excluded.artist_dir,
   scanned_at=excluded.scanned_at, unreadable=excluded.unreadable,
+  genre=excluded.genre, isrc=excluded.isrc, mb_albumid=excluded.mb_albumid,
+  mb_releasegroupid=excluded.mb_releasegroupid,
+  mb_albumartistid=excluded.mb_albumartistid, mb_artistid=excluded.mb_artistid,
+  mb_trackid=excluded.mb_trackid, mb_releasetrackid=excluded.mb_releasetrackid,
+  compilation=excluded.compilation, releasetype=excluded.releasetype,
+  label=excluded.label, originaldate=excluded.originaldate, junk=excluded.junk,
+  tags_version=excluded.tags_version,
   -- a rescan must not forget which download produced the file
   provider_track_id=COALESCE(library_index.provider_track_id,
                              excluded.provider_track_id)
@@ -320,35 +337,82 @@ def _unreadable_row(root: Path, rel: str, size: int, mtime: float) -> tuple:
     return (normalize(artist_dir), normalize(stem), "", rel,
             Path(rel).suffix.lstrip(".").lower(), None,
             None, stem, None, None, None, None, None, None, None, None, None,
-            size, mtime, dirpath, artist_dir, utcnow(), utcnow(), 1)
+            size, mtime, dirpath, artist_dir, utcnow(), utcnow(), 1,
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
+            TAGS_VERSION)
 
 
 def _read_file(root: Path, rel: str, size: int, mtime: float) -> tuple:
     """One row for library_index; a placeholder row if the file will not open."""
-    import mutagen
+    import json
+
+    from .engine import tagio
 
     path = root / rel
-    try:
-        audio = mutagen.File(path, easy=True)
-    except Exception:
-        return _unreadable_row(root, rel, size, mtime)
-    if audio is None:
-        return _unreadable_row(root, rel, size, mtime)
-
-    def tag(key: str) -> str | None:
-        try:
-            value = audio.get(key)
-        except Exception:
-            return None
-        if not value:
-            return None
-        text = str(value[0]).strip()
-        return text or None
-
-    info = getattr(audio, "info", None)
     parts = Path(rel).parts
     artist_dir = parts[0] if len(parts) > 1 else ""
     dirpath = str(Path(rel).parent) if len(parts) > 1 else ""
+
+    data = None
+    if path.suffix.lower() in tagio.WRITABLE_SUFFIXES:
+        try:
+            data = tagio.read(path)
+        except tagio.TagError:
+            data = None          # a container tagio can't do (raw AAC): the plain reader
+        except Exception:
+            return _unreadable_row(root, rel, size, mtime)
+    if data is not None:
+        fields, info = data["fields"], data["info"]
+
+        def tag(key: str) -> str | None:
+            values = fields.get(key) or []
+            text = str(values[0]).strip() if values else ""
+            return text or None
+
+        def joined(key: str) -> str | None:
+            values = [v for v in fields.get(key) or [] if str(v).strip()]
+            return "; ".join(values) if values else None
+
+        length = info.get("length")
+        bitrate_kbps = info.get("bitrate_kbps")
+        sample_rate = info.get("sample_rate")
+        bits = info.get("bits_per_sample")
+        channels = info.get("channels")
+        extended = (
+            joined("genre"), tag("isrc"), tag("mb_albumid"), tag("mb_releasegroupid"),
+            tag("mb_albumartistid"), tag("mb_artistid"), tag("mb_trackid"),
+            tag("mb_releasetrackid"), 1 if tag("compilation") not in (None, "0") else None,
+            joined("releasetype"), tag("label"), tag("originaldate"),
+            json.dumps(data["junk"]) if data["junk"] else None, TAGS_VERSION)
+    else:
+        import mutagen
+        try:
+            audio = mutagen.File(path, easy=True)
+        except Exception:
+            return _unreadable_row(root, rel, size, mtime)
+        if audio is None:
+            return _unreadable_row(root, rel, size, mtime)
+
+        def tag(key: str) -> str | None:
+            try:
+                value = audio.get(key)
+            except Exception:
+                return None
+            if not value:
+                return None
+            text = str(value[0]).strip()
+            return text or None
+
+        info = getattr(audio, "info", None)
+        length = getattr(info, "length", None)
+        bitrate = getattr(info, "bitrate", None)
+        bitrate_kbps = int(bitrate / 1000) if bitrate else None
+        sample_rate = getattr(info, "sample_rate", None)
+        bits = getattr(info, "bits_per_sample", None)
+        channels = getattr(info, "channels", None)
+        extended = (tag("genre"), tag("isrc"), tag("musicbrainz_albumid"), None, None,
+                    tag("musicbrainz_artistid"), tag("musicbrainz_trackid"), None, None,
+                    None, None, None, None, TAGS_VERSION)
 
     title = tag("title") or Path(rel).stem
     artist = tag("artist")
@@ -358,20 +422,17 @@ def _read_file(root: Path, rel: str, size: int, mtime: float) -> tuple:
     # is Artist/Album/file, so the top folder is what Plex will call it anyway.
     effective_artist = artist or album_artist or artist_dir
     date = tag("date") or tag("originaldate")
-    bitrate = getattr(info, "bitrate", None)
 
     return (
         normalize(effective_artist), normalize(title), normalize(album or ""),
         rel, path.suffix.lstrip(".").lower(),
-        getattr(info, "length", None),
+        length,
         artist, title, album, album_artist,
         _int(tag("tracknumber")), _int(tag("discnumber")),
         (date or "")[:4] or None,
-        int(bitrate / 1000) if bitrate else None,
-        getattr(info, "sample_rate", None),
-        getattr(info, "bits_per_sample", None),
-        getattr(info, "channels", None),
+        bitrate_kbps, sample_rate, bits, channels,
         size, mtime, dirpath, artist_dir, utcnow(), utcnow(), 0,
+        *extended,
     )
 
 
@@ -416,14 +477,17 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
             found = await loop.run_in_executor(None, _walk, root)
             log.info("library scan: %d audio files on disk", len(found))
 
-            known = {r["path"]: (r["filesize_bytes"], r["mtime"], r["scanned_at"])
-                     for r in await db.fetchall(
-                         "SELECT path, filesize_bytes, mtime, scanned_at FROM library_index")}
+            known = {r["path"]: (r["filesize_bytes"], r["mtime"], r["scanned_at"],
+                                 r.get("tags_version", TAGS_VERSION))
+                     for r in map(dict, await db.fetchall(
+                         "SELECT path, filesize_bytes, mtime, scanned_at, tags_version "
+                         "FROM library_index"))}
 
             stale = []
             for rel, (size, mtime) in found.items():
                 previous = known.get(rel)
                 if (full or previous is None or previous[2] is None
+                        or (previous[3] or 0) < TAGS_VERSION
                         or previous[0] != size
                         or previous[1] is None or abs(previous[1] - mtime) > 1):
                     stale.append((rel, size, mtime))

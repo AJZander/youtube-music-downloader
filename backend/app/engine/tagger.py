@@ -1,4 +1,4 @@
-"""Tag writing via mutagen. For Spotify-sourced tracks, Spotify metadata is
+"""Tag writing for downloads (via tagio). For Spotify-sourced tracks, Spotify metadata is
 authoritative and overwrites whatever yt-dlp embedded; cover art is replaced
 with the Spotify 640px image. Synced lyrics are written as .lrc sidecars —
 Plex only reads sidecar lyrics, never embedded ones."""
@@ -9,10 +9,12 @@ from pathlib import Path
 
 import httpx
 from mutagen.flac import Picture
-from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TSRC
-from mutagen.mp4 import MP4, MP4Cover
+from mutagen.id3 import ID3
+from mutagen.mp4 import MP4
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
+
+from . import tagio
 
 log = logging.getLogger("mdl.tagger")
 
@@ -28,75 +30,39 @@ async def fetch_cover(url: str) -> bytes | None:
         return None
 
 
-def _vorbis_picture_b64(image: bytes, mime: str = "image/jpeg") -> str:
-    pic = Picture()
-    pic.type = 3  # front cover
-    pic.mime = mime
-    pic.data = image
-    return base64.b64encode(pic.write()).decode("ascii")
-
-
 def write_tags(path: Path, meta: dict, cover: bytes | None = None) -> None:
     """meta keys: title, artist, album, album_artist, track_number,
-    disc_number, release_date, isrc (all optional except title/artist/album)."""
-    suffix = path.suffix.lower()
+    disc_number, release_date, isrc (all optional except title/artist/album).
+
+    yt-dlp's embedded metadata is mostly YouTube's, not the record's: genre is
+    the video category ("Music"), and description/synopsis/purl/comment carry
+    the video link and the "Provided to YouTube by…" blurb. Those go; the
+    metadata manager writes real genres once the release is identified."""
     year = (meta.get("release_date") or "")[:10]
     if len(year) == 8 and year.isdigit():  # yt-dlp style YYYYMMDD
         year = f"{year[:4]}-{year[4:6]}-{year[6:]}"
-    if suffix == ".m4a":
-        audio = MP4(path)
-        audio["\xa9nam"] = [meta["title"]]
-        audio["\xa9ART"] = [meta["artist"]]
-        audio["aART"] = [meta["album_artist"]]
-        audio["\xa9alb"] = [meta["album"]]
-        if year:
-            audio["\xa9day"] = [year]
-        if meta.get("track_number"):
-            audio["trkn"] = [(int(meta["track_number"]), int(meta.get("total_tracks") or 0))]
-        if meta.get("disc_number"):
-            audio["disk"] = [(int(meta["disc_number"]), 0)]
-        if meta.get("isrc"):
-            audio["----:com.apple.iTunes:ISRC"] = [meta["isrc"].encode()]
-        if cover:
-            audio["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
-        audio.save()
-    elif suffix in (".opus", ".ogg"):
-        audio = OggOpus(path) if suffix == ".opus" else OggVorbis(path)
-        audio["title"] = [meta["title"]]
-        audio["artist"] = [meta["artist"]]
-        audio["albumartist"] = [meta["album_artist"]]
-        audio["album"] = [meta["album"]]
-        if year:
-            audio["date"] = [year]
-        if meta.get("track_number"):
-            audio["tracknumber"] = [str(meta["track_number"])]
-        if meta.get("disc_number"):
-            audio["discnumber"] = [str(meta["disc_number"])]
-        if meta.get("isrc"):
-            audio["isrc"] = [meta["isrc"]]
-        if cover:
-            audio["metadata_block_picture"] = [_vorbis_picture_b64(cover)]
-        audio.save()
-    elif suffix == ".mp3":
-        audio = ID3(path)
-        audio.setall("TIT2", [TIT2(encoding=3, text=meta["title"])])
-        audio.setall("TPE1", [TPE1(encoding=3, text=meta["artist"])])
-        audio.setall("TPE2", [TPE2(encoding=3, text=meta["album_artist"])])
-        audio.setall("TALB", [TALB(encoding=3, text=meta["album"])])
-        if year:
-            audio.setall("TDRC", [TDRC(encoding=3, text=year)])
-        if meta.get("track_number"):
-            audio.setall("TRCK", [TRCK(encoding=3, text=str(meta["track_number"]))])
-        if meta.get("disc_number"):
-            audio.setall("TPOS", [TPOS(encoding=3, text=str(meta["disc_number"]))])
-        if meta.get("isrc"):
-            audio.setall("TSRC", [TSRC(encoding=3, text=meta["isrc"])])
-        if cover:
-            audio.setall("APIC", [APIC(encoding=3, mime="image/jpeg", type=3,
-                                       desc="Front cover", data=cover)])
-        audio.save()
-    else:
-        log.warning("no tag writer for %s — leaving yt-dlp tags in place", suffix)
+    fields: dict[str, list[str]] = {
+        "title": [meta["title"]],
+        "artist": [meta["artist"]],
+        "albumartist": [meta["album_artist"]],
+        "album": [meta["album"]],
+        "genre": [],
+    }
+    if year:
+        fields["date"] = [year]
+    if meta.get("track_number"):
+        fields["tracknumber"] = [str(int(meta["track_number"]))]
+        if meta.get("total_tracks"):
+            fields["totaltracks"] = [str(int(meta["total_tracks"]))]
+    if meta.get("disc_number"):
+        fields["discnumber"] = [str(int(meta["disc_number"]))]
+    if meta.get("isrc"):
+        fields["isrc"] = [meta["isrc"]]
+    try:
+        tagio.write(path, fields, strip_junk=True, cover=cover)
+    except tagio.TagError as exc:
+        log.warning("no tag writer for %s (%s) — leaving yt-dlp tags in place",
+                    path.suffix, exc)
 
 
 def read_tags(path: Path) -> dict:

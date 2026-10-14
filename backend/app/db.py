@@ -221,6 +221,189 @@ MIGRATIONS: list[str] = [
     CREATE INDEX idx_discover_releases_channel ON discover_releases(channel_id);
     CREATE INDEX idx_discover_releases_year ON discover_releases(year);
     """,
+    # v9 — the metadata manager. library_index learns the tags that say
+    # *which* release a file is (MusicBrainz ids, ISRC) and what it is
+    # described as (genre, label, release type), plus the junk it carries.
+    # tags_version marks rows read by this reader: older rows are re-read by
+    # the next incremental scan, so no separate migration pass is needed.
+    #
+    # plex_items mirrors the Plex music section, joined to our files by path.
+    # md_* hold the desired state (md_albums / md_artists), what disagrees
+    # with it (md_issues), and every change made to get there (md_changes),
+    # each with the old value so it can be undone.
+    """
+    ALTER TABLE library_index ADD COLUMN genre TEXT;
+    ALTER TABLE library_index ADD COLUMN isrc TEXT;
+    ALTER TABLE library_index ADD COLUMN mb_albumid TEXT;
+    ALTER TABLE library_index ADD COLUMN mb_releasegroupid TEXT;
+    ALTER TABLE library_index ADD COLUMN mb_albumartistid TEXT;
+    ALTER TABLE library_index ADD COLUMN mb_artistid TEXT;
+    ALTER TABLE library_index ADD COLUMN mb_trackid TEXT;
+    ALTER TABLE library_index ADD COLUMN mb_releasetrackid TEXT;
+    ALTER TABLE library_index ADD COLUMN compilation INTEGER;
+    ALTER TABLE library_index ADD COLUMN releasetype TEXT;
+    ALTER TABLE library_index ADD COLUMN label TEXT;
+    ALTER TABLE library_index ADD COLUMN originaldate TEXT;
+    ALTER TABLE library_index ADD COLUMN junk TEXT;
+    ALTER TABLE library_index ADD COLUMN tags_version INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX idx_li_mb_album ON library_index(mb_albumid);
+
+    CREATE TABLE plex_items (
+      rating_key TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      guid TEXT,
+      mbid TEXT,
+      title TEXT,
+      parent_key TEXT,
+      grandparent_key TEXT,
+      parent_title TEXT,
+      grandparent_title TEXT,
+      idx INTEGER,
+      parent_idx INTEGER,
+      year INTEGER,
+      studio TEXT,
+      path TEXT,
+      folder TEXT,
+      genres TEXT,
+      styles TEXT,
+      moods TEXT,
+      countries TEXT,
+      locked TEXT,
+      thumb TEXT,
+      summary TEXT,
+      added_at INTEGER,
+      updated_at INTEGER,
+      detail_at INTEGER,
+      seen_at REAL NOT NULL
+    );
+    CREATE INDEX idx_plex_type ON plex_items(type);
+    CREATE INDEX idx_plex_path ON plex_items(path);
+    CREATE INDEX idx_plex_parent ON plex_items(parent_key);
+    CREATE INDEX idx_plex_folder ON plex_items(folder);
+
+    CREATE TABLE md_albums (
+      key TEXT PRIMARY KEY,
+      dirpath TEXT NOT NULL,
+      artist_dir TEXT,
+      album_tag TEXT,
+      release_mbid TEXT,
+      releasegroup_mbid TEXT,
+      artist_mbid TEXT,
+      confidence REAL,
+      source TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      manual INTEGER NOT NULL DEFAULT 0,
+      ignored INTEGER NOT NULL DEFAULT 0,
+      desired TEXT,
+      candidates TEXT,
+      plex_key TEXT,
+      file_sig TEXT,
+      plex_sig TEXT,
+      checked_at REAL,
+      next_check REAL NOT NULL DEFAULT 0,
+      priority INTEGER NOT NULL DEFAULT 0,
+      error TEXT
+    );
+    CREATE INDEX idx_md_albums_dir ON md_albums(dirpath);
+    CREATE INDEX idx_md_albums_artist ON md_albums(artist_dir);
+    CREATE INDEX idx_md_albums_due ON md_albums(next_check);
+
+    CREATE TABLE md_artists (
+      artist_dir TEXT PRIMARY KEY,
+      name TEXT,
+      artist_mbid TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      desired TEXT,
+      plex_key TEXT,
+      checked_at REAL,
+      next_check REAL NOT NULL DEFAULT 0,
+      error TEXT
+    );
+
+    CREATE TABLE md_issues (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL,
+      entity TEXT NOT NULL,
+      ref TEXT NOT NULL,
+      artist_dir TEXT,
+      album_key TEXT,
+      severity TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      detail TEXT,
+      auto INTEGER NOT NULL DEFAULT 0,
+      state TEXT NOT NULL DEFAULT 'open',
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_issues_state ON md_issues(state, kind);
+    CREATE INDEX idx_issues_artist ON md_issues(artist_dir, state);
+    CREATE INDEX idx_issues_album ON md_issues(album_key, state);
+    -- Issues that concern several albums or artists at once (a duplicate
+    -- group, an artist split across folders) are listed under each of them.
+    CREATE TABLE md_issue_refs (
+      issue_id INTEGER NOT NULL REFERENCES md_issues(id) ON DELETE CASCADE,
+      artist_dir TEXT,
+      album_key TEXT
+    );
+    CREATE INDEX idx_issue_refs_issue ON md_issue_refs(issue_id);
+    CREATE INDEX idx_issue_refs_album ON md_issue_refs(album_key);
+    CREATE INDEX idx_issue_refs_artist ON md_issue_refs(artist_dir);
+
+    CREATE TABLE md_changes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id TEXT NOT NULL,
+      target TEXT NOT NULL,
+      ref TEXT NOT NULL,
+      artist_dir TEXT,
+      album_key TEXT,
+      field TEXT,
+      old_value TEXT,
+      new_value TEXT,
+      summary TEXT,
+      applied_at TEXT NOT NULL,
+      reverted_at TEXT
+    );
+    CREATE INDEX idx_changes_batch ON md_changes(batch_id);
+    CREATE INDEX idx_changes_album ON md_changes(album_key);
+    CREATE INDEX idx_changes_artist ON md_changes(artist_dir);
+
+    CREATE TABLE md_runs (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      report_only INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL,
+      total INTEGER NOT NULL DEFAULT 0,
+      done INTEGER NOT NULL DEFAULT 0,
+      counts TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      error TEXT
+    );
+
+    CREATE TABLE md_overrides (
+      entity TEXT NOT NULL,
+      ref TEXT NOT NULL,
+      field TEXT NOT NULL,
+      value TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (entity, ref, field)
+    );
+
+    CREATE TABLE md_state (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+
+    -- MusicBrainz / Last.fm responses. Separate from catalog_cache: different
+    -- sources, different lifetimes, and pruned on their own schedule.
+    CREATE TABLE meta_cache (
+      key TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      fetched_at REAL NOT NULL
+    );
+    """,
 ]
 
 

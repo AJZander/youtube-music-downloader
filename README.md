@@ -26,11 +26,17 @@ pushes back.
   transcoded), validated length, imported atomically.
 - **No duplicates, no gaps** — a track is skipped only when the same track is
   already in the library *on the same album*, so every release arrives whole.
-- **Library manager** — find duplicate albums and tracks and artists split
-  across folder spellings; removals go to a restorable trash.
-- **Queue control** — reorder, pause and resume downloads; live progress.
+- **Library** — one page for the whole library: scroll every artist, open an
+  album, see its tracks, and fix what is wrong with it in place. Duplicates,
+  split artists, bad tags and Plex mismatches are flagged where they are and
+  queued in a sidebar of things to deal with.
+- **Metadata manager** — identifies every album on MusicBrainz, writes clean
+  tags (MusicBrainz ids, real multi-value genres, the primary artist as album
+  artist), files it as `Artist/(Year) Album/NN - Title`, and keeps Plex
+  matched and described the same way — genres, moods and cover art included.
+  Report-only until you turn on auto-apply; every change can be undone.
 - **Plex integration** (optional) — a partial library scan per imported album,
-  then a check that the track shows up.
+  a check that the exact file shows up, and the metadata manager above.
 
 ## Requirements
 
@@ -81,6 +87,10 @@ option. The main ones:
 | `DISCOVER_REQUEST_INTERVAL` | 12 | Seconds between that scan's requests |
 | `DISCOVER_COUNTRY` | `ZZ` | Starting chart country (`AU`, `US`, `GB`…; `ZZ` is global) |
 | `LIBRARY_SCAN_WORKERS` | 32 | Processes reading tags during a library scan |
+| `MUSICBRAINZ_CONTACT` | — | Your email or a URL; MusicBrainz requires it, and album identification is off without it |
+| `LASTFM_API_KEY` | — | Genres and moods for albums MusicBrainz has none for |
+| `METADATA_INTERVAL_MIN` | 30 | How often new and changed albums are checked |
+| `METADATA_WRITE_FILES` / `METADATA_MOVE_FILES` / `METADATA_WRITE_PLEX` | true | Hard limits on what the metadata manager may change |
 
 ### YouTube cookies (optional)
 
@@ -196,12 +206,32 @@ curated playlists. A chart lists a song by its music video, so queueing one
 finds it on its album and downloads the album track instead — album audio,
 tags and folder — falling back to the video only if it can't.
 
-### Managing the library
+### The Library page
 
-The **Library** tab manages what is already on disk. Run **Rescan** first; the
-first scan reads every file's tags and can take a while on a network share
-(around an hour for 60,000 files over SMB); later scans only re-read files
-that changed.
+Everything about the library is on one page:
+
+- **Artists** on the left — every artist folder, searchable and sortable,
+  with a badge for anything that needs attention. Filter to artists with
+  issues, duplicates, an unmatched Plex entry, or no MusicBrainz entry.
+- **The artist** in the middle — genres and moods, how MusicBrainz and Plex
+  know them, and their albums with cover art. Each album is flagged for what
+  is wrong with it (duplicate, unmatched in Plex, tags to fix, a move pending).
+  Click an album to see its tracks.
+- **Needs attention** on the right — every open issue, grouped by kind, for
+  the whole library or just this artist. Kinds that can be fixed automatically
+  have an *Apply all*; the rest open as a list to review. Below it, the
+  activity log: every change made, each with *Undo*.
+- **The detail pane** at the bottom (drag to resize, like the download pane)
+  — for the selected album: a three-way comparison of what the files say,
+  what MusicBrainz says and what Plex says; the tracks; match candidates (and
+  "Add to MusicBrainz" for albums it doesn't have); its duplicates; where its
+  files are and where they will go; and its history.
+
+Run **Rescan** first; the first scan reads every file's tags and can take a
+while on a network share (around an hour for 60,000 files over SMB); later
+scans only re-read files that changed.
+
+#### Duplicates
 
 A duplicate is **the same track on the same album** — the same song on a
 compilation, a single or another edition is that release's copy, never a
@@ -210,23 +240,57 @@ spare.
 - **Duplicate albums** — folders whose names agree (by tag or folder, across
   naming conventions) *and* whose tracks agree. Each copy is scored —
   **lossless outranks any bitrate**, tags break ties, signs of truncation
-  outrank everything — and the best is pre-selected to keep. Tracks only a
-  removed copy has are listed separately and left unticked.
-- **Duplicate tracks** — one album's track held twice: two formats side by
-  side, a re-download beside the original, a loose file tagged with an album
-  that is also on disk. Lengths must agree — two mixes are not a duplicate.
+  outrank everything — and the best is pre-selected to keep.
+- **Duplicate tracks** — one album's track held twice. Lengths must agree —
+  two mixes are not a duplicate.
 - **Split artists** — one artist under several folder spellings (`AC_DC` /
   `ACDC`). Merging moves the albums *and* rewrites the `albumartist` tag, since
   Plex groups artists by tag, not folder.
 
-Duplicate detection is a heuristic, so every group offers **Not duplicates**,
-and album groups let you keep more than one copy; those decisions stick across
-scans and are listed (and undoable) under **Ignored**.
+Every group can be marked **Not duplicates**; that sticks across scans and is
+listed (and undoable) under **Ignored**.
 
-**Nothing is deleted.** Removal moves files into `<library>/.mdl-trash` — a
-rename on the same filesystem, so it is instant and byte-identical. The
-**Trash** tab restores or purges; purging is the only thing that unlinks a
-file.
+#### Metadata
+
+**Full run** checks every album; the background check (every 30 minutes, and
+a few minutes after each download) only looks at what is new or changed. For
+each album it:
+
+1. **Identifies the release** — from MusicBrainz ids already in the tags, the
+   release Plex matched, ISRCs, or a MusicBrainz search — and scores it
+   against the files (titles, versions, lengths, track count). 85% or better
+   is acted on; 55–85% is offered for review; below that the album is
+   reported as not identified (with a pre-filled *Add to MusicBrainz* form).
+2. **Builds the desired record** — album artist is the primary artist (the
+   full credit stays on each track: `Drake feat. Rihanna`), Various Artists
+   for compilations, MusicBrainz genre names (from the release, then Last.fm,
+   then the artist, then Plex), and moods from Plex's own vocabulary.
+3. **Compares** it with the files and with Plex, and files an issue for each
+   difference: tags to write, files to move, track or disc numbers that don't
+   match the release (in the files or in Plex), Plex not having the album, an
+   unmatched or wrongly matched Plex album, genres, moods, missing cover art.
+4. **Checks the album is complete.** Tracks of the release that are not in the
+   library — counted across every folder of the release, so a two-disc set in
+   `CD1`/`CD2` folders is one album — are listed as *Missing tracks*.
+   *Download missing* finds the album on YouTube Music and queues exactly those
+   tracks; they arrive through the normal downloader, and the next check files
+   them in. Downloads are never started automatically.
+
+The first full run is **report-only**. Review it, then turn on
+**auto-apply**: confident fixes are then applied as they are found, and the
+rest wait for you. Applying always goes files first (tags, then the move to
+`Artist/(Year) Album [Edition]/NN - Title`), then a Plex scan, then Plex's
+own fields — which are locked, so a Plex refresh can't undo them.
+
+Plex reads genres only from its own agent with *Genres: Plex Music*, and never
+reads moods from files, so those are set through Plex's API. Grouping is
+another matter: Plex groups albums by tags, so artist and album fixes are
+written to the files.
+
+**Nothing is deleted, and everything can be undone.** Tag writes keep the
+values they replace (junk included); moves are renames on the same disk; Plex
+edits keep the old value and lock state. Removal of duplicates moves files
+into `<library>/.mdl-trash`, restorable from **Trash**.
 
 ## How it works
 

@@ -295,7 +295,10 @@ class Worker:
         # Usually a cache hit: the artist browser has already loaded it.
         album = await catalog.album(browse_id, priority=catalog.BACKGROUND,
                                     max_age=catalog.WORKER_ALBUM_MAX_AGE)
-        album_artist = ", ".join(album["artists"]) or None
+        # The album artist is the primary credit. Joining every credit made
+        # "3%, Fred Leone" an artist of its own in the folder tree and in Plex;
+        # the full credit still goes on each track's artist tag.
+        album_artist = (album["artists"] or [None])[0]
         tracks = catalog.album_track_rows(album, album_artist)
         await self._use_album_audio(album, tracks)
         return album["title"], album_artist, tracks
@@ -445,7 +448,7 @@ class Worker:
                 album_artist=meta["album_artist"], title=meta["title"],
                 error_code=None, error_message=None, force=0, staging_path=None,
                 finished_at=utcnow())
-            asyncio.create_task(self._verify_in_plex(track_id, meta))
+            asyncio.create_task(self._verify_in_plex(track_id, result["library_path"]))
         except ValidationError as exc:
             await self._handle_validation_failure(track, staging, exc, force_validation)
         except ImportError_ as exc:
@@ -659,17 +662,27 @@ class Worker:
                                      finished_at=utcnow())
 
     # ------------------------------------------------------------ verify in plex
-    async def _verify_in_plex(self, track_id: str, meta: dict) -> None:
+    async def _verify_in_plex(self, track_id: str, library_path: str) -> None:
+        """Mark the track verified once Plex lists this exact file. By path,
+        not by title: a title search happily "verifies" someone else's song
+        of the same name. The metadata manager is told either way — a new
+        album is the first thing it should look at."""
         try:
+            since = int(time.time()) - 600
             await asyncio.sleep(60)  # give the debounced scan time to run
             for _ in range(6):
-                key = await plex.find_track(meta["title"], meta["album_artist"])
+                key = await plex.find_track_by_path(library_path, added_since=since)
                 if key:
                     await self._update_track(track_id, plex_verified=1, plex_rating_key=key)
-                    return
+                    break
                 await asyncio.sleep(20)
         except Exception:
             log.debug("plex verify task failed", exc_info=True)
+        try:
+            from .metadata import runner
+            await runner.note_import(library_path)
+        except Exception:
+            log.debug("metadata manager not told about %s", library_path, exc_info=True)
 
     # ------------------------------------------------------------ accounting
     async def _recompute_job(self, job_id: str) -> None:

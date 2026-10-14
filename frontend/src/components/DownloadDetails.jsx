@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  Box, Chip, Divider, IconButton, LinearProgress, Link, Paper, Table, TableBody,
+  Box, Chip, Divider, IconButton, LinearProgress, Link, Table, TableBody,
   TableCell, TableHead, TableRow, Tab, Tabs, Tooltip, Typography,
 } from '@mui/material'
 import CloseIcon from '@mui/icons-material/Close'
@@ -10,9 +10,9 @@ import VerifiedIcon from '@mui/icons-material/Verified'
 
 import { api } from '../api.js'
 import { transferLine } from '../format.js'
+import BottomPane, { STATS_BAR_HEIGHT } from './BottomPane.jsx'
 
-export const STATS_BAR_HEIGHT = 36
-const MIN_HEIGHT = 140
+export { STATS_BAR_HEIGHT }
 
 const STATUS_COLOR = {
   queued: 'default', paused: 'warning', resolving: 'info', downloading: 'info',
@@ -150,7 +150,6 @@ export default function DownloadDetails({
   const [tab, setTab] = useState(0)
   const [filter, setFilter] = useState('all')
   const [error, setError] = useState(null)
-  const resizing = useRef(false)
 
   const load = useCallback(() => {
     if (!jobId) return
@@ -180,31 +179,6 @@ export default function DownloadDetails({
     if (changed) setTracks(next)
   }, [trackEvents]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Drag the top edge to resize, like the pane divider in a torrent client.
-  useEffect(() => {
-    const move = (e) => {
-      if (!resizing.current) return
-      const y = e.touches ? e.touches[0].clientY : e.clientY
-      const next = window.innerHeight - y - STATS_BAR_HEIGHT
-      onHeight(Math.max(MIN_HEIGHT, Math.min(next, window.innerHeight * 0.85)))
-    }
-    const stop = () => {
-      if (!resizing.current) return
-      resizing.current = false
-      document.body.style.userSelect = ''
-    }
-    window.addEventListener('mousemove', move)
-    window.addEventListener('touchmove', move)
-    window.addEventListener('mouseup', stop)
-    window.addEventListener('touchend', stop)
-    return () => {
-      window.removeEventListener('mousemove', move)
-      window.removeEventListener('touchmove', move)
-      window.removeEventListener('mouseup', stop)
-      window.removeEventListener('touchend', stop)
-    }
-  }, [onHeight])
-
   const counts = useMemo(() => {
     const out = {}
     ;(tracks || []).forEach((t) => { out[t.status] = (out[t.status] || 0) + 1 })
@@ -224,23 +198,7 @@ export default function DownloadDetails({
   const current = (tracks || []).find((t) => ACTIVE_TRACK.has(t.status))
 
   return (
-    <Paper elevation={8} square sx={{
-      position: 'fixed', left: 0, right: 0, bottom: STATS_BAR_HEIGHT, height,
-      zIndex: (theme) => theme.zIndex.appBar - 1,
-      display: 'flex', flexDirection: 'column',
-      borderTop: 1, borderColor: 'divider',
-    }}>
-      <Box
-        onMouseDown={() => { resizing.current = true; document.body.style.userSelect = 'none' }}
-        onTouchStart={() => { resizing.current = true }}
-        sx={{
-          height: 8, flexShrink: 0, cursor: 'ns-resize',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          '&:hover': { bgcolor: 'action.hover' },
-        }}>
-        <Box sx={{ width: 40, height: 3, borderRadius: 2, bgcolor: 'divider' }} />
-      </Box>
-
+    <BottomPane height={height} onHeight={onHeight}>
       <Box sx={{ px: 2, pb: 0.5, display: 'flex', alignItems: 'center', gap: 1,
         flexWrap: 'wrap' }}>
         <Box sx={{ flexGrow: 1, minWidth: 0 }}>
@@ -365,6 +323,6 @@ export default function DownloadDetails({
           </Box>
         )}
       </Box>
-    </Paper>
+    </BottomPane>
   )
 }

@@ -144,7 +144,9 @@ function coveredPaths(instances) {
   return new Set(instances.flatMap((i) => (i.covered || []).map((f) => f.path)))
 }
 
-function Group({ group, onResolved }) {
+/** One duplicate-album group with its keep/remove controls. Exported so the
+ *  library pane can show the group a selected album belongs to. */
+export function AlbumDupeGroup({ group, onResolved }) {
   const [instances, setInstances] = useState(group.instances)
   const [keepers, setKeepers] = useState(
     () => new Set([group.instances.find((i) => i.is_keeper)?.dirpath
@@ -218,10 +220,10 @@ function Group({ group, onResolved }) {
       <Alert severity="success" sx={{ mb: 1.5 }}>
         {done.dismissed
           ? 'Marked as different albums — this group will not come back. '
-            + 'Undo it on the Ignored tab.'
+            + 'Undo it under Ignored.'
           : <>
               Moved {done.trashed} files ({bytes(done.freed_bytes)}) to trash — restore
-              them any time from the Trash tab.
+              them any time from Trash.
               {done.emptied_folders?.length > 0
                 && ` Removed ${done.emptied_folders.length} emptied folder(s).`}
               {done.kept_together > 0
@@ -326,7 +328,7 @@ export default function AlbumDupes({ onChanged }) {
       </Paper>
 
       {data.items.slice(0, shown).map((group) => (
-        <Group key={group.id} group={group} onResolved={onChanged} />
+        <AlbumDupeGroup key={group.id} group={group} onResolved={onChanged} />
       ))}
 
       {data.items.length > shown && (

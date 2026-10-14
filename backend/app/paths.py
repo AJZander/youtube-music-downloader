@@ -35,6 +35,20 @@ def sanitize_component(name: str) -> str:
     return cleaned
 
 
+def album_folder_name(album: str, year: str | int | None = None,
+                      edition: str | None = None) -> str:
+    """`(1977) Rumours [2004 Remaster]`: the original year first so a folder
+    listing sorts by release, and the edition in brackets so a re-release is
+    told apart from the original at a glance."""
+    name = album
+    year_text = str(year or "").strip()[:4]
+    if re.fullmatch(r"\d{4}", year_text):
+        name = f"({year_text}) {name}"
+    if edition and edition.strip():
+        name = f"{name} [{edition.strip()}]"
+    return sanitize_component(name)
+
+
 def build_track_relpath(
     album_artist: str,
     album: str,
@@ -42,10 +56,13 @@ def build_track_relpath(
     ext: str,
     track_number: int | None = None,
     disc_number: int | None = None,
+    year: str | int | None = None,
+    edition: str | None = None,
 ) -> Path:
-    """Relative path under the library root: Artist/Album/NN - Title.ext"""
+    """Relative path under the library root: Artist/(Year) Album/NN - Title.ext"""
     artist_dir = sanitize_component(album_artist)
-    album_dir = sanitize_component(album)
+    sanitize_component(album)   # an album that sanitizes to nothing is an error
+    album_dir = album_folder_name(album, year, edition)
     prefix = ""
     if track_number:
         if disc_number and disc_number > 1:

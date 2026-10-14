@@ -72,6 +72,31 @@ class Settings(BaseSettings):
     # Default chart country (YouTube Music codes: AU, US, GB… or ZZ = global).
     discover_country: str = "ZZ"
 
+    # Metadata manager: keeps file tags and Plex in step with MusicBrainz.
+    # Report-only until auto-apply is switched on in the UI; these switches
+    # are a hard ceiling on what auto-apply may touch.
+    metadata_enabled: bool = True
+    metadata_interval_min: int = 30
+    metadata_write_files: bool = True
+    metadata_move_files: bool = True
+    metadata_write_plex: bool = True
+    # A release is applied automatically at or above this match score, offered
+    # for review between the two, and reported as unidentified below.
+    metadata_auto_confidence: float = 0.85
+    metadata_review_confidence: float = 0.55
+    metadata_max_genres: int = 5
+    metadata_max_moods: int = 5
+    # Albums already checked are looked at again this often (sources improve).
+    metadata_recheck_days: int = 90
+    # MusicBrainz requires contact details in the User-Agent; lookups stay
+    # off until this is set (an email address or a URL).
+    musicbrainz_contact: str = ""
+    musicbrainz_url: str = "https://musicbrainz.org/ws/2"
+    musicbrainz_interval: float = 1.0     # seconds between request starts (limit: 1/s)
+    lastfm_api_key: str = ""
+    # Plex is local; this only keeps a full sync from hogging the server.
+    plex_requests_per_sec: float = 20.0
+
     # Matching
     duration_tolerance_sec: float = 3.0
 

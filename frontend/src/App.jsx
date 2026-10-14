@@ -21,6 +21,9 @@ import Discover from './components/Discover.jsx'
 import StatsBar from './components/StatsBar.jsx'
 import SubmitBar from './components/SubmitBar.jsx'
 
+const DISCOVER_TAB = 5
+const LIBRARY_TAB = 6
+
 const TERMINAL_TRACK = new Set([
   'completed', 'skipped_duplicate', 'failed', 'cancelled', 'needs_review',
   'import_failed',
@@ -33,7 +36,19 @@ export default function App() {
     palette: { mode: dark ? 'dark' : 'light', primary: { main: '#7c4dff' } },
   }), [dark])
 
-  const [tab, setTab] = useState(0)
+  // A #/library link (the library workspace keeps its selection in the hash)
+  // opens straight onto the Library tab.
+  const [tab, setTabState] = useState(
+    () => (window.location.hash.startsWith('#/library') ? LIBRARY_TAB : 0))
+  const setTab = useCallback((next) => {
+    setTabState((prev) => {
+      if (prev === LIBRARY_TAB && next !== LIBRARY_TAB
+          && window.location.hash.startsWith('#/library')) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search)
+      }
+      return next
+    })
+  }, [])
   const [jobs, setJobs] = useState([])
   const [trackEvents, setTrackEvents] = useState({})   // track_id -> latest track
   // Transient transfer stats: speed/ETA/bytes, never persisted server-side.
@@ -56,7 +71,7 @@ export default function App() {
   const browseArtist = useCallback((ref) => {
     setArtistRequest({ ref, at: Date.now() })
     setTab(4)
-  }, [])
+  }, [setTab])
 
   const refreshJobs = useCallback(() => {
     api.listJobs({ limit: 100 }).then(setJobs).catch(() => {})
@@ -109,6 +124,8 @@ export default function App() {
     })
   }
 
+  const onLibrary = tab === LIBRARY_TAB
+
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
@@ -126,10 +143,14 @@ export default function App() {
         </Toolbar>
       </AppBar>
 
-      <Container maxWidth="lg" sx={{
+      {/* The library workspace is three columns wide and sizes itself to the
+          window, so it gets the full width and manages its own bottom pane.
+          Discover is wider too: new releases have an artist sidebar. */}
+      <Container maxWidth={onLibrary ? false : tab === DISCOVER_TAB ? 'xl' : 'lg'} sx={{
         py: 2,
         // Keep the last row reachable above the detail pane and the stats bar.
-        pb: `${(selectedJobId ? detailsHeight : 0) + STATS_BAR_HEIGHT + 32}px`,
+        pb: onLibrary ? `${STATS_BAR_HEIGHT + 8}px`
+          : `${(selectedJobId ? detailsHeight : 0) + STATS_BAR_HEIGHT + 32}px`,
       }}>
         <HealthBanner health={health} stats={stats}
           onResume={() => api.governorResume().then(refreshMeta)} />
@@ -165,10 +186,11 @@ export default function App() {
           <Discover onQueued={refreshJobs} onBrowseArtist={browseArtist} stats={stats}
             bottomOffset={(selectedJobId ? detailsHeight : 0) + STATS_BAR_HEIGHT} />
         </Box>
-        {tab === 6 && <Library />}
+        {onLibrary && <Library />}
       </Container>
 
-      {selectedJobId && (
+      {/* Hidden, not closed, on the Library tab: the library has its own pane. */}
+      {selectedJobId && !onLibrary && (
         <DownloadDetails
           jobId={selectedJobId}
           trackEvents={trackEvents}

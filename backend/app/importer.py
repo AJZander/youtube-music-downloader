@@ -99,7 +99,8 @@ async def import_track(staging_file: Path, validated: dict, track_meta: dict,
     try:
         relpath = build_track_relpath(
             meta["album_artist"], meta["album"], meta["title"],
-            staging_file.suffix, meta.get("track_number"), meta.get("disc_number"))
+            staging_file.suffix, meta.get("track_number"), meta.get("disc_number"),
+            year=(meta.get("release_date") or "")[:4])
     except PathBuildError as exc:
         raise ImportError_("path_build", str(exc), ErrorClass.VALIDATION_FAILED) from exc
 

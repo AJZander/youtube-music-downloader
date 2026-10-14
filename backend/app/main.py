@@ -9,6 +9,9 @@ from .config import settings
 from .db import db
 from .discover import scanner
 from .engine import ytdlp_engine
+from .metadata.routes import router as library_router
+from .metadata.runner import runner as metadata_runner
+from .plex import plex
 from .worker import worker
 
 
@@ -45,11 +48,17 @@ async def lifespan(app: FastAPI):
 
     await worker.start()
     scanner.start()
+    metadata_runner.start()
     yield
+    await metadata_runner.stop()
     await scanner.stop()
     await worker.stop()
+    await plex.close()
     await db.close()
 
 
 app = FastAPI(title="Music Downloader v2", version="2.0.0", lifespan=lifespan)
+# The library router first: it serves /library/overview and /library/artists,
+# which the older routes in api.py used to.
+app.include_router(library_router)
 app.include_router(router)

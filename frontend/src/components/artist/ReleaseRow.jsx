@@ -255,6 +255,11 @@ function ReleaseRow({
               <Chip size="small" color="success" variant="outlined" label="In library" />
             </Tooltip>
           )}
+          {!r.library && !r.in_library && r.downloaded && (
+            <Tooltip title="Downloaded here before">
+              <Chip size="small" color="success" variant="outlined" label="Downloaded" />
+            </Tooltip>
+          )}
           <LibraryChip library={r.library} />
         </Box>
         {onDismiss && (
