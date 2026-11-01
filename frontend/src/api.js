@@ -68,15 +68,12 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action }),
     }).then(json),
-  search: (q) => fetch('/api/v1/search?' + new URLSearchParams({ q })).then(json),
   spotifyResolve: (url) =>
     fetch('/api/v1/spotify/resolve?' + new URLSearchParams({ url })).then(json),
   spotifyPlaylists: () => fetch('/api/v1/spotify/playlists').then(json),
   spotifyAuthUrl: () => fetch('/api/v1/spotify/auth-url').then(json),
 
   // --- artist catalogue (YouTube Music)
-  catalogSearch: (q) =>
-    fetch('/api/v1/catalog/search?' + new URLSearchParams({ q })).then(json),
   catalogArtist: (ref, refresh = false) =>
     fetch('/api/v1/catalog/artist?' + new URLSearchParams({ ref, refresh })).then(json),
   catalogAlbum: (browseId) =>
@@ -93,8 +90,11 @@ export const api = {
   discoverScan: () => fetch('/api/v1/discover/scan', { method: 'POST' }).then(json),
   discoverReleases: (params = {}) =>
     fetch('/api/v1/discover/releases?' + new URLSearchParams(params)).then(json),
-  discoverReleaseArtists: (params = {}) =>
-    fetch('/api/v1/discover/releases/artists?' + new URLSearchParams(params)).then(json),
+  discoverKnownArtists: () => fetch('/api/v1/discover/known-artists').then(json),
+  discoverSearch: (q) =>
+    fetch('/api/v1/discover/search?' + new URLSearchParams({ q })).then(json),
+  discoverSearchYoutube: (q, kind = 'all') =>
+    fetch('/api/v1/discover/search/youtube?' + new URLSearchParams({ q, kind })).then(json),
   discoverDismissReleases: (browseIds) =>
     fetch('/api/v1/discover/releases/dismiss', {
       method: 'POST',
@@ -191,7 +191,13 @@ export const api = {
   libraryIssues: (params = {}) =>
     fetch('/api/v1/library/issues?' + qs(params)).then(json),
   libraryApplyIssues: (body) => send('POST', '/api/v1/library/issues/apply', body),
-  libraryDismissIssues: (ids) => send('POST', '/api/v1/library/issues/dismiss', { ids }),
+  // ids, or a selection: { kind, artist_dir, q, filter, exclude }
+  libraryDismissIssues: (sel) => send('POST', '/api/v1/library/issues/dismiss',
+    Array.isArray(sel) ? { ids: sel } : sel),
+  libraryDecideIssues: (body) => send('POST', '/api/v1/library/issues/decide', body),
+  libraryTriageMatches: (body = {}) =>
+    send('POST', '/api/v1/library/issues/triage-matches', body),
+  libraryDismissFailed: (body) => send('POST', '/api/v1/library/issues/dismiss-failed', body),
   libraryReopenIssues: (ids) => send('POST', '/api/v1/library/issues/reopen', { ids }),
   libraryChanges: (params = {}) =>
     fetch('/api/v1/library/changes?' + qs(params)).then(json),
@@ -202,6 +208,8 @@ export const api = {
     send('POST', '/api/v1/library/album/match', { key, release_mbid: releaseMbid }),
   libraryAlbumIgnore: (key, ignored = true) =>
     send('POST', '/api/v1/library/album/ignore', { key, ignored }),
+  libraryAlbumNoRelease: (key, noRelease = true) =>
+    send('POST', '/api/v1/library/album/no-release', { key, no_release: noRelease }),
   libraryAlbumCandidates: (key, q) =>
     fetch('/api/v1/library/album/candidates?' + qs({ key, q })).then(json),
   libraryDownloadMissing: (key) => send('POST', '/api/v1/library/album/download-missing', { key }),

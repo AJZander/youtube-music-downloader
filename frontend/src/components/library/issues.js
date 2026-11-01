@@ -12,12 +12,18 @@ export const KINDS = {
     help: 'File tags differ from MusicBrainz. Applying rewrites them (undoable).' },
   track_order: { label: 'Track order', severity: 'warning', applyable: true,
     help: 'Track or disc numbers differ from the release — in the files or in Plex. Applying renumbers them (undoable).' },
-  missing_tracks: { label: 'Missing tracks', severity: 'warning', applyable: true,
-    help: 'The release has tracks the library does not. Applying finds the album on YouTube Music and queues just those tracks for download.' },
+  missing_tracks: { label: 'Missing tracks', severity: 'warning', applyable: true, bulkAll: true,
+    help: 'The release has tracks the library does not. Applying finds the album on YouTube Music and queues just those tracks, filed into the album\'s own folder. Tracks YouTube Music doesn\'t have stay listed: "Accept incomplete" stops reporting them.' },
   move: { label: 'Rename / move', severity: 'info', applyable: true,
     help: 'Files are not at Artist/(Year) Album/NN - Title. Applying moves them (undoable).' },
-  move_conflict: { label: 'Move blocked', severity: 'warning', applyable: false,
-    help: 'The destination already exists — usually another copy of the album. Resolve it by hand.' },
+  move_conflict: { label: 'Move blocked', severity: 'warning', applyable: true, bulkAll: true,
+    help: 'The destination already holds another copy of the album. Merging moves in the tracks it lacks; where a track is in both, the better file stays and the other goes to Trash (restorable, and undoable from Activity). Files it can\'t pair are left where they are.' },
+  album_copies: { label: 'Album held more than once', severity: 'warning', applyable: true, bulkAll: true,
+    help: 'One album — a CD, a vinyl rip, a remaster, a deluxe edition — in several folders. Merging makes it one album in the most complete edition\'s folder, keeping the best file of each recording; the other copies go to Trash (restorable, and undoable from Activity). A different recording (a new remix, live, a demo) is not a copy and stays where it is. Box sets keep their own copies.' },
+  bad_file: { label: 'Damaged file', severity: 'warning', applyable: true, bulkAll: true,
+    help: 'Files that can\'t be read — a zeroed or cut-off download. Nothing can tag them or show them in Plex. Applying re-reads each one and moves it to Trash only if it is still unreadable; "Download missing" then fetches a good copy.' },
+  plex_shared: { label: 'Plex album shared', severity: 'warning', applyable: true,
+    help: 'Plex files these tracks in one album with other albums\' tracks, and an earlier fix matched or tagged that album as this one. Applying puts back what Plex had.' },
   genres: { label: 'Genres', severity: 'info', applyable: true,
     help: 'Plex shows different genres from ours. Applying sets and locks ours.' },
   moods: { label: 'Moods', severity: 'info', applyable: true,
@@ -52,6 +58,45 @@ export const KINDS = {
 
 export const DUPE_KINDS = new Set(['dup_album', 'dup_track', 'split_artist'])
 
+/**
+ * What the Review dialog offers for picking and acting on many issues of a
+ * kind at once: filters (server-side, so "select all" means all that match),
+ * the user's calls besides Apply, and what Dismiss means there.
+ */
+export const BULK = {
+  review_match: {
+    filters: [
+      { value: 'sure', label: 'Files settle it',
+        help: 'Every file matched a track of the release, and the artist is yours' },
+      { value: 'namesake', label: 'Someone else\'s song',
+        help: 'A single or two whose best match is another artist\'s song of the same name — usually a single MusicBrainz doesn\'t have' },
+      { value: 'unsure', label: 'Needs a look' },
+    ],
+    decisions: [
+      { decision: 'accept_match', label: 'Accept match',
+        help: 'Identify each album as its best match; its fixes follow' },
+      { decision: 'no_release', label: 'Not on MusicBrainz',
+        help: 'Keep the files\' own tags and stop asking' },
+    ],
+    triage: true,
+  },
+  unresolved: {
+    decisions: [{ decision: 'no_release', label: 'Not on MusicBrainz',
+      help: 'Keep the files\' own tags and stop asking' }],
+  },
+  missing_tracks: {
+    filters: [
+      { value: 'untried', label: 'Not tried yet' },
+      { value: 'tried', label: 'Download tried',
+        help: 'A download ran; what is left wasn\'t on YouTube Music or hasn\'t arrived' },
+    ],
+    dismissLabel: 'Accept incomplete',
+  },
+  move_conflict: { confirmApply: true },
+  album_copies: { confirmApply: true },
+  bad_file: { confirmApply: true },
+}
+
 export function kindLabel(kind) {
   return KINDS[kind]?.label || (kind || '').replace(/_/g, ' ')
 }
@@ -66,6 +111,7 @@ export const STATUS = {
   resolved: { label: 'identified', color: 'success' },
   review: { label: 'check match', color: 'warning' },
   unresolved: { label: 'not identified', color: 'error' },
+  no_release: { label: 'not on MusicBrainz', color: 'default' },
   ignored: { label: 'ignored', color: 'default' },
 }
 

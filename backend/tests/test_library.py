@@ -172,6 +172,110 @@ class AlbumDuplicateTestCase(unittest.TestCase):
                  for i in range(1, 6)]
         self.assertEqual(len(find_album_duplicates(rows)), 1)
 
+    def test_an_edition_in_brackets_is_still_another_album(self):
+        """The mover's layout puts the edition in [brackets] and MusicBrainz
+        often titles a deluxe edition plainly, so the tags agree."""
+        rows = [file_row(f"A/(2017) Album/{i}.flac", f"Song {i}", album="Album",
+                         album_artist="A") for i in range(1, 6)]
+        rows += [file_row(f"A/(2017) Album [Complete Edition]/{i}.flac", f"Song {i}",
+                          album="Album", album_artist="A") for i in range(1, 6)]
+        self.assertEqual(find_album_duplicates(rows), [])
+
+    def test_a_remaster_in_brackets_is_the_same_album(self):
+        rows = [file_row(f"A/(1974) Album/{i}.mp3", f"Song {i}", fmt="mp3", album="Album",
+                         album_artist="A") for i in range(1, 6)]
+        rows += [file_row(f"A/(1974) Album [2001 Remaster]/{i}.flac", f"Song {i}",
+                          album="Album", album_artist="A") for i in range(1, 6)]
+        self.assertEqual(len(find_album_duplicates(rows)), 1)
+
+    def test_a_partial_copy_of_the_album_is_a_duplicate(self):
+        rows = [file_row(f"A/(1979) Album/{i:02d}.mp3", f"Song {i}", fmt="mp3",
+                         album="Album", album_artist="A") for i in range(1, 11)]
+        rows += [file_row(f"A/Album/{i:02d}.opus", f"Song {i}", fmt="opus",
+                          album="Album", album_artist="A") for i in (3, 7)]
+        self.assertEqual(len(find_album_duplicates(rows)), 1)
+
+    def test_another_release_group_is_another_album_whatever_the_name(self):
+        """A single named like the album it comes from."""
+        rows = [file_row(f"A/(2021) Flavors of love/{i}.flac", t, album="Flavors of love",
+                         album_artist="A") for i, t in enumerate(["Flavors of love", "B"])]
+        rows += [file_row("A/Flavors of love/1.flac", "Flavors of love",
+                          album="Flavors of love", album_artist="A")]
+        for row in rows:
+            row["mb_releasegroupid"] = "single-rg" if row["dirpath"] == "A/Flavors of love" \
+                else "album-rg"
+        self.assertEqual(find_album_duplicates(rows), [])
+
+    def test_a_box_sets_discs_are_not_copies_of_the_albums(self):
+        rows = []
+        for disc, name in ((1, "Jazz"), (2, "The Miracle")):
+            rows += [file_row(f"Q/BOX-SETS/1995 - The Box, 20CD/CD 0{disc} - {name}/{i}.mp3",
+                              f"{name} {i}", fmt="mp3", album=name, album_artist="Q")
+                     for i in range(1, 6)]
+            rows += [file_row(f"Q/(1978) {name}/{i}.flac", f"{name} {i}", album=name,
+                              album_artist="Q") for i in range(1, 6)]
+        self.assertEqual(find_album_duplicates(rows), [])
+
+    def test_an_album_inside_a_dated_collection_is_the_collections(self):
+        rows = [file_row(f"B/Compilations/(2010) B - The Mono Recordings/1964 - Another Side/{i}.flac",
+                         f"Song {i}", album="Another Side", album_artist="B")
+                for i in range(1, 6)]
+        rows += [file_row(f"B/(1964) Another Side/{i}.flac", f"Song {i}", album="Another Side",
+                          album_artist="B") for i in range(1, 6)]
+        self.assertEqual(find_album_duplicates(rows), [])
+
+    def test_the_discs_of_one_album_still_group_with_another_copy(self):
+        rows = [file_row(f"B/Bootleg Series/(1991) Vols 1-3/CD{d}/{i}.flac", f"Song {d}{i}",
+                         album="The Bootleg Series Volumes 1-3", album_artist="B")
+                for d in (1, 2) for i in range(1, 4)]
+        rows += [file_row(f"B/(1991) The Bootleg Series Volumes 1-3/{i}.flac", f"Song {d}{i}",
+                          album="The Bootleg Series Volumes 1-3", album_artist="B")
+                 for d in (1, 2) for i in range(1, 4)]
+        self.assertEqual(len(find_album_duplicates(rows)), 1)
+
+    def test_a_single_with_a_featured_credit_is_not_part_of_the_album(self):
+        """MusicBrainz may match the single's one track to the album; the
+        folder's credit says it came as the single."""
+        rows = [file_row(f"F/(2012) Wild Ones/{i}.flac", t, album="Wild Ones", album_artist="F")
+                for i, t in enumerate(["Wild Ones", "Whistle", "Let It Roll"], start=1)]
+        rows += [file_row("F/Wild Ones (feat. Sia)/1.flac", "Wild Ones", album="Wild Ones",
+                          album_artist="F")]
+        self.assertEqual(find_album_duplicates(rows), [])
+
+    def test_another_artists_version_with_the_same_title_is_not_a_copy(self):
+        """A cover filed in the artist's folder, tagged like the original."""
+        rows = [file_row("T/(2020) you broke me first/01.flac", "you broke me first",
+                         album="you broke me first", album_artist="T", duration=169.0)]
+        rows += [file_row("T/(2022) The Graes - you broke me first/01.flac", "you broke me first",
+                          album="you broke me first", album_artist="T", duration=188.0)]
+        self.assertEqual(find_album_duplicates(rows), [])
+
+    def test_an_edited_cut_is_kept_not_covered(self):
+        """Innuendo's vinyl cuts some songs short: those are not the CD's tracks."""
+        lengths = [393, 270, 260, 400, 420]
+        rows = [file_row(f"Q/(1991) Innuendo/{i}.flac", f"Song {i}", album="Innuendo",
+                         album_artist="Q", duration=float(d))
+                for i, d in enumerate(lengths, start=1)]
+        rows += [file_row(f"Q/VINYL-RIP/1991 - Innuendo/{i}.mp3", f"Song {i}", fmt="mp3",
+                          album="Innuendo", album_artist="Q",
+                          duration=float(d - (60 if i == 5 else 1)))
+                 for i, d in enumerate(lengths, start=1)]
+        group = find_album_duplicates(rows)[0]
+        loser = group["instances"][1]
+        self.assertEqual([f["title"] for f in loser["orphans"]], ["Song 5"])
+        self.assertEqual(len(loser["covered"]), 4)
+
+    def test_edition_words_come_from_qualifiers_only(self):
+        from app.library import edition_words
+        self.assertEqual(edition_words("(2017) Dua Lipa (Deluxe Edition)"), {"deluxe"})
+        self.assertEqual(edition_words("(1987) Bad [Special Edition]"), {"special"})
+        self.assertEqual(edition_words("(1974) Waterloo [2001 Remaster]"), frozenset())
+        self.assertEqual(edition_words("1988 - Live at Wembley"), frozenset())
+        self.assertEqual(edition_words("Live Through This"), frozenset())
+        self.assertEqual(edition_words("Megadeth - Rust In Peace", hints=("Megadeth",)),
+                         frozenset())
+        self.assertEqual(edition_words("Girl on Fire (Remixes)"), {"remix"})
+
     def test_loose_artist_folder_files_are_not_treated_as_an_album(self):
         rows = [file_row(f"A/{i}. Song {i}.mp3", f"Song {i}", fmt="mp3", bitrate=320)
                 for i in range(1, 6)]
@@ -217,10 +321,69 @@ class TrackDuplicateTestCase(unittest.TestCase):
 
     def test_groups_inside_a_duplicate_album_are_flagged(self):
         rows = [file_row("A/Album/01.flac", "Song", album="Album", album_artist="A"),
-                file_row("A/Album Copy/01.opus", "Song", fmt="opus", bitrate=128,
+                file_row("A/Album/01 - Song.opus", "Song", fmt="opus", bitrate=128,
                          album="Album", album_artist="A")]
         groups = find_track_duplicates(rows, covered_dirs={"A/Album", "A/Album Copy"})
         self.assertTrue(groups[0]["in_album_group"])
+
+    def test_two_album_folders_are_compared_as_albums_not_track_by_track(self):
+        """A song on the album and again on a single, or in a second album
+        folder, is not a track duplicate: only the same album twice (or a
+        full and a partial copy) is, and that is the album comparison's."""
+        rows = [file_row("A/(2020) Album/01 - Song.flac", "Song", album="Album",
+                         album_artist="A", track=1),
+                file_row("A/Singles/A - Song.opus", "Song", fmt="opus", album="Album",
+                         album_artist="A"),
+                file_row("A/Album Copy/01.opus", "Song", fmt="opus", album="Album",
+                         album_artist="A", track=1)]
+        self.assertEqual(find_track_duplicates(rows), [])
+
+    def test_two_tracks_of_one_release_are_not_duplicates(self):
+        """A clean and an explicit take, both on the release."""
+        rows = [file_row("A/Single/02 - Locked Up (remix).flac", "Locked Up (remix)",
+                         album="Locked Up", album_artist="A", track=2),
+                file_row("A/Single/03 - Locked Up (remix).flac", "Locked Up (remix)",
+                         album="Locked Up", album_artist="A", track=3)]
+        for i, row in enumerate(rows):
+            row.update(mb_albumid="rel", mb_releasegroupid="rg", mb_releasetrackid=f"t{i}")
+        self.assertEqual(find_track_duplicates(rows), [])
+        for row in rows:
+            row.pop("mb_releasetrackid")       # untagged: the numbers say the same
+        self.assertEqual(find_track_duplicates(rows), [])
+
+    def test_the_same_track_in_two_formats_in_its_folder_is_a_duplicate(self):
+        rows = [file_row("A/(2012) Album/06 - Speaking in Tongues.m4a", "Speaking in Tongues",
+                         fmt="m4a", album="Album", album_artist="Hilltop Hoods", track=6),
+                file_row("A/(2012) Album/06 - Hilltop Hoods - Speaking In Tongues.opus",
+                         "Hilltop Hoods - Speaking In Tongues (Official Video) ft. Chali 2na",
+                         fmt="opus", album="Album", album_artist="Hilltop Hoods")]
+        self.assertEqual(len(find_track_duplicates(rows)), 1)
+
+    def test_a_shared_suffix_after_a_dash_is_not_the_song(self):
+        """Every chapter of an audiobook, every song of a live album: what
+        follows the dash is the album's, not the song's."""
+        titles = ["Kapitel 2.2 - Chronicles, Vol. 1", "Kapitel 3.2 - Chronicles, Vol. 1",
+                  "Freakum Dress - Live", "Broken-Hearted Girl - Live",
+                  "If I Ain't Got You (Unplugged Live at BAM, Brooklyn, NY - July 2005)",
+                  "If I Was Your Woman (Unplugged Live at BAM, Brooklyn, NY - July 2005)"]
+        rows = [file_row(f"A/Album/{i:02d}.flac", t, album="Album", album_artist="A")
+                for i, t in enumerate(titles, start=1)]
+        self.assertEqual(find_track_duplicates(rows), [])
+
+    def test_a_remix_named_after_a_featured_credit_stays_a_remix(self):
+        rows = [file_row("A/Solo/01.flac", "Solo (feat. Demi Lovato)  (Wideboys Remix)",
+                         album="Solo", album_artist="A"),
+                file_row("A/Solo/02.flac", "Solo (feat. Demi Lovato)  (Hotel Garuda Remix)",
+                         album="Solo", album_artist="A")]
+        self.assertEqual(find_track_duplicates(rows), [])
+
+    def test_a_loose_single_is_not_the_album_track_when_musicbrainz_says_single(self):
+        rows = [file_row("A/(2021) Flavors of love/11 - Flavors of love.flac",
+                         "Flavors of love", album="Flavors of love", album_artist="A", track=11),
+                file_row("A/A - Flavors Of Love.flac", "Flavors Of Love",
+                         album="Flavors of love", album_artist="A")]
+        rows[0]["mb_releasegroupid"], rows[1]["mb_releasegroupid"] = "album-rg", "single-rg"
+        self.assertEqual(find_track_duplicates(rows), [])
 
     def test_same_title_by_different_artists_is_not_a_duplicate(self):
         rows = [file_row("A/Album/01.flac", "Hello", album_artist="A"),
@@ -451,6 +614,48 @@ class MergeArtistsTestCase(unittest.TestCase):
         self.assertEqual(self.result["failures"], [])
 
 
+class FakeTags(dict):
+    saved = False
+
+    def save(self):
+        self.saved = True
+
+
+class MergeRetagTestCase(unittest.TestCase):
+    """The merge writes the target's own album artist, never its folder name."""
+
+    def retag(self, tags, known):
+        root = Path(self._tmp.name)
+        for name in tags:
+            (root / "AC_DC" / name).touch()
+        files = {str(root / "AC_DC" / n): t for n, t in tags.items()}
+        row = {"album_artist": known} if known else None
+        with mock.patch.object(library.settings, "library_dir", root), \
+                mock.patch.object(library.db, "fetchone", mock.AsyncMock(return_value=row)), \
+                mock.patch("mutagen.File", side_effect=lambda p, easy: files[str(p)]):
+            return asyncio.run(library._retag_album_artist("AC_DC", ["ACDC"]))
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        (Path(self._tmp.name) / "AC_DC").mkdir()
+
+    def test_old_spellings_take_the_targets_tag_and_its_own_are_left(self):
+        keeper = FakeTags(albumartist=["AC/DC"], artist=["AC/DC"])
+        moved = FakeTags(albumartist=["ACDC"], artist=["ACDC"])
+        bare = FakeTags(artist=["Brian Johnson"])
+        changed = self.retag({"1.flac": keeper, "2.flac": moved, "3.flac": bare}, "AC/DC")
+        self.assertEqual(changed, 2)
+        self.assertFalse(keeper.saved)
+        self.assertEqual((moved["albumartist"], moved["artist"]), (["AC/DC"], ["AC/DC"]))
+        self.assertEqual((bare["albumartist"], bare["artist"]), (["AC/DC"], ["Brian Johnson"]))
+
+    def test_a_target_without_tags_falls_back_to_its_folder_name(self):
+        moved = FakeTags(albumartist=["ACDC"])
+        self.assertEqual(self.retag({"1.flac": moved}, None), 1)
+        self.assertEqual(moved["albumartist"], ["AC_DC"])
+
+
 class AlbumGroupingEdgeTestCase(unittest.TestCase):
     def album(self, folder, titles, *, artist="A", album=None, fmt="flac"):
         return [file_row(f"{artist}/{folder}/{i:02d}.{fmt}", t, fmt=fmt,
@@ -490,11 +695,16 @@ class AlbumGroupingEdgeTestCase(unittest.TestCase):
             f["sample_rate"] = 96000
         rows += self.album("Cowboys From Hell", ["One", "Two", "Three"],
                            album="Cowboys From Hell")
+        rows += self.album("Cowboys From Hell [MP3]", ["One", "Two", "Three"],
+                           album="Cowboys From Hell", fmt="mp3")
         rows += self.album("Cowboys From Hell (Deluxe)", ["One", "Two", "Three"],
                            album="Cowboys From Hell")
         group = find_album_duplicates(rows)[0]
         self.assertIn("Box Set", group["instances"][0]["dirpath"])
         self.assertEqual(group["album"], "Cowboys From Hell")
+        # the deluxe edition is another album, whatever its tags say
+        self.assertNotIn("A/Cowboys From Hell (Deluxe)",
+                         [i["dirpath"] for i in group["instances"]])
 
     def test_group_ids_are_unique_when_a_box_set_keeps_several_groups(self):
         rows = self.album("Box/Album One", ["A1", "A2", "A3"], album="Box")

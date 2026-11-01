@@ -36,7 +36,7 @@ from .catalog import BACKGROUND, CatalogError
 from .config import settings
 from .db import db
 from .events import bus
-from .library import album_identity, strict_key
+from .library import album_identity, fold, strict_key
 from .models import ErrorClass, JobStatus
 
 log = logging.getLogger("mdl.discover")
@@ -153,9 +153,12 @@ def _year(value) -> int | None:
 
 
 async def _refresh(row) -> None:
+    """Read an artist's whole discography — the artist page and the "More"
+    lists behind it — into the shared catalogue cache, so opening the artist
+    later asks YouTube nothing, and remember every release in it."""
     channel_id, now = row["channel_id"], time.time()
     try:
-        raw = await catalog.call("get_artist", channel_id, priority=BACKGROUND)
+        doc = await catalog.discography(channel_id, refresh=True, priority=BACKGROUND)
     except CatalogError as exc:
         if exc.error_class in catalog.THROTTLED:
             raise
@@ -167,35 +170,33 @@ async def _refresh(row) -> None:
              channel_id))
         return
 
-    name = raw.get("name") or row["name"]
-    releases = []
-    for section in catalog.SECTIONS:
-        for item in (raw.get(section) or {}).get("results") or []:
-            release = catalog.release_from_listing(item, section)
-            if release:
-                releases.append(release)
+    name = doc.get("name") or row["name"]
+    releases = doc["releases"]
     # first_seen is never updated: it is how "new since last time" is known.
+    # A release the artist page itself does not show, met for the first time,
+    # is back catalogue — read now because the "More" lists are — and was
+    # there all along; only what the page shows can have just appeared.
+    first_page = set(doc.get("first_page") or [r["browse_id"] for r in releases])
+    back = row["first_checked"] or now
     await db.executemany(
         "INSERT INTO discover_releases (browse_id, channel_id, artist, title, type, "
         "year, thumbnail, explicit, first_seen) VALUES (?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(browse_id) DO UPDATE SET title = excluded.title, "
         "type = excluded.type, year = excluded.year, thumbnail = excluded.thumbnail",
         [(r["browse_id"], channel_id, name, r["title"], r["type"], _year(r["year"]),
-          r["thumbnail"], int(r["explicit"]), now) for r in releases])
-    related = [{
-        "channel_id": r["browseId"],
-        "name": r.get("title") or "",
-        "thumbnail": catalog._thumb(r.get("thumbnails"), 120),
-    } for r in ((raw.get("related") or {}).get("results") or [])
-        if (r.get("browseId") or "").startswith("UC")]
+          r["thumbnail"], int(r["explicit"]),
+          now if r["browse_id"] in first_page else back) for r in releases])
+    await _derive([channel_id])
+    related = [{k: r.get(k) for k in ("channel_id", "name", "thumbnail")}
+               for r in doc.get("related") or []]
     frequent = row["source"] == "library" and (row["weight"] or 0) >= FREQUENT_WEIGHT
     interval = (FREQUENT_INTERVAL if frequent else DEFAULT_INTERVAL) * random.uniform(0.85, 1.15)
     await db.execute(
         "UPDATE discover_artists SET name = ?, thumbnail = COALESCE(thumbnail, ?), "
         "related = ?, first_checked = COALESCE(first_checked, ?), checked_at = ?, "
         "next_check = ?, error = NULL WHERE channel_id = ?",
-        (name, catalog._thumb(raw.get("thumbnails"), 226), json.dumps(related), now, now,
-         now + interval, channel_id))
+        (name, doc.get("thumbnail"), json.dumps(related), now, now, now + interval,
+         channel_id))
 
 
 async def suggestions(limit: int | None = 40) -> list[dict]:
@@ -291,7 +292,14 @@ class Scanner:
 
     async def _run(self) -> None:
         await asyncio.sleep(30)   # let startup and crash recovery go first
+        try:
+            # The list's stored columns, ready before anyone asks: after an
+            # upgrade that is every release, after a restart the library.
+            await _prepare()
+        except Exception:
+            log.exception("discover: preparing the release list failed")
         while True:
+            before = catalog.pacer.count
             try:
                 did = await self.step()
             except asyncio.CancelledError:
@@ -307,7 +315,10 @@ class Scanner:
             finally:
                 self.current = None
             if did:
-                await asyncio.sleep(settings.discover_request_interval)
+                # A whole discography can take a few requests; the interval
+                # is per request, so the scan's share of the budget holds.
+                used = max(1, catalog.pacer.count - before)
+                await asyncio.sleep(settings.discover_request_interval * used)
                 continue
             self._wake.clear()
             try:
@@ -374,15 +385,23 @@ async def status() -> dict:
 
 
 # ------------------------------------------------------------------ new releases
-_owned: dict = {"at": 0.0, "keys": frozenset()}
+# Everything the list keeps between requests: the library's owned albums
+# (refreshed every OWNED_TTL), the owned set the stored `owned` flags were
+# last brought in line with, whether rows from before migration v10 have had
+# their columns filled, and the finished-job stamp downloads were synced at.
+_feed: dict = {"at": 0.0, "keys": frozenset()}
+_prepare_lock = asyncio.Lock()
+RELEASE_URL = "https://music.youtube.com/browse/"
 
 
 async def owned_albums() -> frozenset[tuple[str, str]]:
     """(artist, album) keys of every album folder and album tag in the
     library — enough to say a listed release is already here without
-    fetching its tracklist. Cached briefly; the library changes slowly."""
-    if time.time() - _owned["at"] < OWNED_TTL:
-        return _owned["keys"]
+    fetching its tracklist. Cached briefly; the library changes slowly. While
+    nothing has changed the same set comes back, so callers can tell by
+    identity."""
+    if time.time() - _feed["at"] < OWNED_TTL:
+        return _feed["keys"]
     rows = await db.fetchall(
         "SELECT DISTINCT substr(path, 1, instr(path, '/') - 1) AS top, dirpath, album, "
         "norm_album, album_artist FROM library_index WHERE instr(path, '/') > 0")
@@ -396,8 +415,11 @@ async def owned_albums() -> frozenset[tuple[str, str]]:
         for artist in _artist_keys(r["top"]) | _artist_keys(r["album_artist"]):
             for name in names:
                 keys.add((artist, name))
-    _owned.update(at=time.time(), keys=frozenset(keys))
-    return _owned["keys"]
+    keys = frozenset(keys)
+    if keys != _feed["keys"]:
+        _feed["keys"] = keys
+    _feed["at"] = time.time()
+    return _feed["keys"]
 
 
 # A release with several artists is filed under the whole credit
@@ -415,110 +437,170 @@ def _artist_keys(credit: str | None) -> set[str]:
     return keys
 
 
-def _in_library(owned, artist: str | None, title: str) -> bool:
-    artist_key = _key(artist or "")
-    return any((artist_key, name) in owned for name in _identity(title))
-
-
-# Every listing runs these over every release in range (thousands, with all
-# years); a title says the same thing each time.
+# Run over every release an artist has, each time one is stored; a title
+# says the same thing each time.
 _key = functools.lru_cache(maxsize=1 << 16)(strict_key)
 _identity = functools.lru_cache(maxsize=1 << 16)(album_identity)
 _classify = functools.lru_cache(maxsize=1 << 16)(catalog.classify_release)
 
 
-# Built listings by (first year, source). Reading and shaping every release in
-# range takes most of a second with all years, and a page, its totals and the
-# artist sidebar all start from one. The scan writes every few seconds, so
-# what it finds shows within LISTING_TTL; a dismissal drops them at once, and
-# a re-read of owned_albums rebuilds them.
-LISTING_TTL = 60
-_listings: dict = {}
-_listing_lock = asyncio.Lock()
+def _owned_by(owned, artist_key: str, title: str) -> bool:
+    return any((artist_key, name) in owned for name in _identity(title))
 
 
-def _listing_changed() -> None:
-    _listings.clear()
+def _in_library(owned, artist: str | None, title: str) -> bool:
+    return _owned_by(owned, _key(artist or ""), title)
 
 
-async def _listing(years: int, source: str | None) -> tuple[list[dict], dict[str, tuple]]:
-    """The releases in range, deduplicated and sorted, and for each the
-    browse ids it stands for (a clean and an explicit edition are one row)."""
+def _chunks(items, size: int = 500):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _marks(n: int) -> str:
+    return ",".join("?" * n)
+
+
+async def _derive(channel_ids) -> None:
+    """Fill the columns the list filters on (see migration v10) for every
+    release of these artists: run whenever their releases are stored."""
     owned = await owned_albums()
-    min_year = datetime.now().year - years + 1 if years > 0 else None
-    source = source if source in ("library", "suggested") else None
-    async with _listing_lock:
-        hit = _listings.get((min_year, source))
-        if hit and hit["owned"] is owned and time.time() - hit["at"] < LISTING_TTL:
-            return hit["releases"], hit["ids"]
-        params: list = []
-        where = "r.dismissed = 0 AND a.dismissed = 0"
-        if min_year:
-            where += " AND r.year >= ?"
-            params.append(min_year)
-        if source:
-            where += " AND a.source = ?"
-            params.append(source)
+    updates = []
+    for chunk in _chunks(sorted(set(channel_ids))):
         rows = await db.fetchall(
-            "SELECT r.*, a.source, a.name AS artist_name, a.first_checked "
-            "FROM discover_releases r JOIN discover_artists a ON a.channel_id = r.channel_id "
-            f"WHERE {where}", tuple(params))
-        now = time.time()
-        # YouTube Music lists a clean and an explicit release under one title as
-        # two releases; one row is enough, and the explicit one is the original.
-        rows = sorted(rows, key=lambda r: -r["explicit"])
-        groups: dict[tuple, list[str]] = {}
-        out = []
+            "SELECT r.browse_id, r.channel_id, r.artist, r.title, r.type, r.explicit, "
+            "r.dismissed, a.name AS artist_name FROM discover_releases r "
+            "LEFT JOIN discover_artists a ON a.channel_id = r.channel_id "
+            f"WHERE r.channel_id IN ({_marks(len(chunk))})", tuple(chunk))
+        groups: dict[tuple, list] = collections.defaultdict(list)
         for r in rows:
-            group = groups.setdefault((r["channel_id"], _key(r["title"]), r["type"]), [])
-            group.append(r["browse_id"])
-            if len(group) > 1:
-                continue
-            artist = r["artist"] or r["artist_name"]
-            out.append({
-                "browse_id": r["browse_id"],
-                "title": r["title"],
-                "type": r["type"] or "album",
-                "category": _classify(r["title"], r["type"] or "album"),
-                "year": str(r["year"]) if r["year"] else None,
-                "explicit": bool(r["explicit"]),
-                "thumbnail": r["thumbnail"],
-                "url": f"https://music.youtube.com/browse/{r['browse_id']}",
-                "artist_name": artist,
-                "channel_id": r["channel_id"],
-                "source": r["source"],
-                "in_library": _in_library(owned, artist, r["title"]),
-                # On the page now, and not the first time this artist was looked at.
-                "is_new": bool(r["first_checked"])
-                and r["first_seen"] > r["first_checked"] + 3600
-                and now - r["first_seen"] < NEW_FOR,
-                "first_seen": r["first_seen"],
-                "tracks": None, "track_count": None, "duration_sec": None, "artists": None,
-                "library": None, "contained_in": [], "versions": [],
-            })
-        out.sort(key=lambda r: (not r["is_new"], -int(r["year"] or 0), -r["first_seen"]))
-        ids = {group[0]: tuple(group) for group in groups.values()}
-        _listings[(min_year, source)] = {"at": now, "owned": owned, "releases": out, "ids": ids}
-        return out, ids
+            groups[(r["channel_id"], _key(r["title"]), r["type"])].append(r)
+        for (_, title_key, _), members in groups.items():
+            # YouTube Music lists a clean and an explicit release under one
+            # title as two; the explicit one is the original and stands for
+            # both. A dismissal covers every edition, a new one included.
+            members.sort(key=lambda r: (-r["explicit"], r["browse_id"]))
+            dismissed = int(any(m["dismissed"] for m in members))
+            for i, r in enumerate(members):
+                artist = r["artist"] or r["artist_name"] or ""
+                artist_key = _key(artist)
+                updates.append((
+                    _classify(r["title"], r["type"] or "album"), title_key, artist_key,
+                    fold(f"{r['title']} {artist}"), int(i == 0),
+                    int(_owned_by(owned, artist_key, r["title"])), dismissed,
+                    r["browse_id"]))
+    await db.executemany(
+        "UPDATE discover_releases SET category = ?, title_key = ?, artist_key = ?, "
+        "search = ?, rep = ?, owned = ?, dismissed = ? WHERE browse_id = ?", updates)
 
 
-async def new_releases(*, years: int = 2, source: str | None = None,
-                       include_owned: bool = False) -> list[dict]:
-    """Every release by scanned artists from the last `years` years (0: any
-    year), shaped like the artist browser's releases so the same rows draw
-    them. What appeared since the last look comes first, then newest first."""
-    releases, ids = await _listing(years, source)
-    # Downloaded here, whatever the library index makes of the files — and
-    # straight away, where the listing and owned_albums are cached.
-    done = {r["source_url"].rsplit("/", 1)[-1] for r in await db.fetchall(
-        "SELECT DISTINCT source_url FROM jobs WHERE status = ? "
-        "AND source_url LIKE 'https://music.youtube.com/browse/%'", (JobStatus.COMPLETED,))}
-    out = []
-    for r in releases:
-        downloaded = any(i in done for i in ids[r["browse_id"]])
-        if include_owned or not (r["in_library"] or downloaded):
-            out.append({**r, "downloaded": downloaded})
-    return out
+async def _sync_owned() -> None:
+    """Keep each release's `owned` in step with the library — looking again
+    only at the artists whose albums came or went since last time."""
+    owned = await owned_albums()
+    synced = _feed.get("synced")
+    if synced is owned:
+        return
+    columns = "SELECT browse_id, artist_key, title, owned FROM discover_releases"
+    if synced is None:
+        rows = await db.fetchall(columns)
+    else:
+        rows = []
+        for chunk in _chunks({artist for artist, _ in owned ^ synced}):
+            rows += await db.fetchall(
+                f"{columns} WHERE artist_key IN ({_marks(len(chunk))})", tuple(chunk))
+    changes = []
+    for r in rows:
+        have = int(_owned_by(owned, r["artist_key"] or "", r["title"]))
+        if have != r["owned"]:
+            changes.append((have, r["browse_id"]))
+    await db.executemany("UPDATE discover_releases SET owned = ? WHERE browse_id = ?",
+                         changes)
+    _feed["synced"] = owned
+
+
+async def _sync_downloaded() -> None:
+    """Mark releases downloaded here — every edition of one — once a job for
+    one completes, whatever the library index makes of the files."""
+    mark = await db.fetchone(
+        "SELECT COUNT(*) AS n, MAX(finished_at) AS last FROM jobs WHERE status = ?",
+        (JobStatus.COMPLETED,))
+    stamp = (mark["n"], mark["last"])
+    if _feed.get("jobs") == stamp:
+        return
+    await db.execute(
+        "UPDATE discover_releases SET downloaded = 1 WHERE downloaded = 0 "
+        "AND (channel_id, title_key, type) IN (SELECT r.channel_id, r.title_key, r.type "
+        "FROM jobs j JOIN discover_releases r ON r.browse_id = substr(j.source_url, ?) "
+        "WHERE j.status = ? AND j.source_url LIKE ?)",
+        (len(RELEASE_URL) + 1, JobStatus.COMPLETED, RELEASE_URL + "%"))
+    _feed["jobs"] = stamp
+
+
+async def _prepare() -> None:
+    """Bring the stored columns up to date before reading them."""
+    async with _prepare_lock:
+        if not _feed.get("derived"):
+            rows = await db.fetchall(
+                "SELECT DISTINCT channel_id FROM discover_releases WHERE category IS NULL")
+            if rows:
+                await _derive([r["channel_id"] for r in rows])
+            await catalog.index_cached_tracks()
+            _feed["derived"] = True
+        await _sync_owned()
+        await _sync_downloaded()
+
+
+_FROM = "FROM discover_releases r JOIN discover_artists a ON a.channel_id = r.channel_id"
+# On the page now, and not the first time this artist was looked at. Takes
+# the oldest first_seen that still counts as new.
+_IS_NEW = ("(a.first_checked IS NOT NULL AND r.first_seen > a.first_checked + 3600 "
+           "AND r.first_seen > ?)")
+_OWNED = "(r.owned = 1 OR r.downloaded = 1)"
+
+
+def _scope(*, years: int, source: str | None, artist: str | None,
+           q: str | None) -> tuple[str, list]:
+    where = ["r.rep = 1", "r.dismissed = 0", "a.dismissed = 0"]
+    params: list = []
+    if years > 0:
+        where.append("r.year >= ?")
+        params.append(datetime.now().year - years + 1)
+    if source in ("library", "suggested"):
+        where.append("a.source = ?")
+        params.append(source)
+    if artist:
+        where.append("r.channel_id = ?")
+        params.append(artist)
+    needle = fold((q or "").strip())
+    if needle:
+        where.append("instr(r.search, ?) > 0")
+        params.append(needle)
+    return " AND ".join(where), params
+
+
+def shape(r) -> dict:
+    """A stored release as the release rows draw it."""
+    return {
+        "browse_id": r["browse_id"],
+        "title": r["title"],
+        "type": r["type"] or "album",
+        "category": r["category"],
+        "year": str(r["year"]) if r["year"] else None,
+        "explicit": bool(r["explicit"]),
+        "thumbnail": r["thumbnail"],
+        "url": f"{RELEASE_URL}{r['browse_id']}",
+        "artist_name": r["artist"] or r["artist_name"],
+        "channel_id": r["channel_id"],
+        "source": r["source"],
+        "in_library": bool(r["owned"]),
+        "downloaded": bool(r["downloaded"]),
+        "is_new": bool(r["is_new"]),
+        "first_seen": r["first_seen"],
+        "tracks": None, "track_count": None, "duration_sec": None, "artists": None,
+        "library": None, "contained_in": [], "versions": [],
+    }
 
 
 def owned_release(r: dict) -> bool:
@@ -526,57 +608,215 @@ def owned_release(r: dict) -> bool:
     return r["in_library"] or r["downloaded"]
 
 
-def _in_scope(releases: list[dict], *, include_owned: bool, categories, artist: str | None,
-              q: str | None) -> list[dict]:
-    needle = (q or "").strip().casefold()
-    return [r for r in releases
-            if (include_owned or not owned_release(r))
-            and (not categories or r["category"] in categories)
-            and (not artist or r["channel_id"] == artist)
-            and (not needle or needle in r["title"].casefold()
-                 or needle in (r["artist_name"] or "").casefold())]
-
-
 async def release_page(*, years: int = 2, source: str | None = None,
                        include_owned: bool = False, categories=None,
                        artist: str | None = None, q: str | None = None,
                        offset: int = 0, limit: int = 500) -> dict:
-    """One page of new releases, filtered here so a page of singles is a full
-    page. With it, the totals the filters need: per category (whatever
-    categories are picked), and how many owned ones are hidden or shown."""
-    every = await new_releases(years=years, source=source, include_owned=True)
-    scope = dict(include_owned=include_owned, artist=artist, q=q)
-    picked = _in_scope(every, categories=categories, **scope)
-    counts = collections.Counter(
-        r["category"] for r in _in_scope(every, categories=None, **scope))
-    owned = sum(1 for r in _in_scope(every, categories=categories,
-                                     **{**scope, "include_owned": True})
-                if owned_release(r))
+    """One page of releases by scanned artists from the last `years` years
+    (0: any year), filtered here so a page of singles is a full page. What
+    appeared since the last look comes first, then newest first. With it,
+    the totals the filters need: per category (whatever categories are
+    picked), and how many owned ones are hidden or shown."""
+    await _prepare()
+    where, params = _scope(years=years, source=source, artist=artist, q=q)
+    counts, total, owned = {}, 0, 0
+    for t in await db.fetchall(
+            f"SELECT r.category AS category, COUNT(*) AS n, SUM({_OWNED}) AS owned "
+            f"{_FROM} WHERE {where} GROUP BY r.category", tuple(params)):
+        shown = t["n"] if include_owned else t["n"] - t["owned"]
+        if shown:
+            counts[t["category"]] = shown
+        if not categories or t["category"] in categories:
+            total += shown
+            owned += t["owned"]
+    if categories:
+        where += f" AND r.category IN ({_marks(len(categories))})"
+        params += sorted(categories)
+    if not include_owned:
+        where += f" AND NOT {_OWNED}"
+    rows = await db.fetchall(
+        f"SELECT r.*, a.source, a.name AS artist_name, {_IS_NEW} AS is_new {_FROM} "
+        f"WHERE {where} ORDER BY is_new DESC, r.year DESC, r.first_seen DESC, "
+        "r.browse_id LIMIT ? OFFSET ?",
+        (time.time() - NEW_FOR, *params, limit, offset))
     return {
-        "releases": picked[offset:offset + limit],
-        "total": len(picked),
+        "releases": [shape(r) for r in rows],
+        "total": total,
         "offset": offset,
         "limit": limit,
-        "counts": dict(counts),
+        "counts": counts,
         "owned": owned,
     }
+
+
+async def new_releases(*, years: int = 2, source: str | None = None,
+                       include_owned: bool = False) -> list[dict]:
+    """Every release release_page would page through."""
+    page = await release_page(years=years, source=source, include_owned=include_owned,
+                              limit=-1)
+    return page["releases"]
 
 
 async def release_artists(*, years: int = 2, source: str | None = None,
                           include_owned: bool = False, categories=None) -> list[dict]:
     """The artists behind those releases, with how many each has under the
-    same filters — the Discover sidebar."""
-    every = await new_releases(years=years, source=source, include_owned=True)
-    artists: dict[str, dict] = {}
-    for r in _in_scope(every, include_owned=include_owned, categories=categories,
-                       artist=None, q=None):
-        a = artists.setdefault(r["channel_id"], {
-            "channel_id": r["channel_id"], "name": r["artist_name"], "source": r["source"],
-            "releases": 0, "new": 0, "latest": 0})
-        a["releases"] += 1
-        a["new"] += r["is_new"]
-        a["latest"] = max(a["latest"], r["first_seen"])
-    return sorted(artists.values(), key=lambda a: (a["name"] or "").casefold())
+    same filters."""
+    await _prepare()
+    where, params = _scope(years=years, source=source, artist=None, q=None)
+    if categories:
+        where += f" AND r.category IN ({_marks(len(categories))})"
+        params += sorted(categories)
+    if not include_owned:
+        where += f" AND NOT {_OWNED}"
+    rows = await db.fetchall(
+        f"SELECT r.channel_id, a.name, a.source, COUNT(*) AS releases, "
+        f"SUM({_IS_NEW}) AS new, MAX(r.first_seen) AS latest {_FROM} WHERE {where} "
+        "GROUP BY r.channel_id", (time.time() - NEW_FOR, *params))
+    return sorted(({k: r[k] for k in ("channel_id", "name", "source", "releases", "new",
+                                       "latest")} for r in rows),
+                  key=lambda a: (a["name"] or "").casefold())
+
+
+async def known_artists() -> list[dict]:
+    """Every artist Discover follows — yours and the recommended ones — with
+    what there is to find: releases, how many just appeared, and how many
+    the library does not have."""
+    await _prepare()
+    found = {r["channel_id"]: r for r in await db.fetchall(
+        f"SELECT r.channel_id, COUNT(*) AS releases, SUM({_IS_NEW} AND NOT {_OWNED}) AS new, "
+        f"SUM(NOT {_OWNED}) AS missing, MAX(r.first_seen) AS latest {_FROM} "
+        "WHERE r.rep = 1 AND r.dismissed = 0 GROUP BY r.channel_id", (time.time() - NEW_FOR,))}
+    out = []
+    for a in await db.fetchall("SELECT channel_id, name, source, weight, checked_at "
+                               "FROM discover_artists WHERE dismissed = 0"):
+        r = found.get(a["channel_id"])
+        out.append({
+            "channel_id": a["channel_id"], "name": (a["name"] or "").strip(),
+            "source": a["source"],
+            "tracks": int(a["weight"] or 0) if a["source"] == "library" else 0,
+            "checked": a["checked_at"] is not None,
+            "releases": r["releases"] if r else 0, "new": r["new"] if r else 0,
+            "missing": r["missing"] if r else 0, "latest": r["latest"] if r else 0,
+        })
+    return sorted(out, key=lambda a: (a["name"] or "").casefold())
+
+
+# ------------------------------------------------------------------ search
+async def _track_states(tracks: list[dict]) -> list[dict]:
+    """Library state for songs from anywhere (same-album rule; see ownership)."""
+    credits = {t["artist"] for t in tracks if t.get("artist")}
+    names = {re.split(r",| & ", t["artist"])[0].strip() for t in tracks if t.get("artist")}
+    index = await ownership.load_index(credits, names, [t["video_id"] for t in tracks])
+    return [{**t, **index.lookup(title=t["title"], credit=t.get("artist"),
+                                 album=t.get("album"), video_id=t["video_id"],
+                                 length=t.get("duration_sec"))} for t in tracks]
+
+
+async def search_tracks(q: str, limit: int = 50) -> dict:
+    """Songs on the tracklists already loaded, by title or artist."""
+    needle = fold(" ".join((q or "").split()))
+    if len(needle) < 2:
+        return {"total": 0, "items": []}
+    total = (await db.fetchone(
+        "SELECT COUNT(*) AS n FROM catalog_tracks WHERE instr(search, ?) > 0", (needle,)))["n"]
+    rows = await db.fetchall(
+        "SELECT * FROM catalog_tracks WHERE instr(search, ?) > 0 "
+        "ORDER BY instr(search, ?) = 1 DESC, year DESC, browse_id, position LIMIT ?",
+        (needle, needle, limit))
+    tracks = [{"video_id": r["video_id"], "title": r["title"], "artist": r["artists"],
+               "artist_id": r["channel_id"], "album": r["album"], "album_id": r["browse_id"],
+               "year": r["year"], "thumbnail": r["thumbnail"],
+               "duration_sec": r["duration_sec"]} for r in rows]
+    return {"total": total, "items": await _track_states(tracks)}
+
+
+async def search_local(q: str) -> dict:
+    """Everything Discover already knows that matches: releases in the
+    catalogue (any year, owned ones included) and songs on loaded
+    tracklists. Instant — nothing is asked of YouTube."""
+    releases = await release_page(years=0, include_owned=True, q=q, limit=100)
+    return {"releases": {"total": releases["total"], "items": releases["releases"]},
+            "tracks": await search_tracks(q)}
+
+
+async def annotate_youtube(found: dict) -> dict:
+    """YouTube Music search results with what is already here: artists
+    Discover follows, albums the library has, songs it holds."""
+    ids = [a["channel_id"] for a in found["artists"]]
+    known = {r["channel_id"]: r["source"] for r in await db.fetchall(
+        "SELECT channel_id, source FROM discover_artists WHERE dismissed = 0 AND channel_id IN "
+        f"({_marks(len(ids))})", tuple(ids))} if ids else {}
+    await _prepare()
+    owned = await owned_albums()
+    browse_ids = [a["browse_id"] for a in found["albums"]]
+    stored = {r["browse_id"]: r for r in await db.fetchall(
+        "SELECT browse_id, owned, downloaded FROM discover_releases WHERE browse_id IN "
+        f"({_marks(len(browse_ids))})", tuple(browse_ids))} if browse_ids else {}
+    albums = []
+    for a in found["albums"]:
+        row = stored.get(a["browse_id"])
+        albums.append({**a, "in_library": bool(row["owned"]) if row
+                       else _in_library(owned, a["artist"], a["title"]),
+                       "downloaded": bool(row and row["downloaded"])})
+    return {
+        "artists": [{**a, "source": known.get(a["channel_id"])} for a in found["artists"]],
+        "songs": await _track_states(found["songs"]) if found["songs"] else [],
+        "albums": albums,
+    }
+
+
+def _because(rows, channel_id: str) -> tuple[list[str], int]:
+    """Which of your artists list this one as related, biggest first."""
+    who = []
+    for r in rows:
+        if r["source"] == "library" and r["related"] and not r["dismissed"] \
+                and any(x.get("channel_id") == channel_id for x in json.loads(r["related"])):
+            who.append((r["weight"] or 0, r["name"]))
+    return [name for _, name in sorted(who, reverse=True)[:3]], len(who)
+
+
+async def artist_context(view: dict) -> dict | None:
+    """Discover's side of an artist view: on each release, whether it just
+    appeared, was dismissed or was downloaded here; for the artist, whether
+    they are yours or recommended, and why. None for an artist Discover does
+    not follow."""
+    await _prepare()
+    ids = [r["browse_id"] for r in view["releases"]]
+    stored: dict[str, dict] = {}
+    for chunk in _chunks(ids):
+        for r in await db.fetchall(
+                f"SELECT r.browse_id, r.channel_id, r.dismissed, r.downloaded, {_IS_NEW} AS is_new "
+                f"{_FROM} WHERE r.browse_id IN ({_marks(len(chunk))})",
+                (time.time() - NEW_FOR, *chunk)):
+            stored[r["browse_id"]] = r
+    for release in view["releases"]:
+        row = stored.get(release["browse_id"])
+        release["known"] = row is not None
+        release["is_new"] = bool(row and row["is_new"])
+        release["dismissed"] = bool(row and row["dismissed"])
+        release["downloaded"] = bool(row and row["downloaded"])
+    # Discover may know the artist by another of their channel ids.
+    channels = collections.Counter(r["channel_id"] for r in stored.values())
+    candidates = [c for c, _ in channels.most_common()] + [view["artist"]["channel_id"]]
+    rows = await db.fetchall(
+        "SELECT channel_id, name, source, weight, related, dismissed, checked_at "
+        "FROM discover_artists")
+    by_id = {r["channel_id"]: r for r in rows}
+    artist = next((by_id[c] for c in candidates if c in by_id), None)
+    if artist is None:
+        return None
+    because, because_count = ([], 0)
+    if artist["source"] == "suggested":
+        because, because_count = _because(rows, artist["channel_id"])
+    return {
+        "channel_id": artist["channel_id"],
+        "source": artist["source"],
+        "tracks": int(artist["weight"] or 0) if artist["source"] == "library" else 0,
+        "dismissed": bool(artist["dismissed"]),
+        "checked_at": artist["checked_at"],
+        "because": because,
+        "because_count": because_count,
+    }
 
 
 async def dismiss_release(browse_id: str) -> None:
@@ -588,25 +828,17 @@ async def dismiss_releases(browse_ids, dismissed: bool = True) -> int:
     back. A clean and an explicit edition are listed as one release, so both
     go: hiding only the one shown would let the other take its place.
     Returns how many listed releases that was."""
-    picked = []
-    browse_ids = list(dict.fromkeys(browse_ids))
-    for i in range(0, len(browse_ids), 500):
-        chunk = browse_ids[i:i + 500]
-        picked += await db.fetchall(
-            "SELECT channel_id, title, type FROM discover_releases WHERE browse_id IN "
-            f"({','.join('?' * len(chunk))})", tuple(chunk))
-    groups = {(r["channel_id"], _key(r["title"]), r["type"]) for r in picked}
-    channels = sorted({channel for channel, _, _ in groups})
-    editions = []
-    for i in range(0, len(channels), 500):
-        chunk = channels[i:i + 500]
-        editions += [r["browse_id"] for r in await db.fetchall(
-            "SELECT browse_id, channel_id, title, type FROM discover_releases WHERE channel_id IN "
-            f"({','.join('?' * len(chunk))})", tuple(chunk))
-            if (r["channel_id"], _key(r["title"]), r["type"]) in groups]
-    await db.executemany("UPDATE discover_releases SET dismissed = ? WHERE browse_id = ?",
-                         [(int(dismissed), b) for b in editions])
-    _listing_changed()
+    await _prepare()
+    groups = set()
+    for chunk in _chunks(dict.fromkeys(browse_ids)):
+        groups |= {(r["channel_id"], r["title_key"], r["type"]) for r in await db.fetchall(
+            "SELECT channel_id, title_key, type FROM discover_releases "
+            f"WHERE browse_id IN ({_marks(len(chunk))})", tuple(chunk))}
+    for chunk in _chunks(sorted(groups, key=str)):
+        await db.execute(
+            "UPDATE discover_releases SET dismissed = ? WHERE (channel_id, title_key, type) "
+            f"IN (VALUES {','.join(['(?,?,?)'] * len(chunk))})",
+            (int(dismissed), *[v for g in chunk for v in g]))
     return len(groups)
 
 
@@ -615,7 +847,6 @@ async def dismiss_artist(channel_id: str, name: str = "") -> None:
         "INSERT INTO discover_artists (channel_id, name, source, dismissed) "
         "VALUES (?,?,'suggested',1) ON CONFLICT(channel_id) DO UPDATE SET dismissed = 1",
         (channel_id, name or channel_id))
-    _listing_changed()
 
 
 async def suggested_artists(limit: int = 40, years: int = 2) -> list[dict]:
@@ -627,7 +858,7 @@ async def suggested_artists(limit: int = 40, years: int = 2) -> list[dict]:
     ids = [s["channel_id"] for s in found]
     counts = {r["channel_id"]: r["n"] for r in await db.fetchall(
         "SELECT channel_id, COUNT(*) AS n FROM discover_releases WHERE dismissed = 0 "
-        f"AND year >= ? AND channel_id IN ({','.join('?' * len(ids))}) GROUP BY channel_id",
+        f"AND rep = 1 AND year >= ? AND channel_id IN ({','.join('?' * len(ids))}) GROUP BY channel_id",
         (min_year, *ids))}
     checked = {r["channel_id"] for r in await db.fetchall(
         "SELECT channel_id FROM discover_artists WHERE checked_at IS NOT NULL "

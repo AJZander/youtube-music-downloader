@@ -113,10 +113,11 @@ class Worker:
     # ------------------------------------------------------------ enqueue
     async def enqueue(self, url: str, force: bool = False, *,
                       title: str | None = None, artist: str | None = None,
-                      track_filter: str | None = None) -> str:
+                      track_filter: str | None = None, target_dir: str | None = None) -> str:
         """title/artist are a placeholder until expansion fills in the real
         ones — so a release queued from the browser is named in the queue
-        straight away. track_filter is a JSON list of video ids to keep."""
+        straight away. track_filter is a JSON list of video ids to keep;
+        target_dir an album folder the tracks belong in (missing tracks)."""
         routed: RoutedURL = route(url)
         job_id = uuid.uuid4().hex[:12]
         row = await db.fetchone(
@@ -124,11 +125,11 @@ class Worker:
         await db.execute(
             """INSERT INTO jobs (id, source_url, provider, source_type, force,
                                  status, queue_position, created_at, title,
-                                 artist, track_filter)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                 artist, track_filter, target_dir)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (job_id, routed.canonical_url, routed.provider, routed.source_type,
              int(force), JobStatus.QUEUED, row["last"] + 1, utcnow(), title,
-             artist, track_filter))
+             artist, track_filter, target_dir))
         await self._publish_job(job_id)
         self.wake()
         return job_id
@@ -328,7 +329,8 @@ class Worker:
     async def _resolve_yt_artist(self, url: str) -> tuple[str | None, str | None, list[dict]]:
         """A whole artist as one job. The browser is the better way in — it
         lets you choose — but a pasted artist URL still means everything."""
-        doc = await catalog.discography(url, priority=catalog.BACKGROUND)
+        doc = await catalog.discography(url, priority=catalog.BACKGROUND,
+                                        max_age=catalog.ARTIST_FRESH)
         artist_name = doc["name"]
         tracks: list[dict] = []
         for release in doc["releases"]:
@@ -419,7 +421,9 @@ class Worker:
             # -------- import
             await self._update_track(track_id, status=TrackStatus.IMPORTING, stage="importing")
             result = await import_track(validated["path"], validated, final_meta,
-                                        force=force_guards)
+                                        force=force_guards,
+                                        target_dir=job["target_dir"] if "target_dir" in job.keys()
+                                        else None)
             meta = result["meta"]
             if result["overwrote"]:
                 await bus.record(

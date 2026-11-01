@@ -1,9 +1,9 @@
 # Music Downloader
 
-A self-hosted music downloader for a personal library. Paste a YouTube, YouTube
-Music or Spotify link — a song, album, artist or playlist — and correctly
-tagged, best-quality audio lands in your library as `Artist/Album/NN - Title`,
-ready for Plex or any other music server.
+A self-hosted music downloader for a personal library. Find music in Discover —
+search, browse an artist's whole discography, or paste a YouTube, YouTube Music
+or Spotify link — and correctly tagged, best-quality audio lands in your
+library as `Artist/Album/NN - Title`, ready for Plex or any other music server.
 
 It runs as three Docker containers with a web UI, and is built to be gentle
 with YouTube: one download at a time, paced, with backoff the moment YouTube
@@ -11,16 +11,17 @@ pushes back.
 
 ## Features
 
-- **Paste anything** — YouTube or YouTube Music songs, albums, playlists and
-  artists; Spotify tracks, albums, playlists and artists (Spotify supplies the
-  metadata, YouTube Music the audio). Or type to search.
-- **Artist browser** — an artist's *complete* discography (not just the ten
-  albums on their YouTube Music page), grouped into albums, EPs, singles, live
-  albums, compilations and soundtracks, with tracklists, and what is already in
-  your library. Pick whole releases or single tracks.
-- **Discover** — new releases from the artists in your library and from artists
-  like them, recommendations ("because you have…"), country charts, and the top
-  songs and albums of every genre.
+- **Discover** — one place to find music. Search what it already knows as you
+  type (artists, releases, songs on loaded tracklists) and YouTube Music on
+  Enter; open any artist's *complete* discography (not just the ten albums on
+  their YouTube Music page), grouped into albums, EPs, singles, live albums,
+  compilations and soundtracks, with tracklists and what is already in your
+  library; follow new releases from your artists and artists like them,
+  recommendations ("because you have…"), country charts and the top songs and
+  albums of every genre. Pick whole releases or single tracks.
+- **Paste anything** — into Discover's search box: YouTube or YouTube Music
+  songs, albums, playlists and artists; Spotify tracks, albums, playlists and
+  artists (Spotify supplies the metadata, YouTube Music the audio).
 - **Proper files** — tags from YouTube Music or Spotify, cover art, synced
   lyrics (`.lrc`) from LRCLIB when it has them, stream-copied audio (never
   transcoded), validated length, imported atomically.
@@ -116,19 +117,39 @@ and `.env`, are git-ignored. Don't share them; they hold your tokens.
 
 ### Downloading
 
-Paste one or more links into the bar at the top, or type to search YouTube
-Music. A job is created per link and works through its tracks one at a time:
+Paste one or more links (one per line) into the search box in **Discover** and
+press Enter, or pick releases and songs there. A job is created per link or
+release and works through its tracks one at a time:
 download → validate (length, format) → tag → import into the library. Anything
 that fails validation lands in **Needs Review** with the file kept, to retry,
 discard or import anyway. Tracks already in the library are skipped and listed
 under **Skipped**, with what they matched; *Force download* fetches one anyway.
 
-Pasting an artist link opens the **Artists** tab instead, so you can choose.
+Pasting an artist or album link opens it in Discover instead, so you can choose.
+
+### Discover
+
+Discover is one page: a rail on the left and a pane for whatever is picked.
+The rail has a search box, the views that are not an artist (**New releases**,
+**Recommended artists**, **Charts & genres**), and every artist Discover
+follows — yours and the recommended ones — plus anyone opened recently. Filter
+it to yours, recommended or recent, and sort it by name, what just appeared,
+what you don't have, the latest release found, or how much of them you own.
+Where you are is in the address bar (`#/discover/artist/…`), so Back works and
+an artist can be bookmarked.
+
+**Search.** Typing filters the rail's artists and shows, in the pane, what
+Discover already knows that matches: releases in its catalogue (any year, ones
+you have included) and songs on the tracklists already loaded, each with what
+is in your library. Nothing is asked of YouTube until you press Enter (or the
+button): then one YouTube Music search adds artists, songs and albums, with
+*More* for each. Searches are remembered for a week. A song queues through its
+album where it is on one, so it arrives with album audio and tags.
 
 ### Browsing an artist
 
-The **Artists** tab shows everything an artist has on YouTube Music. Search by
-name, or paste a channel URL, an `@handle` or an album link.
+Open an artist from the rail, a search, a link, or another artist's *Fans also
+like*, and the pane shows everything they have on YouTube Music.
 
 An artist's YouTube Music page is a stack of carousels, each holding at most
 ten releases; the full lists sit behind each carousel's "More" link, and the
@@ -176,24 +197,37 @@ taking on an album, and editions a bigger selected edition contains. Tick any
 of those yourself and it downloads whole.
 
 Tracklists load in the background a few seconds apart; expanding a release
-loads it immediately. Everything is cached — a discography for 12 hours, a
-tracklist for 30 days — so reopening an artist costs no requests.
+loads it immediately. Nothing is fetched twice for no reason: a discography is
+shown from cache however old it is — Discover's scan keeps its artists' copies
+fresh, and anyone else's is re-read quietly behind it once it is a week old
+(*Refresh* re-reads it now) — and a tracklist is kept for good. Opening one of
+your artists costs no requests at all.
 
-### Discover
+Releases that just appeared are listed first. *Not interested* (✕) hides a
+release from Discover — undo it from the message, or with *Show N not
+interested* and the ↶ on the release. A recommended artist says who
+recommended them, with *Not interested in this artist*.
+
+### What Discover watches
 
 **New releases.** A background scan matches each artist folder in your library
 to its YouTube Music artist (by exact name; of several artists sharing a name,
-the one with the biggest audience), then reads their artist page, which lists
-the newest releases first. It is slow on purpose — one request every 12
-seconds, about 300 an hour, biggest artists first — so a first pass over a
-library of a thousand-odd artists takes several hours, with results appearing
-as it goes. After that, artists are re-checked every two days (ten or more of
-their tracks in the library) or weekly.
+the one with the biggest audience), then reads their whole discography — the
+artist page and the full lists behind its "More" links — into the same cache
+the artist view uses. It is slow on purpose — one request every 12 seconds,
+about 300 an hour, biggest artists first; an artist with "More" lists takes
+two or three — so a first pass over a library of a thousand-odd artists takes
+the best part of a day, with results appearing as it goes. After that, artists
+are re-checked every two days (ten or more of their tracks in the library) or
+weekly. Releases met for the first time that the artist page itself doesn't
+show are back catalogue, not new.
 
 YouTube Music gives a release's year, not its date, so the list shows this year
-and last, and — once an artist has been checked before — *Just appeared* for
-anything new since. Albums you already have are hidden; clean and explicit
-editions show once; *Not interested* hides a release for good.
+and last (or up to every year), and — once an artist has been checked before —
+*Just appeared* for anything new since. It is filtered and paged on the server,
+so a page of singles is a full page of singles. Albums you already have — or
+downloaded here — are hidden behind *Show N already downloaded*; clean and
+explicit editions show once; *Not interested* hides a release for good.
 
 **Artists you might like.** Every artist page lists related artists. Counted
 across your library, weighted by how much of each artist you own, the ones you
@@ -219,8 +253,12 @@ Everything about the library is on one page:
   Click an album to see its tracks.
 - **Needs attention** on the right — every open issue, grouped by kind, for
   the whole library or just this artist. Kinds that can be fixed automatically
-  have an *Apply all*; the rest open as a list to review. Below it, the
-  activity log: every change made, each with *Undo*.
+  have an *Apply all*; *Download missing*, *Merge copies* and *Move to Trash*
+  (never automatic) have one of their own. *Review* opens the kind's list:
+  tick issues (Shift-click for a range, or *Select all … that match* for every
+  page), narrow it with the search box and the kind's filters, and act on them
+  all at once — apply, dismiss, or a call of the kind's own (see below).
+  Below it, the activity log: every change made, each with *Undo*.
 - **The detail pane** at the bottom (drag to resize, like the download pane)
   — for the selected album: a three-way comparison of what the files say,
   what MusicBrainz says and what Plex says; the tracks; match candidates (and
@@ -273,8 +311,49 @@ each album it:
    library — counted across every folder of the release, so a two-disc set in
    `CD1`/`CD2` folders is one album — are listed as *Missing tracks*.
    *Download missing* finds the album on YouTube Music and queues exactly those
-   tracks; they arrive through the normal downloader, and the next check files
-   them in. Downloads are never started automatically.
+   tracks; they arrive through the normal downloader, straight into the
+   album's own folder (whatever YouTube Music calls the album), and the next
+   check tags and numbers them. Downloads are never started automatically.
+   Tracks YouTube Music doesn't have stay listed until you *Accept incomplete*.
+
+The calls only you can make have bulk buttons in *Review*:
+
+- **Check match** — *Accept match*, or *Not on MusicBrainz* (the files keep
+  their own tags and are not asked about again; *Look up again* on the album's
+  Match tab undoes it). Filters split them into *Files settle it* (every file
+  matched a track and the artist is yours), *Someone else's song* (the best
+  match is another artist's song of the same name — usually a single
+  MusicBrainz doesn't have) and *Needs a look*; *Settle them* does the first
+  two in one go.
+- **Move blocked** — another copy of the album is already where it belongs.
+  *Merge copies* makes them one album: tracks the destination lacks move in;
+  where both have a track, the better file stays (lossless over lossy, then
+  bitrate, a cut-off copy last) and the other goes to Trash. Only files
+  identified as a track of the release are ever paired, so a bonus track or
+  a demo with a clashing name stays where it is. A box set's albums stay in
+  the box set, and another album with the same name (a single named like its
+  album, a deluxe beside the standard) gets a folder of its own instead.
+- **Album held more than once** — one album (a CD, a vinyl rip, a remaster, a
+  deluxe edition) in several folders: copies of one MusicBrainz release group
+  that share a recording. *Merge copies* makes it one album in the most
+  complete edition's folder, keeping the best file of each recording; the
+  rest go to Trash. A recording MusicBrainz knows in several versions (an
+  original mono mix, a 2017 stereo mix, live) is never merged, since which
+  version a file is can't be proven, and nor is a pair whose lengths
+  disagree. Box sets keep their own copies.
+- **Damaged file** — files nothing can read (a zeroed download). *Move to
+  Trash* re-reads each one first; then *Download missing* fetches a good copy.
+
+YouTube Music lookups have an hourly budget (`CATALOG_REQUESTS_PER_HOUR`). A
+*Download missing* that finds it spent isn't failed: the download stays
+wanted, and each background check asks again for a few albums, leaving the
+rest of the budget for browsing.
+
+*Not in Plex* that a scan doesn't fix is usually a track Plex keeps after
+deleting its album (a scan finds the file unchanged and skips it). Applying it
+again an hour on hides the file from Plex for one scan, empties Plex's trash
+and shows it again, so Plex adds it afresh (its play history goes with the old
+item) — at most once a week per folder.
 
 The first full run is **report-only**. Review it, then turn on
 **auto-apply**: confident fixes are then applied as they are found, and the

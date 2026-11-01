@@ -12,10 +12,12 @@ cheap:
 - One shared YTMusic client. A new client fetches the music.youtube.com
   homepage for a visitor id before its first real request, so constructing
   one per call doubled the traffic.
-- Everything is cached in `catalog_cache`. A discography is reused for hours
-  and a tracklist for weeks, so reopening an artist costs nothing — and the
-  worker expands an album the browser has already shown without asking
-  YouTube again.
+- Everything is cached in `catalog_cache`, and nothing is fetched twice for
+  no reason. A discography is shown from cache however old it is; Discover's
+  background scan keeps its artists' copies fresh, and any other artist's is
+  re-read quietly once it is a week old. Tracklists are kept for good, so
+  reopening an artist costs nothing — and the worker expands an album the
+  browser has already shown without asking YouTube again.
 - Requests go through `Pacer`: short gaps when someone is waiting on the
   answer, long ones for background tracklist prefetch, and an hourly budget
   over both. It honours the download governor's backoff in both directions —
@@ -39,7 +41,7 @@ from .engine.governor import governor
 from .engine.matcher import normalize
 from .events import bus
 from . import ownership
-from .library import strict_key
+from .library import fold, strict_key
 from .ownership import LIVE_RE as _LIVE_RE
 from .models import ErrorClass
 
@@ -48,11 +50,17 @@ log = logging.getLogger("mdl.catalog")
 INTERACTIVE = "interactive"   # someone is waiting on the answer
 BACKGROUND = "background"     # prefetch and the worker: nobody is
 
-ARTIST_TTL = 12 * 3600          # new releases show up within a day
-PARTIAL_TTL = 3600              # ...but retry an incomplete list sooner
-ALBUM_TTL = 30 * 86400          # tracklists essentially never change
+FOREVER = 100 * 365 * 86400
+# A cached discography is always shown; past this age it is also re-read in
+# the background. Discover's scan re-reads its artists every 2-7 days anyway.
+ARTIST_STALE = 7 * 86400
+ARTIST_FRESH = 12 * 3600        # what the worker accepts for a whole-artist job
+PARTIAL_TTL = 3600              # an incomplete list is re-read sooner
+ALBUM_TTL = FOREVER             # tracklists essentially never change
 RESOLVE_TTL = 30 * 86400        # @handle -> channel id
-SEARCH_TTL = 86400
+SEARCH_TTL = 7 * 86400
+# Searches, charts and the like are dropped after this; discographies and
+# tracklists are kept.
 CACHE_RETENTION = 60 * 86400
 # The worker downloads from these ids, so it wants a fresher copy than the
 # browser does. Videos do get pulled; a week-old tracklist is close enough.
@@ -110,6 +118,7 @@ class Pacer:
         self._interactive_waiting = 0
         self._gap = {INTERACTIVE: 0.0, BACKGROUND: 0.0}
         self.waiting: str | None = None   # why background work is parked
+        self.count = 0                    # requests made, ever: callers diff it
 
     def _prune(self, now: float) -> None:
         while self._recent and self._recent[0] < now - 3600:
@@ -162,6 +171,7 @@ class Pacer:
                 # slot here cannot race another waiter.
                 self._active += 1
                 self._recent.append(now)
+                self.count += 1
                 if not interactive:
                     self.waiting = None
                 return
@@ -300,8 +310,10 @@ async def _cache_put(key: str, data: dict) -> None:
 
 
 async def prune_cache() -> None:
-    await db.execute("DELETE FROM catalog_cache WHERE fetched_at < ?",
-                     (time.time() - CACHE_RETENTION,))
+    await db.execute(
+        "DELETE FROM catalog_cache WHERE fetched_at < ? "
+        "AND key NOT LIKE 'artist:%' AND key NOT LIKE 'album:%'",
+        (time.time() - CACHE_RETENTION,))
 
 
 # ------------------------------------------------------------------ parsing
@@ -651,19 +663,133 @@ async def album(browse_id: str, *, priority: str = INTERACTIVE,
     raw = await call("get_album", browse_id, priority=priority)
     view = album_from_raw(raw, browse_id)
     await _cache_put(key, view)
+    await index_tracks([view])
     _failed.pop(browse_id, None)
     return view
 
 
+# ------------------------------------------------------------------ track index
+async def index_tracks(albums: list[dict]) -> None:
+    """Make these tracklists' songs searchable by title (catalog_tracks)."""
+    rows = []
+    for a in albums:
+        artist = ", ".join(a.get("artists") or [])
+        for i, t in enumerate(a.get("tracks") or []):
+            if not t.get("video_id"):
+                continue
+            credit = ", ".join(t.get("artists") or []) or artist
+            rows.append((a["browse_id"], i, t["video_id"], t.get("title") or "", credit,
+                         t.get("duration_sec"), a.get("title"), artist,
+                         (a.get("artist_ids") or [None])[0], a.get("year"),
+                         a.get("thumbnail"), fold(f"{t.get('title') or ''} {credit}")))
+    for i in range(0, len(albums), 500):
+        chunk = [a["browse_id"] for a in albums[i:i + 500]]
+        await db.execute(f"DELETE FROM catalog_tracks WHERE browse_id IN "
+                         f"({','.join('?' * len(chunk))})", tuple(chunk))
+    await db.executemany(
+        "INSERT OR REPLACE INTO catalog_tracks (browse_id, position, video_id, title, "
+        "artists, duration_sec, album, album_artist, channel_id, year, thumbnail, search) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+
+
+async def index_cached_tracks() -> int:
+    """Index tracklists cached before catalog_tracks existed. Returns how many."""
+    rows = await db.fetchall(
+        "SELECT data FROM catalog_cache WHERE key LIKE 'album:%' AND substr(key, 7) "
+        "NOT IN (SELECT DISTINCT browse_id FROM catalog_tracks)")
+    albums = [json.loads(r["data"]) for r in rows]
+    for i in range(0, len(albums), 200):
+        await index_tracks(albums[i:i + 200])
+    return len(albums)
+
+
+# ------------------------------------------------------------------ YouTube search
+SEARCH_KINDS = ("all", "artists", "songs", "albums")
+_TYPE_LABELS = {"song", "video", "album", "single", "ep", "episode", "podcast", "playlist",
+                "artist"}
+
+
+def search_item(r: dict) -> tuple[str | None, dict | None]:
+    """One ytmusicapi search result as (group, row) — artists, songs or
+    albums; anything else (videos, playlists, podcasts) is (None, None)."""
+    kind = r.get("resultType")
+    # ytmusicapi (1.12) reads the first rows of an unfiltered search one run
+    # early, crediting the row's type label ("Song") as its artist.
+    credited = [a for a in r.get("artists") or [] if a.get("name")
+                and not (a.get("id") is None and a["name"].lower() in _TYPE_LABELS)]
+    names = ", ".join(a["name"] for a in credited) or None
+    artist_id = next((a["id"] for a in credited if (a.get("id") or "").startswith("UC")), None)
+    if kind == "artist":
+        channel_id = r.get("browseId") or artist_id
+        name = r.get("artist") or (credited[0]["name"] if credited else None)
+        if (channel_id or "").startswith("UC") and name:
+            subscribers = r.get("subscribers")
+            return "artists", {"channel_id": channel_id, "name": name,
+                               "thumbnail": _thumb(r.get("thumbnails"), 120),
+                               "audience": f"{subscribers} subscribers" if subscribers else None}
+    elif kind == "song" and r.get("videoId"):
+        album = r.get("album") or {}
+        return "songs", {"video_id": r["videoId"], "title": r.get("title") or "",
+                         "artist": names, "artist_id": artist_id,
+                         "album": album.get("name"), "album_id": album.get("id"),
+                         "duration_sec": r.get("duration_seconds"),
+                         "explicit": bool(r.get("isExplicit")),
+                         "thumbnail": _thumb(r.get("thumbnails"), 120)}
+    elif kind == "album" and (r.get("browseId") or "").startswith("MPREb"):
+        kind_of = (r.get("type") or "Album").strip().lower()
+        kind_of = kind_of if kind_of in ("album", "ep", "single") else "album"
+        return "albums", {"browse_id": r["browseId"], "title": r.get("title") or "",
+                          "type": kind_of, "category": classify_release(r.get("title") or "",
+                                                                         kind_of),
+                          "year": str(r.get("year") or "") or None,
+                          "artist": names, "artist_id": artist_id,
+                          "explicit": bool(r.get("isExplicit")),
+                          "thumbnail": _thumb(r.get("thumbnails"), 226)}
+    return None, None
+
+
+async def search_youtube(q: str, kind: str = "all", *,
+                         priority: str = INTERACTIVE) -> dict:
+    """Search YouTube Music: `all` is one request with a few of each kind,
+    the others one request for more of that kind. Cached for SEARCH_TTL."""
+    q = " ".join((q or "").split())
+    if len(q) < 2:
+        raise CatalogError("Type at least two characters", 422, ErrorClass.PERMANENT)
+    if kind not in SEARCH_KINDS:
+        raise CatalogError(f"Search for one of {', '.join(SEARCH_KINDS)}", 422,
+                           ErrorClass.PERMANENT)
+    if kind == "artists":
+        return {"artists": await search_artists(q, priority=priority),
+                "songs": [], "albums": []}
+    key = f"ytsearch:{kind}:{q.casefold()}"
+    cached = await _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    if kind == "all":
+        raw = await call("search", q, priority=priority)
+    else:
+        raw = await call("search", q, filter=kind, limit=20, priority=priority)
+    out: dict[str, list] = {"artists": [], "songs": [], "albums": []}
+    seen = set()
+    for r in raw or []:
+        group, row = search_item(r)
+        ident = row and (row.get("channel_id") or row.get("video_id") or row.get("browse_id"))
+        if group and ident not in seen:
+            seen.add(ident)
+            out[group].append(row)
+    await _cache_put(key, out)
+    return out
+
+
 async def discography(ref: str, *, refresh: bool = False,
-                      priority: str = INTERACTIVE) -> dict:
-    """The artist and every album, single and EP they list — no tracklists."""
+                      priority: str = INTERACTIVE, max_age: float = FOREVER) -> dict:
+    """The artist and every album, single and EP they list — no tracklists.
+    From cache when there is a copy no older than `max_age`."""
     channel_id = await resolve_channel(ref, priority=priority)
     key = f"artist:{channel_id}"
     if not refresh:
-        cached = await _cache_get(key, ARTIST_TTL)
-        if cached and not (cached.get("partial")
-                           and time.time() - cached["fetched_at"] > PARTIAL_TTL):
+        cached = await _cache_get(key, max_age)
+        if cached:
             return cached
 
     try:
@@ -678,9 +804,13 @@ async def discography(ref: str, *, refresh: bool = False,
         raise CatalogError("That channel is not a YouTube Music artist", 404,
                            ErrorClass.PERMANENT)
     releases, seen, partial = [], set(), False
+    # What the artist page itself shows: the newest of each kind. Anything
+    # only the "More" lists hold is back catalogue (see discover._refresh).
+    first_page = []
     for section in SECTIONS:
         block = raw.get(section) or {}
         items = block.get("results") or []
+        first_page += [i["browseId"] for i in items if i.get("browseId")]
         # A carousel with a "More" link is truncated; follow it for the rest.
         if block.get("browseId") and block.get("params"):
             try:
@@ -725,8 +855,9 @@ async def discography(ref: str, *, refresh: bool = False,
             "thumbnail": _thumb(r.get("thumbnails"), 120),
             "subscribers": r.get("subscribers"),
         } for r in ((raw.get("related") or {}).get("results") or [])
-            if (r.get("browseId") or "").startswith("UC")][:12],
+            if (r.get("browseId") or "").startswith("UC")],
         "releases": releases,
+        "first_page": first_page,
         "partial": partial,
         "fetched_at": time.time(),
     }
@@ -805,11 +936,44 @@ def ensure_prefetch(channel_id: str, missing: list[str]) -> dict:
     return _prefetch.snapshot()
 
 
+# ------------------------------------------------------------------ re-reading
+_rereading: set[str] = set()
+
+
+def stale(doc: dict) -> bool:
+    age = time.time() - doc["fetched_at"]
+    return age > ARTIST_STALE or (doc.get("partial") and age > PARTIAL_TTL)
+
+
+async def _reread(channel_id: str) -> None:
+    try:
+        await discography(channel_id, refresh=True, priority=BACKGROUND)
+    except CatalogError as exc:
+        log.info("background re-read of %s failed: %s", channel_id, exc)
+    finally:
+        _rereading.discard(channel_id)
+        # The browser re-reads the view on this, as it does after a prefetch.
+        bus.publish("catalog.progress", {"channel_id": channel_id, "running": False,
+                                         "reread": True})
+
+
+def ensure_reread(channel_id: str) -> None:
+    """Re-read an old discography in the background, once at a time."""
+    if channel_id in _rereading:
+        return
+    _rereading.add(channel_id)
+    asyncio.create_task(_reread(channel_id), name=f"catalog-reread-{channel_id}")
+
+
 # ------------------------------------------------------------------ views
 async def artist_view(ref: str, *, refresh: bool = False) -> dict:
     """Everything the browser draws for one artist, from cache where possible:
-    releases with whatever tracklists are loaded, library state, overlaps."""
+    releases with whatever tracklists are loaded, library state, overlaps.
+    An old copy is shown straight away and re-read behind it."""
     doc = await discography(ref, refresh=refresh)
+    rereading = not refresh and stale(doc)
+    if rereading:
+        ensure_reread(doc["channel_id"])
     if refresh:
         for r in doc["releases"]:
             _failed.pop(r["browse_id"], None)
@@ -840,6 +1004,7 @@ async def artist_view(ref: str, *, refresh: bool = False) -> dict:
         "releases": releases,
         "partial": doc.get("partial", False),
         "fetched_at": doc["fetched_at"],
+        "rereading": rereading,
         "prefetch": ensure_prefetch(doc["channel_id"], missing),
         "pacer": pacer.snapshot(),
     }

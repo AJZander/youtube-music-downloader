@@ -1,7 +1,8 @@
 /** Picking releases — whole, or track by track — and queueing them. Shared
  *  by the artist browser and Discover, which draw the same release rows. */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 
+import { useShiftRange } from '../rangeSelect.js'
 import {
   inWholeRelease, isOwned, ownedFully, ownedLeftOut, selectedTracks,
 } from './shared.js'
@@ -12,30 +13,59 @@ import {
  * works ownership out again at queue time, so a release whose tracklist has
  * not loaded is covered too. An owned track ticked by hand downloads anyway.
  */
-export function useReleaseSelection(releases, force) {
+export function useReleaseSelection(releases, force, order = releases) {
   const [selection, setSelection] = useState({})
+  // the releases as shown, for Shift-click ranges (read at click time, so
+  // the callbacks stay stable for the memoised rows)
+  const shown = useRef(order)
+  shown.current = order
+  const releaseRange = useShiftRange()
+  const trackRange = useShiftRange()
 
-  const toggle = useCallback((r) => setSelection((s) => {
-    const next = { ...s }
-    if (next[r.browse_id]) delete next[r.browse_id]
-    else next[r.browse_id] = 'all'
-    return next
-  }), [])
+  /** Tick or untick a release; with Shift, every release from the last one
+   *  clicked to this one. A range leaves out releases already complete in
+   *  the library (their boxes are off), as select-all does. */
+  const toggle = useCallback((r, event) => {
+    const list = shown.current
+    const ids = releaseRange(list.map((x) => x.browse_id), r.browse_id, event)
+    const complete = new Set(list.filter((x) => !force && ownedFully(x)).map((x) => x.browse_id))
+    setSelection((s) => {
+      const on = !s[r.browse_id]
+      const next = { ...s }
+      for (const id of ids) {
+        if (!on) delete next[id]
+        else if (id === r.browse_id || !complete.has(id)) next[id] = next[id] || 'all'
+      }
+      return next
+    })
+  }, [force, releaseRange])
 
-  const toggleTrack = useCallback((r, videoId) => setSelection((s) => {
-    const whole = r.tracks.filter((t) => inWholeRelease(t, force)).map((t) => t.video_id)
-    const current = new Set(s[r.browse_id] === 'all' ? whole : s[r.browse_id] || [])
-    if (current.has(videoId)) current.delete(videoId)
-    else current.add(videoId)
-    const next = { ...s }
-    const kept = r.tracks.filter((t) => t.available && current.has(t.video_id))
-      .map((t) => t.video_id)
-    if (!kept.length) delete next[r.browse_id]
-    else if (kept.length === whole.length && whole.every((id) => current.has(id))) {
-      next[r.browse_id] = 'all'
-    } else next[r.browse_id] = kept
-    return next
-  }), [force])
+  /** Tick or untick a track; with Shift, every track from the last one
+   *  clicked on this release to this one. Ticking a range leaves out tracks
+   *  already in the library (they are taken one by one, on purpose). */
+  const toggleTrack = useCallback((r, videoId, event) => {
+    const key = (id) => `${r.browse_id}\u0000${id}`
+    const playable = r.tracks.filter((t) => t.available)
+    const inRange = new Set(trackRange(playable.map((t) => key(t.video_id)), key(videoId), event))
+    const range = playable.filter((t) => inRange.has(key(t.video_id)))
+    setSelection((s) => {
+      const whole = r.tracks.filter((t) => inWholeRelease(t, force)).map((t) => t.video_id)
+      const current = new Set(s[r.browse_id] === 'all' ? whole : s[r.browse_id] || [])
+      const on = !current.has(videoId)
+      for (const t of range) {
+        if (!on) current.delete(t.video_id)
+        else if (t.video_id === videoId || force || !isOwned(t)) current.add(t.video_id)
+      }
+      const next = { ...s }
+      const kept = r.tracks.filter((t) => t.available && current.has(t.video_id))
+        .map((t) => t.video_id)
+      if (!kept.length) delete next[r.browse_id]
+      else if (kept.length === whole.length && whole.every((id) => current.has(id))) {
+        next[r.browse_id] = 'all'
+      } else next[r.browse_id] = kept
+      return next
+    })
+  }, [force, trackRange])
 
   const selectMany = useCallback((ids, on) => setSelection((s) => {
     const next = { ...s }

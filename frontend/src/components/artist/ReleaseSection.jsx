@@ -5,7 +5,7 @@ import { ownedFully } from './shared.js'
 
 export default function ReleaseSection({
   section, selection, expanded, fetching, titles, query, force,
-  onToggle, onToggleTrack, onExpand, onSelectMany, onOpenArtist, onDismiss,
+  onToggle, onToggleTrack, onExpand, onSelectMany, onOpenArtist, onDismiss, onRestore,
 }) {
   // Releases already complete in the library are not picked by select-all.
   const ids = section.releases.filter((r) => force || !ownedFully(r)).map((r) => r.browse_id)
@@ -29,7 +29,7 @@ export default function ReleaseSection({
           expanded={!!expanded[r.browse_id]} fetching={!!fetching[r.browse_id]}
           titles={titles} query={query} force={force} onToggle={onToggle}
           onToggleTrack={onToggleTrack} onExpand={onExpand}
-          onOpenArtist={onOpenArtist} onDismiss={onDismiss} />
+          onOpenArtist={onOpenArtist} onDismiss={onDismiss} onRestore={onRestore} />
       ))}
     </Box>
   )

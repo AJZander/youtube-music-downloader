@@ -9,11 +9,13 @@ import CloseIcon from '@mui/icons-material/Close'
 import LibraryMusicOutlinedIcon from '@mui/icons-material/LibraryMusicOutlined'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import OpenInNewIcon from '@mui/icons-material/OpenInNew'
+import UndoIcon from '@mui/icons-material/Undo'
 
 import {
   albumLength, categoryLabel, isOwned, isSingleFamily, ownedFully, selectedTracks,
   trackTime,
 } from './shared.js'
+import { keepTextSelection } from '../rangeSelect.js'
 
 /** Where the owned tracks live — "Paul Kelly/Seventy (10), Paul Kelly/Time (2)". */
 function folderList(library) {
@@ -122,8 +124,8 @@ function Tracklist({ release, entry, force, query, onToggleTrack }) {
             borderRadius: 1, '&:hover': { bgcolor: 'action.hover' },
           }}>
             <Checkbox size="small" sx={{ p: 0.5 }} disabled={!t.available}
-              checked={chosen.has(t.video_id)}
-              onChange={() => onToggleTrack(release, t.video_id)}
+              checked={chosen.has(t.video_id)} onMouseDown={keepTextSelection}
+              onChange={(e) => onToggleTrack(release, t.video_id, e)}
               inputProps={{ 'aria-label': `Select ${t.title}` }} />
             <Typography variant="caption" color="text.secondary"
               sx={{ width: 22, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
@@ -162,7 +164,7 @@ function Tracklist({ release, entry, force, query, onToggleTrack }) {
 
 function ReleaseRow({
   release, entry, expanded, fetching, titles, query, force,
-  onToggle, onToggleTrack, onExpand, onOpenArtist, onDismiss,
+  onToggle, onToggleTrack, onExpand, onOpenArtist, onDismiss, onRestore,
 }) {
   const r = release
   const chosen = selectedTracks(r, entry, force)
@@ -183,10 +185,10 @@ function ReleaseRow({
   ].filter(Boolean).join(' · ')
 
   return (
-    <Paper variant="outlined" sx={{
-      mb: 0.75, overflow: 'hidden',
+    <Paper variant="outlined" data-release={r.browse_id} sx={{
+      mb: 0.75, overflow: 'hidden', scrollMarginTop: 64,
       borderColor: entry ? 'primary.main' : undefined,
-      opacity: complete ? 0.6 : 1,
+      opacity: r.dismissed ? 0.45 : complete ? 0.6 : 1,
     }}>
       <Box onClick={() => onExpand(r)} sx={{
         display: 'flex', alignItems: 'center', gap: 1.25, p: 0.75, pr: 1,
@@ -197,7 +199,8 @@ function ReleaseRow({
           <span onClick={(e) => e.stopPropagation()}>
             <Checkbox checked={!!entry && (!chosen || chosen.length > 0)}
               indeterminate={!!chosen && chosen.length > 0 && chosen.length < playable}
-              disabled={complete && !entry} onChange={() => onToggle(r)}
+              disabled={complete && !entry} onMouseDown={keepTextSelection}
+              onChange={(e) => onToggle(r, e)}
               inputProps={{ 'aria-label': `Select ${r.title}` }} />
           </span>
         </Tooltip>
@@ -262,7 +265,15 @@ function ReleaseRow({
           )}
           <LibraryChip library={r.library} />
         </Box>
-        {onDismiss && (
+        {/* Only what Discover lists can be hidden from it (`known` is false
+            for a release of an artist it does not follow). */}
+        {r.dismissed && onRestore ? (
+          <Tooltip title="You said not interested — bring it back">
+            <IconButton size="small" onClick={(e) => { e.stopPropagation(); onRestore(r) }}>
+              <UndoIcon sx={{ fontSize: 16 }} />
+            </IconButton>
+          </Tooltip>
+        ) : onDismiss && r.known !== false && (
           <Tooltip title="Not interested — hide it">
             <IconButton size="small" onClick={(e) => { e.stopPropagation(); onDismiss(r) }}>
               <CloseIcon sx={{ fontSize: 16 }} />

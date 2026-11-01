@@ -12,7 +12,8 @@ function since(epochSeconds) {
   const minutes = Math.round((Date.now() / 1000 - epochSeconds) / 60)
   if (minutes < 2) return 'just now'
   if (minutes < 90) return `${minutes} min ago`
-  return `${Math.round(minutes / 60)} h ago`
+  const hours = Math.round(minutes / 60)
+  return hours < 36 ? `${hours} h ago` : `${Math.round(hours / 24)} days ago`
 }
 
 /** Why background loading is stalled, in words — "0 of 62" alone looks broken. */
@@ -42,7 +43,37 @@ function PrefetchStatus({ prefetch, pacer }) {
   )
 }
 
-export default function ArtistHeader({ view, loading, onRefresh, onOpenArtist }) {
+/** What Discover makes of this artist: yours, or recommended and why. */
+function DiscoverContext({ context, onDismissArtist }) {
+  if (!context) return null
+  if (context.source === 'library') {
+    return (
+      <Chip size="small" color="primary" variant="outlined"
+        label={`Yours · ${context.tracks.toLocaleString()} track${context.tracks === 1 ? '' : 's'} in your library`} />
+    )
+  }
+  const more = context.because_count - context.because.length
+  return (
+    <>
+      <Tooltip title="Recommended from the &quot;fans also like&quot; lists on your artists' pages">
+        <Chip size="small" color="secondary" variant="outlined"
+          label={context.dismissed ? 'Recommended — you said not interested' : 'Recommended'} />
+      </Tooltip>
+      {context.because.length > 0 && (
+        <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center' }}>
+          Because you have {context.because.join(', ')}{more > 0 ? ` and ${more} more` : ''}
+        </Typography>
+      )}
+      {!context.dismissed && onDismissArtist && (
+        <Button size="small" color="inherit" onClick={onDismissArtist}>
+          Not interested in this artist
+        </Button>
+      )}
+    </>
+  )
+}
+
+export default function ArtistHeader({ view, loading, onRefresh, onOpenArtist, onDismissArtist }) {
   const { artist, releases, prefetch, pacer } = view
   const [more, setMore] = useState(false)
   const complete = releases.filter(ownedFully).length
@@ -71,7 +102,7 @@ export default function ArtistHeader({ view, loading, onRefresh, onOpenArtist })
           <OpenInNewIcon fontSize="small" />
         </IconButton>
       </Tooltip>
-      <Tooltip title={`Re-read the discography from YouTube Music (fetched ${since(view.fetched_at)}; kept for 12 hours)`}>
+      <Tooltip title={`Re-read the discography from YouTube Music (read ${since(view.fetched_at)})`}>
         <span>
           <IconButton size="small" color="inherit" disabled={loading} onClick={onRefresh}>
             <RefreshIcon fontSize="small" />
@@ -102,7 +133,8 @@ export default function ArtistHeader({ view, loading, onRefresh, onOpenArtist })
       )}
 
       <Box sx={{ p: 2, pt: 1.5 }}>
-        <Stack direction="row" sx={{ flexWrap: 'wrap', gap: 0.75 }}>
+        <Stack direction="row" sx={{ flexWrap: 'wrap', gap: 0.75, alignItems: 'center' }}>
+          <DiscoverContext context={view.discover} onDismissArtist={onDismissArtist} />
           {loaded > 0 && (
             <Chip size="small" color="success" variant={complete ? 'filled' : 'outlined'}
               label={`${complete} complete in your library`} />
@@ -138,6 +170,13 @@ export default function ArtistHeader({ view, loading, onRefresh, onOpenArtist })
           </Alert>
         )}
 
+        {view.rereading && (
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 1 }}>
+            Showing the copy read {since(view.fetched_at)} — checking YouTube Music for anything
+            new behind it.
+          </Typography>
+        )}
+
         <PrefetchStatus prefetch={prefetch} pacer={pacer} />
 
         {artist.related?.length > 0 && (
@@ -145,7 +184,7 @@ export default function ArtistHeader({ view, loading, onRefresh, onOpenArtist })
             <Typography variant="caption" color="text.secondary" sx={{ mr: 0.5 }}>
               Fans also like
             </Typography>
-            {artist.related.map((a) => (
+            {artist.related.slice(0, 12).map((a) => (
               <Chip key={a.channel_id} size="small" variant="outlined" label={a.name}
                 avatar={<Avatar src={a.thumbnail} alt=""
                   imgProps={{ referrerPolicy: 'no-referrer', loading: 'lazy' }} />}

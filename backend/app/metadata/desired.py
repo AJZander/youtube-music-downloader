@@ -2,8 +2,9 @@
 where the files should live, and how Plex should describe it.
 
 House rules (the user's):
-  * album artist = the primary artist (MusicBrainz's first credited artist,
-    named as the release credits it); the track artist is the credit as
+  * album artist = the primary artist (MusicBrainz's first credited artist),
+    one name per artist: the one the library's folders already use, else
+    MusicBrainz's ("Eskimo Callboy" is Electric Callboy); the track artist is the credit as
     released ("Drake feat. Rihanna"); a Various Artists release is
     "Various Artists". Typographic punctuation is made plain ("Wu‐Tang"
     with a Unicode hyphen would be a second artist beside "Wu-Tang").
@@ -44,9 +45,13 @@ _REISSUE_WORDS = re.compile(r"remaster|reissue|re-release|anniversary|expanded|l
 # A variant worth its own folder: different content, or a different market's.
 # Pressing notes ("mono, 1st press", "one EMI box", "Ltd.") describe a copy
 # the files can't show they are, so they stay off folder names.
-_VARIANT_WORDS = re.compile(r"deluxe|expanded|edition|version|bonus|special|international|"
+_VARIANT_WORDS = re.compile(r"\b(?:deluxe|expanded|edition|version|bonus|special\b|international|"
                             r"instrumental|acoustic|remix|collector|platinum|uncut|"
-                            r"anniversary", re.I)
+                            r"anniversary)", re.I)
+# What rides along in a disambiguation without naming an edition: formats,
+# content flags, a "with …" aside ("re-release with Ultra catalog number").
+_EDITION_NOISE = re.compile(r"\b\d+\s*bit\b|\b\d+(?:\.\d+)?\s*khz\b|\bexplicit\b|\bclean\b"
+                            r"|\s(?:with|on|from|for|by)\s.*$|\(\w{2}\)", re.I)
 _IGNORED_DISAMBIGUATION = re.compile(r"^\s*(explicit|clean|censored|uncensored|"
                                      r"digital|digital media|cd|vinyl)\s*$", re.I)
 
@@ -78,7 +83,28 @@ def _fold(name: str) -> str:
     return unicodedata.normalize("NFC", plain(name) or "").casefold()
 
 
-_artist_dirs: dict = {"at": 0.0, "by_fold": {}}
+def _words(name: str) -> str:
+    """An artist folder's name as words: "SAM SMITH", "Art vs Science",
+    "Art vs. Science" and "AC_DC" (for AC/DC) are one artist's; a run-together
+    "ARTVSSCIENCE" or "3doorsdown" is not a name to keep."""
+    return " ".join(re.findall(r"[^\W_]+", _fold(name)))
+
+
+_artist_dirs: dict = {"at": 0.0, "by_words": {}}
+
+
+async def _existing_artists() -> dict[str, tuple[str, int]]:
+    """The library's artist folders and how many tracks each holds, by _words()."""
+    if time.monotonic() - _artist_dirs["at"] > 300:
+        by_words: dict[str, tuple[str, int]] = {}
+        for r in await db.fetchall("SELECT artist_dir, COUNT(*) AS n FROM library_index "
+                                   "WHERE artist_dir IS NOT NULL GROUP BY artist_dir"):
+            key = _words(r["artist_dir"])
+            if key not in by_words or r["n"] > by_words[key][1]:
+                by_words[key] = (r["artist_dir"], r["n"])
+        _artist_dirs["by_words"] = by_words
+        _artist_dirs["at"] = time.monotonic()
+    return _artist_dirs["by_words"]
 
 
 async def on_disk(folder: str, other_names: tuple[str, ...] = ()) -> str:
@@ -88,13 +114,9 @@ async def on_disk(folder: str, other_names: tuple[str, ...] = ()) -> str:
     files with "Alanis Morissette" (`other_names`: the artist's listed
     name) when that folder exists."""
     artist, _, album = folder.partition("/")
-    if time.monotonic() - _artist_dirs["at"] > 300:
-        rows = await db.fetchall("SELECT DISTINCT artist_dir FROM library_index "
-                                 "WHERE artist_dir IS NOT NULL")
-        _artist_dirs["by_fold"] = {_fold(r["artist_dir"]): r["artist_dir"] for r in rows}
-        _artist_dirs["at"] = time.monotonic()
-    existing = (_artist_dirs["by_fold"].get(_fold(name)) for name in (artist, *other_names))
-    artist = next((name for name in existing if name), artist)
+    known = await _existing_artists()
+    existing = (known.get(_words(name)) for name in (artist, *other_names))
+    artist = next((hit[0] for hit in existing if hit), artist)
     for r in await db.fetchall("SELECT DISTINCT dirpath FROM library_index WHERE artist_dir = ?",
                                (artist,)):
         parts = r["dirpath"].split("/")
@@ -117,6 +139,18 @@ def _title_case(text: str) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in text.split())
 
 
+def _edition_words(dis: str) -> str:
+    """The parts of a disambiguation that name an edition: "20th anniversary
+    reissue, translucent yellow" is the 20th anniversary reissue; matrix
+    numbers, colours and stores are pressing notes."""
+    keep = []
+    for part in re.split(r"[,;/]|\s+-\s+|\.\s", dis):
+        part = re.sub(r"\s+", " ", _EDITION_NOISE.sub(" ", part)).strip(" .-_:;")
+        if part and (_REISSUE_WORDS.search(part) or _VARIANT_WORDS.search(part)):
+            keep.append(part)
+    return ", ".join(keep)
+
+
 def edition_of(rel: dict, original_year: str | None) -> tuple[str | None, str | None]:
     """(edition for the [brackets], qualifier for (parentheses) after the
     album name). A reissue gets an edition so it is told apart from the
@@ -131,11 +165,12 @@ def edition_of(rel: dict, original_year: str | None) -> tuple[str | None, str | 
                    and int(year) > int(original_year))
     if dis and _IGNORED_DISAMBIGUATION.match(dis):
         dis = ""
+    dis = _edition_words(dis) if dis else ""
     qualifier = _title_case(dis) if dis and _VARIANT_WORDS.search(dis) else None
     if reissue:
         if dis and _REISSUE_WORDS.search(dis):
             label = _title_case(dis)
-            if year not in label:
+            if not re.search(r"\b(?:19|20)\d\d\b", label):    # "2001 Remaster" says when
                 label = f"{year} {label}"
             return label, None
         return f"{year} Reissue", qualifier
@@ -152,17 +187,43 @@ def album_artist_of(rel: dict) -> dict:
                 "sort": "Various Artists", "various": True,
                 "credit": mb.credit_string(credits) or "Various Artists"}
     first = credits[0].get("artist") or {}
-    # As the release credits it: Kanye West's albums say "Kanye West", though
-    # the artist is listed as "Ye" now. A mere spelling of the listed name
-    # ("Art vs Science" for "Art vs. Science") is written as listed: one
-    # artist, one name, one folder. The sort name belongs to the listed name.
+    # MusicBrainz's name for the artist, not the release's credit: "Eskimo
+    # Callboy" and "Madilyn" are Electric Callboy and Madilyn Bailey, one
+    # artist in Plex. library_name() then prefers the name the library uses.
     listed = plain(first.get("name")) or ""
     credited = plain(credits[0].get("name")) or listed
-    name = listed if listed and strict_key(listed) == strict_key(credited) else credited
-    sort = first.get("sort-name") if name == listed else None
-    return {"name": name, "mbid": first.get("id"), "sort": plain(sort or name),
-            "listed": listed or name,
+    return {"name": listed or credited, "mbid": first.get("id"),
+            "sort": plain(first.get("sort-name") or listed or credited),
+            "listed": listed or credited, "credited": credited,
             "various": False, "credit": plain(mb.credit_string(credits))}
+
+
+async def library_name(aa: dict) -> dict:
+    """One name per artist, the one the library already files them under:
+    of MusicBrainz's name, the release's credit and the artist's other names,
+    the one whose artist folder holds the most ("Kanye West", 900 tracks,
+    over a "Ye" folder of seven, though MusicBrainz lists him as Ye now);
+    otherwise MusicBrainz's name."""
+    if aa["various"]:
+        return aa
+    known = await _existing_artists()
+    if not known:
+        return aa
+    names = [(aa["listed"], aa["sort"]), (aa.get("credited"), None)]
+    if aa.get("mbid"):
+        try:
+            aliases = await mb.artist_aliases(aa["mbid"])
+        except mb.MusicBrainzError:
+            aliases = []
+        names += [(plain(a["name"]), plain(a.get("sort-name"))) for a in aliases]
+    best = None
+    for name, sort in names:
+        hit = known.get(_words(sanitize_component(name))) if name else None
+        if hit and (best is None or hit[1] > best[2]):
+            best = (name, sort, hit[1])
+    if best is None:
+        return aa
+    return {**aa, "name": best[0], "sort": best[1] or best[0]}
 
 
 async def artist_profile(mbid: str | None, name: str, plex_artist: dict | None = None) -> dict:
@@ -204,7 +265,7 @@ async def build_album(rows: list[dict], res: Resolution, *, plex_album: dict | N
             rg = await mb.release_group(rg_id)
         except mb.MusicBrainzError:
             rg = None
-    aa = album_artist_of(rel)
+    aa = await library_name(album_artist_of(rel))
     album_title = plain(rel.get("title") or "")
     original_date = ((rg or {}).get("first-release-date")
                      or (rel.get("release-group") or {}).get("first-release-date")
@@ -278,7 +339,10 @@ async def build_album(rows: list[dict], res: Resolution, *, plex_album: dict | N
     album_tags = {
         "album": [album_title], "albumartist": [aa["name"]],
         "albumartistsort": [aa["sort"]] if aa.get("sort") else [],
-        "date": [rel.get("date")] if rel.get("date") else [],
+        # a release without a date keeps the first release's: players show
+        # the date tag's year, and the index reads the year from
+        # originaldate when a file has no date, so "no date" never sticks
+        "date": [rel.get("date") or original_date] if rel.get("date") or original_date else [],
         "originaldate": [original_date] if original_date else [],
         "genre": genres, "label": [label] if label else [],
         "releasetype": types, "compilation": ["1"] if compilation else [],

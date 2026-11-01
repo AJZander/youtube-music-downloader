@@ -404,6 +404,59 @@ MIGRATIONS: list[str] = [
       fetched_at REAL NOT NULL
     );
     """,
+    # v10 — Discover holds whole discographies, tens of thousands of releases,
+    # so its list is filtered, counted and paged in SQL. These columns are
+    # worked out in Python when a release is stored (discover._derive):
+    # category (album/ep/single/live/...), the keys that group a clean and an
+    # explicit edition into one row (rep marks the one shown), the artist key
+    # ownership is looked up by, folded search text, and whether the library
+    # has it or it was downloaded here.
+    #
+    # catalog_tracks indexes the tracks of every tracklist in catalog_cache,
+    # so a song can be searched for by title.
+    """
+    ALTER TABLE discover_releases ADD COLUMN category TEXT;
+    ALTER TABLE discover_releases ADD COLUMN title_key TEXT;
+    ALTER TABLE discover_releases ADD COLUMN artist_key TEXT;
+    ALTER TABLE discover_releases ADD COLUMN search TEXT;
+    ALTER TABLE discover_releases ADD COLUMN rep INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE discover_releases ADD COLUMN owned INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE discover_releases ADD COLUMN downloaded INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX idx_discover_releases_feed
+      ON discover_releases(rep, dismissed, year, category, owned, downloaded, channel_id);
+    CREATE INDEX idx_discover_releases_artist_key ON discover_releases(artist_key);
+    CREATE INDEX idx_discover_releases_group
+      ON discover_releases(channel_id, title_key, type);
+    CREATE INDEX idx_jobs_source_url ON jobs(source_url);
+    -- Every artist due now: the scan reads each whole discography once,
+    -- biggest artists first, instead of as their weekly checks come round.
+    UPDATE discover_artists SET next_check = 0;
+
+    CREATE TABLE catalog_tracks (
+      browse_id TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      video_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artists TEXT,
+      duration_sec REAL,
+      album TEXT,
+      album_artist TEXT,
+      channel_id TEXT,
+      year TEXT,
+      thumbnail TEXT,
+      search TEXT NOT NULL,
+      PRIMARY KEY (browse_id, position)
+    );
+    """,
+    # v11 — clearing Needs attention. no_release: the user says MusicBrainz
+    # has no release for this album (a YouTube single), so it is not looked
+    # up again and keeps its own tags. target_dir: the album folder a job's
+    # tracks belong in ("Download missing" fills a gap in an album that is
+    # already there, whatever YouTube Music calls it).
+    """
+    ALTER TABLE md_albums ADD COLUMN no_release INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN target_dir TEXT;
+    """,
 ]
 
 

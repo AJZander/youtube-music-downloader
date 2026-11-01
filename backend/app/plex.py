@@ -22,6 +22,7 @@ import asyncio
 import logging
 import time
 import unicodedata
+from urllib.parse import quote
 
 import httpx
 
@@ -211,6 +212,20 @@ class PlexClient:
         items = data.get("Metadata") or []
         return items[0] if items else None
 
+    async def metadata_many(self, rating_keys: list[str]) -> list[dict]:
+        """Several items' own pages in one request; items that are gone are
+        left out. (List views carry at most two genres an item; pages carry
+        them all.)"""
+        if not rating_keys:
+            return []
+        try:
+            data = await self.get(f"/library/metadata/{','.join(rating_keys)}", includeGuids=1)
+        except PlexError as exc:
+            if "404" in str(exc):
+                return []
+            raise
+        return data.get("Metadata") or []
+
     async def children(self, rating_key: str) -> list[dict]:
         data = await self.get(f"/library/metadata/{rating_key}/children", includeGuids=1)
         return data.get("Metadata") or []
@@ -263,9 +278,15 @@ class PlexClient:
                 return True
         return False
 
-    async def wait_for_scan(self, timeout: float = 180, settle: float = 4.0) -> bool:
-        """Wait until Plex has finished scanning (True) or give up (False)."""
+    async def wait_for_scan(self, timeout: float = 180, settle: float = 4.0,
+                            start: float = 30.0) -> bool:
+        """Wait until Plex has finished scanning (True) or give up (False).
+        A scan just asked for can take a while to show up in Plex's
+        activities: up to `start` seconds are allowed for it to begin."""
         await asyncio.sleep(settle)
+        begin_by = time.monotonic() + start
+        while time.monotonic() < begin_by and not await self.scanning():
+            await asyncio.sleep(2)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not await self.scanning():
@@ -321,7 +342,9 @@ class PlexClient:
         wanted = {v.casefold() for v in values}
         stale = [v for v in (current or []) if v.casefold() not in wanted]
         if stale:
-            pairs.append((f"{tag}[].tag.tag-", ",".join(stale)))
+            # Plex splits the removals on commas and unquotes each, so a
+            # value with a comma in it ("Pop, Rock") goes quoted
+            pairs.append((f"{tag}[].tag.tag-", ",".join(quote(v, safe="") for v in stale)))
         pairs.append((f"{tag}.locked", "1" if lock else "0"))
         return pairs
 

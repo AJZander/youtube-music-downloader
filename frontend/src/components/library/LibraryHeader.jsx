@@ -70,7 +70,9 @@ function Progress({ scan, meta, onPause, onResume, onCancel }) {
           {run?.total ? ` · ${run.done.toLocaleString()} of ${run.total.toLocaleString()}` : ''}
           {run?.eta_sec != null && !meta.paused ? ` · ${eta(run.eta_sec)} left` : ''}
           {meta.current ? ` · ${meta.current}` : ''}
-          {meta.applying && meta.phase !== 'applying' ? ` · applying fixes to ${meta.applying}` : ''}
+          {meta.apply_note
+            ? ` · ${meta.apply_note}`
+            : meta.applying && meta.phase !== 'applying' ? ` · applying fixes to ${meta.applying}` : ''}
           {meta.apply_queue ? ` · ${meta.apply_queue} fixes queued` : ''}
           {tally ? ` · ${tally}` : ''}
         </Typography>

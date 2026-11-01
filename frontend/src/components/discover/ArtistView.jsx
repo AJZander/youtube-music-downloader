@@ -5,38 +5,42 @@ import {
 } from '@mui/material'
 import FilterListIcon from '@mui/icons-material/FilterList'
 
-import { api, subscribeEvents } from '../api.js'
-import ArtistHeader from './artist/ArtistHeader.jsx'
-import ArtistSearch from './artist/ArtistSearch.jsx'
-import ReleaseSection from './artist/ReleaseSection.jsx'
-import SelectionBar from './artist/SelectionBar.jsx'
-import { describeQueue, useReleaseSelection } from './artist/selection.js'
-import {
-  CATEGORIES, loadRecent, ownedFully, pickNew, saveRecent, sortReleases,
-} from './artist/shared.js'
+import { api, subscribeEvents } from '../../api.js'
+import ArtistHeader from '../artist/ArtistHeader.jsx'
+import ReleaseSection from '../artist/ReleaseSection.jsx'
+import SelectionBar from '../artist/SelectionBar.jsx'
+import { describeQueue, useReleaseSelection } from '../artist/selection.js'
+import { CATEGORIES, ownedFully, pickNew, sortReleases } from '../artist/shared.js'
+import { useNotInterested } from './useNotInterested.jsx'
 
 /**
- * Browse an artist's whole YouTube Music discography and choose what to
- * download — whole releases, or single tracks out of one.
+ * One artist's whole YouTube Music discography, to choose what to download —
+ * whole releases, or single tracks out of one. With Discover's side of it:
+ * what just appeared, what you said you are not interested in, and whether
+ * the artist is yours or recommended.
  *
- * The release list arrives at once; tracklists fill in behind it as the
- * server prefetches them (paced, and announced over SSE). Expanding a release
- * the prefetch has not reached yet loads it straight away.
+ * The release list comes from cache when it can (Discover's scan keeps its
+ * artists' copies fresh); tracklists fill in behind it as the server
+ * prefetches them, announced over SSE. Expanding a release the prefetch has
+ * not reached yet loads it straight away.
  *
- * The selection (see useReleaseSelection) survives filters and refreshes,
- * and is cleared only by opening another artist.
+ * The selection survives filters and refreshes, and is cleared by opening
+ * another artist.
  */
-export default function ArtistBrowser({ request, onQueued, stats, bottomOffset = 0 }) {
+export default function ArtistView({
+  artistRef, release, onOpenArtist, onLoaded, onArtistChanged, onQueued, stats,
+  bottomOffset = 0,
+}) {
   const [view, setView] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [notice, setNotice] = useState(null)
-  const [recent, setRecent] = useState(loadRecent)
 
   const [expanded, setExpanded] = useState({})
   const [fetching, setFetching] = useState({})
   const [hidden, setHidden] = useState({})
   const [hideOwned, setHideOwned] = useState(false)
+  const [showDismissed, setShowDismissed] = useState(false)
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState('newest')
   const [force, setForce] = useState(false)
@@ -47,30 +51,16 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
   const channelRef = useRef(null)
   const requestSeq = useRef(0)
   const refreshTimer = useRef(null)
+  const root = useRef(null)
   // Read by `expand`, which stays stable so memoized rows are not all redrawn.
   const expandedRef = useRef(expanded)
   const fetchingRef = useRef(fetching)
   expandedRef.current = expanded
   fetchingRef.current = fetching
-
-  const remember = useCallback((artist) => {
-    setRecent((prev) => {
-      const next = [
-        { ref: artist.channel_id, name: artist.name, thumbnail: artist.thumbnail },
-        ...prev.filter((a) => a.ref !== artist.channel_id),
-      ].slice(0, 10)
-      saveRecent(next)
-      return next
-    })
-  }, [])
-
-  const forget = useCallback((ref) => {
-    setRecent((prev) => {
-      const next = prev.filter((a) => a.ref !== ref)
-      saveRecent(next)
-      return next
-    })
-  }, [])
+  // Read when an artist loads; a new callback from the parent must not
+  // re-open the artist.
+  const onLoadedRef = useRef(onLoaded)
+  onLoadedRef.current = onLoaded
 
   /** Re-read the view from the server's cache; out-of-order answers lose. */
   const reload = useCallback(async ({ refresh = false, quiet = true } = {}) => {
@@ -97,19 +87,16 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
       if (seq !== requestSeq.current) return
       channelRef.current = v.artist.channel_id
       setView(v)
-      setSelection({}); setExpanded({}); setQuery(''); setHidden({})
-      remember(v.artist)
+      setSelection({}); setExpanded({}); setQuery(''); setHidden({}); setShowDismissed(false)
+      onLoadedRef.current?.(v.artist)
     } catch (e) {
-      if (seq === requestSeq.current) setError(e.message)
+      if (seq === requestSeq.current) { setError(e.message); setView(null) }
     } finally {
       if (seq === requestSeq.current) setLoading(false)
     }
-  }, [remember])
+  }, [])
 
-  // A link pasted into the main bar arrives here.
-  useEffect(() => {
-    if (request?.ref) open(request.ref)
-  }, [request, open])
+  useEffect(() => { if (artistRef) open(artistRef) }, [artistRef, open])
 
   useEffect(() => subscribeEvents({
     'catalog.progress': (p) => {
@@ -119,9 +106,10 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
       refreshTimer.current = setTimeout(() => reload(), p.running ? 1500 : 0)
     },
   }), [reload])
+  useEffect(() => () => clearTimeout(refreshTimer.current), [])
 
   // SSE can drop (proxies, sleep); a slow poll keeps a long prefetch honest.
-  const prefetching = !!view?.prefetch?.running
+  const prefetching = !!view?.prefetch?.running || !!view?.rereading
   useEffect(() => {
     if (!prefetching) return undefined
     const id = setInterval(() => reload(), 20000)
@@ -149,37 +137,126 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
     }
   }, [reload])
 
+  // Opened at one release (an album link, a search result): expand it and
+  // bring it into view — once per artist and release.
+  const focused = useRef(null)
+  useEffect(() => {
+    if (!view || !release) return
+    const key = `${view.artist.channel_id}/${release}`
+    if (focused.current === key) return
+    focused.current = key
+    const r = view.releases.find((x) => x.browse_id === release)
+    if (!r) {
+      setNotice(`That release is not in ${view.artist.name}'s discography on YouTube Music `
+        + '— queue it from the search results instead.')
+      return
+    }
+    if (r.dismissed) setShowDismissed(true)
+    if (!expandedRef.current[release]) expand(r)
+    // This view's row: the feed, kept mounted behind it, may list it too.
+    // Once now, and once more after the tracklist has opened under it.
+    const bring = () => root.current?.querySelector(`[data-release="${CSS.escape(release)}"]`)
+      ?.scrollIntoView({ block: 'start' })
+    setTimeout(bring, 150)
+    setTimeout(bring, 900)
+  }, [view, release, expand])
+
   // ---------------------------------------------------------------- derived
   const releases = useMemo(() => view?.releases || [], [view])
   const titles = useMemo(
     () => Object.fromEntries(releases.map((r) => [r.browse_id, r.title])), [releases])
   const counts = useMemo(() => {
     const c = {}
-    for (const r of releases) c[r.category] = (c[r.category] || 0) + 1
+    for (const r of releases) if (!r.dismissed) c[r.category] = (c[r.category] || 0) + 1
     return c
   }, [releases])
+  const dismissedCount = useMemo(() => releases.filter((r) => r.dismissed).length, [releases])
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase()
-    return releases.filter((r) => !hidden[r.category]
+    return releases.filter((r) => (showDismissed || !r.dismissed)
+      && !hidden[r.category]
       && !(hideOwned && ownedFully(r))
       && (!needle || r.title.toLowerCase().includes(needle)
         || (r.tracks || []).some((t) => t.title.toLowerCase().includes(needle))))
-  }, [releases, hidden, hideOwned, query])
+  }, [releases, hidden, hideOwned, showDismissed, query])
 
-  const sections = useMemo(() => CATEGORIES
-    .map((c) => ({ ...c, releases: sortReleases(visible.filter((r) => r.category === c.key), sort) }))
-    .filter((s) => s.releases.length), [visible, sort])
+  // What just appeared first, then by kind.
+  const sections = useMemo(() => {
+    const fresh = visible.filter((r) => r.is_new && !r.dismissed)
+    const rest = visible.filter((r) => !fresh.includes(r))
+    return [
+      { key: 'new', label: 'Just appeared', releases: sortReleases(fresh, sort) },
+      ...CATEGORIES.map((c) => ({
+        ...c, releases: sortReleases(rest.filter((r) => r.category === c.key), sort),
+      })),
+    ].filter((s) => s.releases.length)
+  }, [visible, sort])
 
+  const shownInOrder = useMemo(() => sections.flatMap((x) => x.releases), [sections])
   const {
     selection, setSelection, toggle, toggleTrack, selectMany, queueable, summary, picks,
     clearSettled,
-  } = useReleaseSelection(releases, force)
+  } = useReleaseSelection(releases, force, shownInOrder)
+
+  // ---------------------------------------------------------------- not interested
+  const { hide, restore, snackbar } = useNotInterested({
+    onChange: () => reload(), onError: setError,
+  })
+  const markDismissed = useCallback((ids, dismissed) => {
+    const set = new Set(ids)
+    setView((v) => v && ({
+      ...v, releases: v.releases.map((x) => (set.has(x.browse_id) ? { ...x, dismissed } : x)),
+    }))
+    if (dismissed) {
+      setSelection((s) => Object.fromEntries(Object.entries(s).filter(([id]) => !set.has(id))))
+    }
+  }, [setSelection])
+  const dismiss = useCallback(async (r) => {
+    try {
+      await hide([r.browse_id], `“${r.title}” hidden`)
+      markDismissed([r.browse_id], true)
+    } catch (e) {
+      setError(e.message)
+    }
+  }, [hide, markDismissed])
+  const bringBack = useCallback(async (r) => {
+    markDismissed([r.browse_id], false)
+    await restore([r.browse_id])
+  }, [restore, markDismissed])
+
+  const selectedIds = Object.keys(selection)
+  const known = new Set(releases.filter((r) => r.known).map((r) => r.browse_id))
+  const dismissable = selectedIds.filter((id) => known.has(id))
+  const dismissSelected = async () => {
+    setBusy(true); setError(null)
+    try {
+      await hide(dismissable,
+        `${dismissable.length} release${dismissable.length === 1 ? '' : 's'} hidden`)
+      markDismissed(dismissable, true)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const dismissArtist = async () => {
+    try {
+      await api.discoverDismissArtist(view.discover.channel_id, view.artist.name)
+      setNotice(`${view.artist.name} won't be recommended again.`)
+      onArtistChanged?.()
+      reload()
+    } catch (e) {
+      setError(e.message)
+    }
+  }
 
   // ---------------------------------------------------------------- queueing
   const queue = async () => {
-    // In the order shown — albums first — then any picks a filter hides.
-    const shown = sections.flatMap((x) => x.releases)
+    // In the order shown — what just appeared, then albums — then any picks
+    // a filter hides.
+    const shown = shownInOrder
     const rest = releases.filter((r) => !shown.includes(r))
     setBusy(true); setError(null); setNotice(null)
     try {
@@ -197,12 +274,8 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
     }
   }
 
-  const selectedIds = Object.keys(selection)
-
   return (
-    <Box>
-      <ArtistSearch onOpen={open} busy={loading} recent={recent} onForget={forget} />
-
+    <Box ref={root} data-view="artist">
       {error && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>{error}</Alert>}
       {notice && <Alert severity="success" sx={{ mb: 2 }} onClose={() => setNotice(null)}>{notice}</Alert>}
 
@@ -215,20 +288,12 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
         </Paper>
       )}
 
-      {!view && !loading && (
-        <Paper variant="outlined" sx={{ p: 3, textAlign: 'center', borderStyle: 'dashed' }}>
-          <Typography variant="body2" color="text.secondary">
-            Find an artist to see every album, EP and single they have on YouTube Music,
-            with tracklists and what is already in your library — then pick what to download.
-          </Typography>
-        </Paper>
-      )}
-
       {view && (
         <>
           <ArtistHeader view={view} loading={loading}
             onRefresh={() => reload({ refresh: true, quiet: false })}
-            onOpenArtist={open} />
+            onOpenArtist={onOpenArtist}
+            onDismissArtist={view.discover?.source === 'suggested' ? dismissArtist : null} />
 
           <Paper sx={{ p: 1.5, mb: 2 }}>
             <Stack direction="row" sx={{ flexWrap: 'wrap', gap: 0.75, alignItems: 'center' }}>
@@ -239,6 +304,11 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
                   label={`${c.label} ${counts[c.key]}`}
                   onClick={() => setHidden((h) => ({ ...h, [c.key]: !h[c.key] }))} />
               ))}
+              {dismissedCount > 0 && (
+                <Chip size="small" clickable variant={showDismissed ? 'filled' : 'outlined'}
+                  label={`${showDismissed ? 'Hide' : 'Show'} ${dismissedCount} not interested`}
+                  onClick={() => setShowDismissed((v) => !v)} />
+              )}
               <Box sx={{ flexGrow: 1 }} />
               <FormControlLabel sx={{ mr: 0 }}
                 control={<Switch size="small" checked={hideOwned}
@@ -246,7 +316,7 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
                 label={<Typography variant="body2">Hide owned</Typography>} />
               <Tooltip title="Tracks already in your library are normally left out. This
                 downloads them again — and skips the duplicate check for what you queue.">
-                <FormControlLabel sx={{ mr: 0 }}
+                <FormControlLabel sx={{ mr: 0, ml: 1 }}
                   control={<Switch size="small" color="warning" checked={force}
                     onChange={(e) => setForce(e.target.checked)} />}
                   label={<Typography variant="body2">Re-download owned</Typography>} />
@@ -269,7 +339,8 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
                 editions a bigger edition you are taking already holds. Tick any of those
                 yourself and it downloads whole.">
                 <Button size="small" variant="outlined"
-                  onClick={() => selectMany(pickNew(visible, selectedIds), true)}>
+                  onClick={() => selectMany(pickNew(visible.filter((r) => !r.dismissed),
+                    selectedIds), true)}>
                   Select new
                 </Button>
               </Tooltip>
@@ -288,7 +359,7 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
             <ReleaseSection key={s.key} section={s} selection={selection}
               expanded={expanded} fetching={fetching} titles={titles} query={query} force={force}
               onToggle={toggle} onToggleTrack={toggleTrack} onExpand={expand}
-              onSelectMany={selectMany} />
+              onSelectMany={selectMany} onDismiss={dismiss} onRestore={bringBack} />
           ))}
           {!sections.length && (
             <Typography color="text.secondary" sx={{ p: 2 }}>
@@ -298,7 +369,9 @@ export default function ArtistBrowser({ request, onQueued, stats, bottomOffset =
 
           <SelectionBar summary={summary} caps={stats?.caps} force={force}
             busy={busy} onClear={() => setSelection({})} onQueue={queue}
-            bottomOffset={bottomOffset} />
+            bottomOffset={bottomOffset}
+            selected={dismissable.length} onDismiss={dismissable.length ? dismissSelected : null} />
+          {snackbar}
         </>
       )}
     </Box>

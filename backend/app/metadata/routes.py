@@ -43,15 +43,32 @@ class IgnoreIn(BaseModel):
     ignored: bool = True
 
 
-class ApplyIn(BaseModel):
+class SelectIn(BaseModel):
+    """Which issues a bulk action takes: these ids, or every open issue of a
+    kind (for one artist, matching a search or a filter), less `exclude`."""
     ids: list[int] | None = None
     kind: str | None = None
     artist_dir: str | None = None
+    q: str | None = None
+    filter: str | None = None
+    exclude: list[int] | None = None
+
+
+class ApplyIn(SelectIn):
     only_auto: bool = True
 
 
-class IdsIn(BaseModel):
-    ids: list[int]
+class DecideIn(SelectIn):
+    decision: str
+
+
+class IdsIn(SelectIn):
+    pass
+
+
+class NoReleaseIn(BaseModel):
+    key: str
+    no_release: bool = True
 
 
 class OverrideIn(BaseModel):
@@ -151,6 +168,16 @@ async def album_match(body: MatchIn):
     return await views.album(body.key)
 
 
+@router.post("/album/no-release")
+async def album_no_release(body: NoReleaseIn):
+    """"MusicBrainz has no release for this" (or, undone, look it up again)."""
+    await db.execute("UPDATE md_albums SET no_release = ?, manual = CASE WHEN ? THEN 0 "
+                     "ELSE manual END, next_check = 0 WHERE key = ?",
+                     (int(body.no_release), int(body.no_release), body.key))
+    await runner.check_unit(body.key)
+    return await views.album(body.key)
+
+
 @router.post("/album/ignore")
 async def album_ignore(body: IgnoreIn):
     await db.execute("UPDATE md_albums SET ignored = ?, next_check = 0 WHERE key = ?",
@@ -202,58 +229,116 @@ async def attention(artist_dir: str | None = None):
     return await views.attention(artist_dir)
 
 
+ISSUE_STATES = {"open": views.OPEN_STATES,
+                "all": ("open", "failed", "queued", "applied", "dismissed"),
+                "dismissed": ("dismissed",), "applied": ("applied",), "failed": ("failed",)}
+
+
 @router.get("/issues")
 async def list_issues(kind: str | None = None, artist_dir: str | None = None,
                       album_key: str | None = None, state: str = "open",
+                      q: str | None = None, filter: str | None = None,
                       limit: int = Query(100, le=1000), offset: int = 0):
-    states = {"open": views.OPEN_STATES, "all": ("open", "failed", "queued", "applied", "dismissed"),
-              "dismissed": ("dismissed",), "applied": ("applied",), "failed": ("failed",)}
     total, items = await views.issues_for(
         artist_dir=artist_dir, album_keys=[album_key] if album_key else None,
-        kinds=[kind] if kind else None, states=states.get(state, views.OPEN_STATES),
-        limit=limit, offset=offset)
+        kinds=[kind] if kind else None, states=ISSUE_STATES.get(state, views.OPEN_STATES),
+        q=q, filter_=filter, limit=limit, offset=offset)
     return {"total": total, "items": items}
+
+
+async def _selected(body: SelectIn, states=("open", "failed")) -> list[dict]:
+    """The issues a bulk action takes (see SelectIn)."""
+    if body.ids:
+        ids = list(dict.fromkeys(body.ids))
+        rows = []
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            rows += [issues_mod.issue_out(r) for r in await db.fetchall(
+                f"SELECT * FROM md_issues WHERE id IN ({','.join('?' * len(chunk))})",
+                tuple(chunk))]
+    elif body.kind:
+        _, rows = await views.issues_for(artist_dir=body.artist_dir, kinds=[body.kind],
+                                         states=states, q=body.q, filter_=body.filter,
+                                         limit=100000)
+    else:
+        raise HTTPException(422, "pass ids, or a kind")
+    skip = set(body.exclude or ())
+    return [r for r in rows if r["id"] not in skip]
 
 
 @router.post("/issues/apply")
 async def apply_issues(body: ApplyIn):
-    if body.ids:
-        ids = body.ids
-    elif body.kind:
-        if not issues_mod.KINDS.get(body.kind, {}).get("applyable"):
-            raise HTTPException(422, f"{body.kind} issues can't be applied automatically")
-        _, items = await views.issues_for(artist_dir=body.artist_dir, kinds=[body.kind],
-                                          states=("open", "failed"), limit=100000)
-        ids = [i["id"] for i in items if i["auto"] or not body.only_auto]
-    else:
-        raise HTTPException(422, "pass ids, or a kind")
+    if not body.ids and body.kind and not issues_mod.KINDS.get(body.kind, {}).get("applyable"):
+        raise HTTPException(422, f"{body.kind} issues can't be applied automatically")
+    items = await _selected(body)
+    ids = [i["id"] for i in items if i["auto"] or body.ids or not body.only_auto]
     return {"queued": await runner.request_apply(ids)}
+
+
+@router.post("/issues/decide")
+async def decide_issues(body: DecideIn):
+    """Accept the best match, or say MusicBrainz has no release, for each
+    selected album. Runs in the background, like fixes."""
+    if body.decision not in runner.DECISIONS:
+        raise HTTPException(422, f"unknown decision {body.decision!r}")
+    items = await _selected(body)
+    return {"queued": await runner.request_decide([i["id"] for i in items], body.decision)}
+
+
+@router.post("/issues/triage-matches")
+async def triage_matches(body: SelectIn):
+    """Check match, settled where the files settle it: accepted where every
+    file matched a track and the artist is ours; "not on MusicBrainz" where
+    the best match is someone else's song of the same name. The rest stay."""
+    scope = body.model_dump()
+    sure = await _selected(SelectIn(**{**scope, "kind": "review_match", "filter": "sure"}))
+    namesake = await _selected(SelectIn(**{**scope, "kind": "review_match", "filter": "namesake"}))
+    accepted = await runner.request_decide([i["id"] for i in sure], "accept_match")
+    marked = await runner.request_decide([i["id"] for i in namesake], "no_release")
+    return {"accepted": accepted, "no_release": marked}
 
 
 @router.post("/issues/dismiss")
 async def dismiss_issues(body: IdsIn):
-    if not body.ids:
+    rows = await _selected(body, states=views.OPEN_STATES) if (body.ids or body.kind) else []
+    if not rows:
         return {"dismissed": 0}
-    rows = [issues_mod.issue_out(r) for r in await db.fetchall(
-        f"SELECT * FROM md_issues WHERE id IN ({','.join('?' * len(body.ids))})",
-        tuple(body.ids))]
     for issue in rows:
         if issue["kind"] in issues_mod.DUP_KINDS:
             try:
                 await dupes.dismiss(issue)
             except Exception as exc:
                 log.info("exclusion for %s failed: %s", issue["key"], exc)
-    await db.execute(
-        f"UPDATE md_issues SET state = 'dismissed', updated_at = ? "
-        f"WHERE id IN ({','.join('?' * len(body.ids))})", (utcnow(), *body.ids))
+    ids = [r["id"] for r in rows]
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        await db.execute(
+            f"UPDATE md_issues SET state = 'dismissed', updated_at = ? "
+            f"WHERE id IN ({','.join('?' * len(chunk))})", (utcnow(), *chunk))
     await runner.publish_issues()
     return {"dismissed": len(rows)}
+
+
+class ScopeIn(BaseModel):
+    kind: str | None = None
+    artist_dir: str | None = None
+
+
+@router.post("/issues/dismiss-failed")
+async def dismiss_failed(body: ScopeIn):
+    """Every failed fix of a kind (or all kinds), dismissed in one go."""
+    _, items = await views.issues_for(artist_dir=body.artist_dir,
+                                      kinds=[body.kind] if body.kind else None,
+                                      states=("failed",), limit=100000)
+    ids = [i["id"] for i in items]
+    return await dismiss_issues(IdsIn(ids=ids)) if ids else {"dismissed": 0}
 
 
 @router.post("/issues/reopen")
 async def reopen_issues(body: IdsIn):
     if not body.ids:
         return {"reopened": 0}
+    body.ids = list(dict.fromkeys(body.ids))[:5000]
     await db.execute(
         f"UPDATE md_issues SET state = 'open', error = NULL, updated_at = ? "
         f"WHERE id IN ({','.join('?' * len(body.ids))})", (utcnow(), *body.ids))

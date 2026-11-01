@@ -15,7 +15,7 @@ import re
 from collections import defaultdict
 
 from ..db import db
-from ..library import album_key, strict_key
+from ..library import album_key, strict_key, unit_dir
 
 UNIT_COLUMNS = (
     "path, title, artist, album, album_artist, track_number, disc_number, year, format, "
@@ -23,16 +23,6 @@ UNIT_COLUMNS = (
     "artist_dir, provider_track_id, genre, isrc, mb_albumid, mb_releasegroupid, "
     "mb_albumartistid, mb_artistid, mb_trackid, mb_releasetrackid, compilation, "
     "releasetype, label, originaldate, junk, unreadable")
-
-
-_DISC_DIR = re.compile(r"^(?:cd|disc|disk)\s*\d+\b", re.I)
-
-
-def unit_dir(dirpath: str) -> str:
-    """The album folder a file folder belongs to: a disc subfolder's parent
-    (never an artist folder: `Artist/CD1` stays its own)."""
-    parent, _, leaf = (dirpath or "").rpartition("/")
-    return parent if "/" in parent and _DISC_DIR.match(leaf) else dirpath
 
 
 def folder_of(row: dict) -> str:
@@ -88,6 +78,36 @@ def build_units(rows: list[dict]) -> dict[str, list[dict]]:
 
 def unit_folder(key: str) -> str:
     return key.split("|", 1)[0]
+
+
+_YEAR_NAME = re.compile(r"^\s*[\(\[]?(?:19|20)\d{2}[\)\]]?\s*[-–—.]?\s+\S")
+
+
+async def in_box_set(key: str, rows: list[dict]) -> bool:
+    """Whether this unit is one album of a box set, which keeps its own copy:
+    it is never moved out to the album's folder.
+
+    Either its discs sit in disc subfolders of a folder holding other albums
+    too (`The Ultimate Collection Box, 20CD/CD 06 - News Of The World`, split
+    by album tag), or its folder sits inside a dated collection's that holds
+    other albums (`(2010) The Original Mono Recordings/1964 - Another Side Of
+    Bob Dylan`). A dated folder of one album's discs (`2011 Remixes (3CD)/
+    ... (CD3)`) is that album, not a set."""
+    if not rows:
+        return False
+    folder = unit_folder(key)
+    if "|" in key and all((r.get("dirpath") or "") != folder for r in rows):
+        return True
+    artist_dir = rows[0].get("artist_dir") or ""
+    parent = folder.rpartition("/")[0]
+    if not parent or parent == artist_dir or not _YEAR_NAME.match(parent.rsplit("/", 1)[-1]):
+        return False
+    albums = {split_key(r["album"], r["album_artist"] or artist_dir)
+              for r in await db.fetchall(
+                  "SELECT DISTINCT album, album_artist FROM library_index "
+                  "WHERE dirpath >= ? AND dirpath < ? AND album IS NOT NULL AND album != ''",
+                  (parent + "/", parent + "0"))}
+    return len(albums - {""}) > 1
 
 
 def signature(rows: list[dict]) -> str:
@@ -163,14 +183,14 @@ async def sync_registry() -> dict:
         marks = ','.join('?' * len(chunk))
         await db.execute(f"DELETE FROM md_albums WHERE key IN ({marks})", tuple(chunk))
         await db.execute(
-            f"UPDATE md_issues SET state = 'applied', updated_at = datetime('now') "
-            f"WHERE state IN ('open', 'queued') AND album_key IN ({marks}) "
+            f"UPDATE md_issues SET state = 'applied', error = NULL, updated_at = datetime('now') "
+            f"WHERE state IN ('open', 'queued', 'failed') AND album_key IN ({marks}) "
             f"AND kind NOT IN ('dup_album', 'dup_track', 'split_artist')", tuple(chunk))
     # an album's issues outlive it when it moves mid-apply under a new key
     from .issues import UNIT_KINDS
     await db.execute(
-        f"UPDATE md_issues SET state = 'applied', updated_at = datetime('now') "
-        f"WHERE state IN ('open', 'queued') AND album_key IS NOT NULL "
+        f"UPDATE md_issues SET state = 'applied', error = NULL, updated_at = datetime('now') "
+        f"WHERE state IN ('open', 'queued', 'failed') AND album_key IS NOT NULL "
         f"AND kind IN ({','.join('?' * len(UNIT_KINDS))}) "
         f"AND album_key NOT IN (SELECT key FROM md_albums)", UNIT_KINDS)
     return {"units": len(units), "new": len(new_rows), "changed": len(changed),

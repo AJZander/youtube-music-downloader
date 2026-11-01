@@ -32,6 +32,18 @@ from .issues import planned, save
 log = logging.getLogger("mdl.missing")
 
 _VIDEO = re.compile(r"dvd|blu-?ray|vhs|video|hd-?dvd|umd", re.I)
+
+
+class Busy(RuntimeError):
+    """YouTube Music can't be asked right now (this hour's browsing budget is
+    spent, or YouTube asked us to slow down): no answer about the album."""
+
+
+def _asking_failed(exc, what: str) -> RuntimeError:
+    from .. import catalog
+    if isinstance(exc, catalog.CatalogError) and exc.status == 503:
+        return Busy(str(exc))
+    return RuntimeError(f"{what}: {exc}")
 TOLERANCE = 5.0
 
 
@@ -54,12 +66,15 @@ async def compute(release_mbid: str) -> dict | None:
     have: set[str] = set()
     paths: list[str] = []
     desired = None
+    held_by: dict[str, int] = {}
     for unit in units:
         desired = json.loads(unit["desired"])
         paths += list(desired["tracks"])
+        held_by[unit["key"]] = 0
         for track in desired["tracks"].values():
             if track.get("matched") and track.get("releasetrack_mbid"):
                 have.add(track["releasetrack_mbid"])
+                held_by[unit["key"]] += 1
     audio_discs = {m.get("position") or 1 for m in rel.get("media") or []
                    if not _VIDEO.search(m.get("format") or "")}
     tracks = [t for t in mb.release_tracks(rel) if t["disc"] in audio_discs]
@@ -80,6 +95,8 @@ async def compute(release_mbid: str) -> dict | None:
             and not await _album_download(paths),
             "multi_disc": len(audio_discs) > 1,
             "units": sorted(u["key"] for u in units),
+            # where downloaded tracks go: the folder holding most of it
+            "main_unit": max(sorted(held_by), key=lambda k: held_by[k]),
             "artist_dirs": sorted({u["artist_dir"] for u in units if u["artist_dir"]})}
 
 
@@ -126,6 +143,40 @@ async def _file(info: dict, download: dict | None) -> None:
                         album_key=info["units"][0],
                         refs=[(k.split("/", 1)[0], k) for k in info["units"]])],
                scope_kinds=("missing_tracks",), close_others=False)
+
+
+async def want_download(release_mbid: str) -> None:
+    """Remember that the user asked for this release's missing tracks, so a
+    later pass asks YouTube Music again (it couldn't be asked this time)."""
+    row = await db.fetchone("SELECT id, detail FROM md_issues WHERE key = ?",
+                            (f"missing_tracks:{release_mbid}",))
+    if row is None:
+        return
+    detail = json.loads(row["detail"] or "{}")
+    download = detail.get("download") or {}
+    if download.get("job_id") and download.get("active", True):
+        return
+    detail["download"] = {**download, "wanted": True, "wanted_at": utcnow()}
+    await db.execute("UPDATE md_issues SET detail = ?, error = ?, updated_at = ? WHERE id = ?",
+                     (json.dumps(detail), "waiting for YouTube Music's hourly budget",
+                      utcnow(), row["id"]))
+
+
+# Downloads asked for while YouTube Music couldn't be asked, retried a few a
+# pass: each costs a few of the hour's lookups (CATALOG_REQUESTS_PER_HOUR,
+# 600), and browsing needs the rest. Two passes an hour, 30 albums each.
+WANTED_PER_PASS = 30
+
+
+async def wanted_downloads(limit: int = WANTED_PER_PASS) -> list[int]:
+    """Missing-tracks issues whose download was asked for and not yet
+    queued, oldest first."""
+    rows = await db.fetchall(
+        "SELECT id FROM md_issues WHERE kind = 'missing_tracks' AND state IN ('open', 'failed') "
+        "AND (json_extract(detail, '$.download.wanted') = 1 "
+        "OR error LIKE '%browsing budget%' OR error LIKE '%asked us to slow down%') "
+        "ORDER BY updated_at LIMIT ?", (limit,))
+    return [r["id"] for r in rows]
 
 
 async def _job_active(job_id: str | None) -> bool:
@@ -207,7 +258,7 @@ async def find_on_youtube(info: dict) -> tuple[str | None, dict | None]:
         try:
             results = await catalog.call("search", query, filter="albums", limit=8)
         except catalog.CatalogError as exc:
-            raise RuntimeError(f"YouTube Music search failed: {exc}") from exc
+            raise _asking_failed(exc, "YouTube Music search failed") from exc
         wanted = album_identity(info["album"], {info["artist"] or ""})
         artist_key = strict_key(info["artist"] or "")
         scored = []
@@ -228,6 +279,8 @@ async def find_on_youtube(info: dict) -> tuple[str | None, dict | None]:
         try:
             album = await catalog.album(bid)
         except catalog.CatalogError as exc:
+            if exc.status == 503:
+                raise Busy(str(exc)) from exc     # not "not found": not asked
             log.info("album %s: %s", bid, exc)
             continue
         found, _ = _match(info["missing"], album.get("tracks") or [])
@@ -236,8 +289,12 @@ async def find_on_youtube(info: dict) -> tuple[str | None, dict | None]:
     return best[0], best[1]
 
 
-async def queue_download(release_mbid: str) -> dict:
+async def queue_download(release_mbid: str, skip_videos: set[str] | frozenset = frozenset()) -> dict:
+    """Queue the release's missing tracks as one job, filed into the album's
+    own folder. `skip_videos`: tracks already downloaded and just filed in
+    (their files aren't matched to the release until its next check)."""
     from ..worker import worker
+    from .units import unit_folder
     info = await compute(release_mbid)
     if not info or not info["missing"]:
         return {"queued": 0, "message": "nothing is missing"}
@@ -245,6 +302,10 @@ async def queue_download(release_mbid: str) -> dict:
     if not browse_id or not album:
         raise RuntimeError(f"couldn't find {info['album']} on YouTube Music")
     video_ids, not_found = _match(info["missing"], album.get("tracks") or [])
+    if skip_videos:
+        video_ids = [v for v in video_ids if v not in skip_videos]
+        if not video_ids:
+            return {"queued": 0, "message": "the downloaded tracks were filed in"}
     if not video_ids:
         raise RuntimeError(f"none of the missing tracks are on the YouTube Music release "
                            f"of {album.get('title')}")
@@ -255,7 +316,8 @@ async def queue_download(release_mbid: str) -> dict:
         f"SELECT id FROM jobs WHERE source_url = ? AND track_filter = ? AND status IN ({active})",
         (url, track_filter, *ACTIVE_JOB_STATUSES))
     job_id = dup["id"] if dup else await worker.enqueue(
-        url, title=info["album"], artist=info["artist"], track_filter=track_filter)
+        url, title=info["album"], artist=info["artist"], track_filter=track_filter,
+        target_dir=unit_folder(info["main_unit"]))
     download = {"job_id": job_id, "browse_id": browse_id, "queued_at": utcnow(),
                 "tracks": len(video_ids), "not_found": [t["title"] for t in not_found],
                 "active": True}

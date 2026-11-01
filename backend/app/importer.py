@@ -77,10 +77,13 @@ async def _retry_io(func, description: str):
 
 
 async def import_track(staging_file: Path, validated: dict, track_meta: dict,
-                       force: bool = False) -> dict:
+                       force: bool = False, target_dir: str | None = None) -> dict:
     """Move a validated staging file into the library.
     track_meta carries authoritative metadata (Spotify) or {} (YouTube —
-    validated tags are used). Returns import result fields for the DB."""
+    validated tags are used). `target_dir` is an existing album folder the
+    track belongs in (a missing track of that album): the file goes there,
+    under its usual name, and the metadata manager tags and numbers it as
+    that album's. Returns import result fields for the DB."""
     if not library_online():
         raise ImportError_("library_offline", "library sentinel missing — mount down?")
 
@@ -101,6 +104,8 @@ async def import_track(staging_file: Path, validated: dict, track_meta: dict,
             meta["album_artist"], meta["album"], meta["title"],
             staging_file.suffix, meta.get("track_number"), meta.get("disc_number"),
             year=(meta.get("release_date") or "")[:4])
+        if target_dir:
+            relpath = _in_folder(target_dir, relpath.name)
     except PathBuildError as exc:
         raise ImportError_("path_build", str(exc), ErrorClass.VALIDATION_FAILED) from exc
 
@@ -159,6 +164,16 @@ async def import_track(staging_file: Path, validated: dict, track_meta: dict,
         "meta": meta,
         "overwrote": overwrote,
     }
+
+
+def _in_folder(folder: str, filename: str) -> Path:
+    """`folder/filename`, refusing a folder that would leave the library
+    (it comes from the database, but it is still a path to write to)."""
+    parts = Path(folder).parts
+    if not parts or Path(folder).is_absolute() or any(p in ("..", ".") or p.startswith(".")
+                                                      for p in parts):
+        raise PathBuildError(f"not a library folder: {folder!r}")
+    return Path(folder) / filename
 
 
 async def _place_folder_art(dest_dir: Path, staging_file: Path, track_meta: dict) -> None:

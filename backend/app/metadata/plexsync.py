@@ -1,10 +1,11 @@
 """A local mirror of the Plex music section, joined to our files by path.
 
 List views are cheap (a few dozen paged requests for 60k tracks) and carry
-almost everything: guid, MusicBrainz ids, titles, numbers, file paths and
-genres. Moods, styles, countries and locked fields only come from an item's
-own page, so those are read for artists and albums that are new or changed
-since they were last read.
+almost everything: guid, MusicBrainz ids, titles, numbers and file paths.
+But they carry at most two genres an item, and moods, styles, countries and
+locked fields only come from an item's own page, so the pages of items that
+are new or changed since they were last read are read too (a hundred to a
+request), and a page's genres stand until the item changes again.
 
 Incremental syncs fetch only what was added or updated since the last one.
 Plex has no "deleted since" filter, so when the section's counts stop
@@ -21,13 +22,19 @@ import unicodedata
 from collections import Counter
 
 from ..db import db
-from ..plex import ALBUM, ARTIST, TRACK, PlexError, mbid_of, plex, tag_values
+from ..plex import ALBUM, ARTIST, TRACK, PlexError, mbid_of, nfc, plex, tag_values
 from .vocab import vocab
 
 log = logging.getLogger("mdl.plexsync")
 
 FULL_EVERY = 6 * 3600
 TYPE_NAME = {ARTIST: "artist", ALBUM: "album", TRACK: "track"}
+PAGE_BATCH = 100      # item pages to a request
+# 2: tracks' pages are read too, and a list view no longer cuts an item's
+# genres to two: every page is read again once
+# 3: tracks edited with their album were never read back (an edit leaves
+# Plex's updatedAt alone), so the mirror kept their old genres: again once
+DETAIL_REV = "3"
 
 _UPSERT = """
 INSERT INTO plex_items (rating_key, type, guid, mbid, title, parent_key, grandparent_key,
@@ -41,7 +48,11 @@ ON CONFLICT(rating_key) DO UPDATE SET
   idx=excluded.idx, parent_idx=excluded.parent_idx, year=excluded.year,
   studio=excluded.studio, path=excluded.path,
   folder=COALESCE(excluded.folder, plex_items.folder),
-  genres=excluded.genres, thumb=excluded.thumb, added_at=excluded.added_at,
+  -- a list view's genres are cut to two: an unchanged item keeps its page's
+  genres=CASE WHEN plex_items.detail_at IS NOT NULL
+                   AND COALESCE(excluded.updated_at, 0) <= plex_items.detail_at
+              THEN plex_items.genres ELSE excluded.genres END,
+  thumb=excluded.thumb, added_at=excluded.added_at,
   updated_at=excluded.updated_at, seen_at=excluded.seen_at,
   -- an item whose page changed must be read again
   detail_at=CASE WHEN COALESCE(excluded.updated_at, 0) > COALESCE(plex_items.detail_at, 0)
@@ -140,6 +151,9 @@ async def sync(*, full: bool = False, progress=None) -> dict:
           SELECT t.folder FROM plex_items t WHERE t.parent_key = plex_items.rating_key
           AND t.type = 'track' GROUP BY t.folder ORDER BY COUNT(*) DESC LIMIT 1)
         WHERE type = 'album'""")
+    if await _state("plex_detail_rev") != DETAIL_REV:
+        await db.execute("UPDATE plex_items SET detail_at = NULL")
+        await _set_state("plex_detail_rev", DETAIL_REV)
     details = await read_details(progress=progress)
     await _harvest_moods()
     await _map_artists()
@@ -156,71 +170,89 @@ async def sync(*, full: bool = False, progress=None) -> dict:
     return result
 
 
-async def read_details(keys: list[str] | None = None, progress=None) -> int:
-    """Read the item pages (moods, styles, countries, locks) of artists and
-    albums that changed since they were last read, or of `keys`."""
-    if keys is None:
-        rows = await db.fetchall(
-            "SELECT rating_key FROM plex_items WHERE type IN ('artist', 'album') "
-            "AND detail_at IS NULL")
-        keys = [r["rating_key"] for r in rows]
-    done = 0
-
-    async def one(key: str) -> bool:
-        try:
-            item = await plex.metadata(key)
-        except PlexError as exc:
-            log.debug("plex detail %s failed: %s", key, exc)
-            return False
-        if item is None:
-            await db.execute("DELETE FROM plex_items WHERE rating_key = ?", (key,))
-            return False
-        await store_detail(item)
-        return True
-
-    # The client allows six requests in flight; feed it in batches.
-    for i in range(0, len(keys), 24):
-        results = await asyncio.gather(*(one(k) for k in keys[i:i + 24]))
-        done += sum(results)
-        if progress and (i // 24) % 10 == 0:
-            progress("Plex details", done)
-    return done
-
-
-async def store_detail(item: dict) -> None:
-    locked = [f.get("name") for f in item.get("Field") or [] if f.get("locked")]
-
-    def tags(key):
-        values = tag_values(item, key)
-        return json.dumps(values) if values else None
-
-    await db.execute(
-        "UPDATE plex_items SET guid = ?, mbid = ?, title = ?, genres = ?, styles = ?, "
-        "moods = ?, countries = ?, locked = ?, summary = ?, studio = ?, thumb = ?, "
-        "year = COALESCE(?, year), updated_at = ?, detail_at = ? WHERE rating_key = ?",
-        (item.get("guid"), mbid_of(item), item.get("title"), tags("Genre"), tags("Style"),
-         tags("Mood"), tags("Country"), json.dumps(locked) if locked else None,
-         (item.get("summary") or "")[:2000] or None, item.get("studio"), item.get("thumb"),
-         item.get("year"), item.get("updatedAt"),
-         int(item.get("updatedAt") or time.time()), str(item.get("ratingKey"))))
-
-
-async def refresh_items(keys: list[str]) -> None:
-    """Re-read specific items (after an edit) — list fields and detail."""
+async def _pages(keys: list[str]) -> list[dict] | None:
+    """The pages of these items, in one request; an item left out of the
+    answer is asked for alone, and dropped from the mirror if Plex has
+    deleted it. None when Plex can't be asked."""
+    try:
+        items = await plex.metadata_many(keys)
+    except PlexError as exc:
+        log.debug("plex pages failed: %s", exc)
+        return None
+    found = {str(i.get("ratingKey")) for i in items}
     for key in keys:
+        if key in found:
+            continue
         try:
             item = await plex.metadata(key)
         except PlexError:
             continue
         if item is None:
             await db.execute("DELETE FROM plex_items WHERE rating_key = ?", (key,))
-            continue
-        type_num = {"artist": ARTIST, "album": ALBUM, "track": TRACK}.get(item.get("type"))
-        if type_num is None:
-            continue
-        await db.execute(_UPSERT, _row(item, type_num, time.time()))
-        if type_num in (ARTIST, ALBUM):
-            await store_detail(item)
+        else:
+            items.append(item)
+    return items
+
+
+async def read_details(keys: list[str] | None = None, progress=None) -> int:
+    """Read the item pages (every genre, moods, styles, countries, locks) of
+    items that changed since they were last read, or of `keys`."""
+    if keys is None:
+        rows = await db.fetchall("SELECT rating_key FROM plex_items WHERE detail_at IS NULL")
+        keys = [r["rating_key"] for r in rows]
+    done = 0
+
+    async def batch(chunk: list[str]) -> int:
+        items = await _pages(chunk)
+        if items:
+            await db.executemany(_DETAIL, [_detail_row(i) for i in items])
+        return len(items or [])
+
+    # The client allows six requests in flight; keep four going.
+    step = PAGE_BATCH * 4
+    for i in range(0, len(keys), step):
+        results = await asyncio.gather(*(batch(keys[j:j + PAGE_BATCH])
+                                         for j in range(i, min(i + step, len(keys)), PAGE_BATCH)))
+        done += sum(results)
+        if progress:
+            progress("Plex details", done)
+    return done
+
+
+_DETAIL = (
+    "UPDATE plex_items SET guid = ?, mbid = ?, title = ?, genres = ?, styles = ?, "
+    "moods = ?, countries = ?, locked = ?, summary = ?, studio = COALESCE(?, studio), "
+    "thumb = COALESCE(?, thumb), year = COALESCE(?, year), updated_at = ?, detail_at = ? "
+    "WHERE rating_key = ?")
+
+
+def _detail_row(item: dict) -> tuple:
+    locked = [f.get("name") for f in item.get("Field") or [] if f.get("locked")]
+
+    def tags(key):
+        values = tag_values(item, key)
+        return json.dumps(values) if values else None
+
+    return (item.get("guid"), mbid_of(item), item.get("title"), tags("Genre"), tags("Style"),
+            tags("Mood"), tags("Country"), json.dumps(locked) if locked else None,
+            (item.get("summary") or "")[:2000] or None, item.get("studio"), item.get("thumb"),
+            item.get("year"), item.get("updatedAt"),
+            int(item.get("updatedAt") or time.time()), str(item.get("ratingKey")))
+
+
+async def refresh_items(keys: list[str]) -> None:
+    """Re-read specific items (after an edit) — list fields and detail."""
+    now = time.time()
+    for i in range(0, len(keys), PAGE_BATCH):
+        items = await _pages(keys[i:i + PAGE_BATCH]) or []
+        rows = []
+        for item in items:
+            type_num = {"artist": ARTIST, "album": ALBUM, "track": TRACK}.get(item.get("type"))
+            if type_num is not None:
+                rows.append((item, _row(item, type_num, now)))
+        if rows:
+            await db.executemany(_UPSERT, [r for _, r in rows])
+            await db.executemany(_DETAIL, [_detail_row(item) for item, _ in rows])
 
 
 async def sync_recent(since: float) -> int:
@@ -330,7 +362,68 @@ async def album_for_paths(paths: list[str]) -> dict | None:
                                    (album["parent_key"],))
     return {"album": dict(album) if album else None,
             "artist": dict(artist) if artist else None,
-            "tracks": tracks, "album_keys": list(counter)}
+            "tracks": tracks, "album_keys": list(counter),
+            "others": await album_others(album_key, paths)}
+
+
+async def album_others(album_key: str, paths: list[str]) -> list[dict]:
+    """The album's other tracks, as our files. Plex may file other albums'
+    tracks in it too: a track it first saw untagged keeps its first album."""
+    mine = {nfc(p) for p in spellings(paths)}
+    other_paths = [r["path"] for r in await db.fetchall(
+        "SELECT path FROM plex_items WHERE type = 'track' AND parent_key = ?", (album_key,))
+        if r["path"] and nfc(r["path"]) not in mine]
+    others: list[dict] = []
+    for i in range(0, len(other_paths), 400):
+        chunk = other_paths[i:i + 400]
+        others += [dict(r) for r in await db.fetchall(
+            "SELECT path, album, mb_releasegroupid FROM library_index WHERE path IN "
+            f"({','.join('?' * len(chunk))})", tuple(chunk))]
+    return others
+
+
+def album_share(info: dict | None, rows: list[dict], releasegroup: str | None = None) -> dict:
+    """Who the Plex album these files map to holds tracks of. Plex never
+    regroups a track it filed before its tags were fixed, so an untitled
+    album may collect tracks from all over the library.
+
+    `ours`: this album's tracks in it (from any folder); `foreign`: other
+    albums'; `owner_tagged`: whether one other, identified album holds most
+    of it (and so looks after it)."""
+    others = (info or {}).get("others") or []
+    album = (info or {}).get("album") or {}
+    mine = sum(1 for t in ((info or {}).get("tracks") or {}).values()
+               if t.get("parent_key") == album.get("rating_key")) or len(rows)
+    if not others:
+        return {"ours": mine, "foreign": 0, "owner_tagged": False}
+    from ..library import album_key
+    groups = ({releasegroup} if releasegroup
+              else {r.get("mb_releasegroupid") for r in rows if r.get("mb_releasegroupid")})
+    names = {album_key(r.get("album")) for r in rows if r.get("album")}
+    foreign: Counter = Counter()
+    same = 0
+    for other in others:
+        rg = other.get("mb_releasegroupid")
+        if rg and groups:
+            if rg in groups:
+                same += 1
+                continue
+        elif other.get("album") and album_key(other["album"]) in names:
+            same += 1
+            continue
+        foreign[f"rg:{rg}" if rg else f"name:{album_key(other.get('album') or '')}"] += 1
+    total = mine + len(others)
+    top = foreign.most_common(1)
+    return {"ours": mine + same, "foreign": sum(foreign.values()),
+            "owner_tagged": bool(top) and top[0][0].startswith("rg:") and top[0][1] * 2 > total}
+
+
+def shares_album(info: dict | None, rows: list[dict], releasegroup: str | None = None) -> bool:
+    """Whether the Plex album these files map to is mostly other albums'
+    tracks: then it is not theirs to match, name or tag, or each album in it
+    would overwrite the last. The album holding most of it looks after it."""
+    share = album_share(info, rows, releasegroup)
+    return share["foreign"] > 0 and share["foreign"] >= share["ours"]
 
 
 def jlist(value) -> list:

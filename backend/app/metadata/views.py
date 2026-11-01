@@ -85,11 +85,42 @@ async def _issue_counts_by_artist() -> dict[str, Counter]:
     return out
 
 
+# Narrower views of one kind's issues, for picking what a bulk action takes.
+ISSUE_FILTERS = {
+    # Check match: every file matched a track and the artist is ours / the
+    # best match is someone else's song of the same name / the rest
+    "sure": "json_extract(i.detail, '$.artist') >= 1 "
+            "AND json_extract(i.detail, '$.matched') = json_extract(i.detail, '$.files')",
+    # (a single or two: a whole album credited otherwise is usually ours
+    # under another name — "Ye", "千葉雄喜", a soundtrack's credit)
+    "namesake": "json_extract(i.detail, '$.artist') = 0 "
+                "AND COALESCE(json_extract(i.detail, '$.files'), 99) <= 2",
+    "unsure": "NOT ((COALESCE(json_extract(i.detail, '$.artist'), -1) = 0 AND "
+              "COALESCE(json_extract(i.detail, '$.files'), 99) <= 2) OR "
+              "(COALESCE(json_extract(i.detail, '$.artist'), -1) >= 1 AND "
+              "COALESCE(json_extract(i.detail, '$.matched'), -1) = "
+              "COALESCE(json_extract(i.detail, '$.files'), -2)))",
+    # Missing tracks: a download was tried (what is left isn't on YouTube
+    # Music, or hasn't arrived) / never tried
+    "tried": "json_extract(i.detail, '$.download') IS NOT NULL",
+    "untried": "json_extract(i.detail, '$.download') IS NULL",
+    "failed": "i.state = 'failed'",
+}
+
+
 async def issues_for(*, artist_dir: str | None = None, album_keys: list[str] | None = None,
                      kinds: list[str] | None = None, states=OPEN_STATES, entity: str | None = None,
+                     q: str | None = None, filter_: str | None = None,
                      limit: int = 500, offset: int = 0) -> tuple[int, list[dict]]:
     where = [f"i.state IN ({','.join('?' * len(states))})"]
     params: list = list(states)
+    if q and q.strip():
+        needle = f"%{q.strip()}%"
+        where.append("(i.ref LIKE ? OR i.summary LIKE ? OR i.album_key LIKE ? "
+                     "OR i.artist_dir LIKE ?)")
+        params.extend([needle] * 4)
+    if filter_ in ISSUE_FILTERS:
+        where.append(f"({ISSUE_FILTERS[filter_]})")
     joins = ""
     if artist_dir is not None or album_keys:
         joins = "JOIN md_issue_refs r ON r.issue_id = i.id"
@@ -233,6 +264,7 @@ async def _album_summary(key: str, rows: list[dict], record: dict | None,
         "art_url": _art_url(key=key),
         "status": (record or {}).get("status") or "pending",
         "ignored": bool((record or {}).get("ignored")),
+        "no_release": bool((record or {}).get("no_release")),
         "confidence": (record or {}).get("confidence"),
         "release_mbid": (record or {}).get("release_mbid"),
         "plex": ({"rating_key": record["plex_key"], "guid": record.get("plex_guid"),

@@ -27,8 +27,8 @@ import re
 
 from .db import db
 from .engine.matcher import normalize
-from .library import (DURATION_TOLERANCE, album_identity, row_album_identity,
-                      title_looks_like_junk)
+from .library import (DURATION_TOLERANCE, UPLOAD_TOLERANCE, album_identity,
+                      row_album_identity, title_looks_like_junk)
 
 # A live album, by its title. Release classification uses it too.
 LIVE_RE = re.compile(
@@ -63,9 +63,6 @@ _VERSION_TAG_RE = re.compile(
 # The same, once normalization has flattened "(Live)" into a trailing word.
 _TRAILING_VERSION_RE = re.compile(
     r"\s(?:live|acoustic|demo|instrumental|karaoke|remix|unplugged|acapella)$")
-# Old YouTube uploads run long — a few seconds of silence, a video's intro —
-# so a copy with a YouTube-style title gets this much slack instead.
-UPLOAD_TOLERANCE = 30.0
 
 _LIKE_ESCAPE = str.maketrans({"%": r"\%", "_": r"\_", "\\": r"\\"})
 _COLUMNS = ("norm_artist, norm_title, title, album, norm_album, album_artist, "

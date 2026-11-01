@@ -1,4 +1,5 @@
 """Run with: python -m unittest discover backend/tests"""
+import asyncio
 import json
 import sys
 import tempfile
@@ -39,7 +40,8 @@ def artist_page(name, albums, singles=(), related=()):
 
 class FakeClient:
     def __init__(self):
-        self.searches, self.pages, self.albums = {}, {}, {}
+        self.searches, self.pages, self.albums, self.more = {}, {}, {}, {}
+        self.results = {}
         self.calls = []
         self.genre_page = {}
 
@@ -56,6 +58,14 @@ class FakeClient:
     def get_album(self, browse_id):
         self.calls.append(("get_album", browse_id))
         return self.albums[browse_id]
+
+    def get_artist_albums(self, browse_id, params, limit=None):
+        self.calls.append(("get_artist_albums", browse_id))
+        return self.more[browse_id]
+
+    def search(self, query, filter=None, limit=20):
+        self.calls.append(("search", query, filter))
+        return self.results.get((query, filter), [])
 
     def get_charts(self, country):
         self.calls.append(("get_charts", country))
@@ -155,8 +165,9 @@ class DiscoverDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(catalog, "client", return_value=self.fake),
             mock.patch.object(catalog.governor, "backoff_remaining", return_value=0),
             mock.patch.object(discover.bus, "publish"),
-            mock.patch.object(discover, "_owned", {"at": 0.0, "keys": frozenset()}),
-            mock.patch.object(discover, "_listings", {}),
+            mock.patch.object(discover, "_feed", {"at": 0.0, "keys": frozenset()}),
+            # Opening an artist would start loading tracklists behind the test.
+            mock.patch.object(catalog, "ensure_prefetch", return_value={}),
             mock.patch.object(discover, "scanner", discover.Scanner()),
         ]
         for patcher in patches:
@@ -269,8 +280,10 @@ class DiscoverDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
         self.setup_artists()
         await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)])
         await self.scan()
-        # Downloaded since, credited to both artists.
+        # Downloaded since, credited to both artists; the library is re-read
+        # once the owned-albums cache runs out.
         await self.library("Paul Kelly, Dan Sultan/Rita Wrote A Letter/01.m4a")
+        discover._feed["at"] = 0.0
         titles = [r["title"] for r in await discover.new_releases()]
         self.assertNotIn("Rita Wrote A Letter", titles)
 
@@ -317,6 +330,148 @@ class DiscoverDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(owned["Paul Kelly"], 2)
         singles = await discover.release_artists(categories={"single"})
         self.assertEqual([(a["name"], a["source"]) for a in singles], [("Paul Kelly", "library")])
+
+    async def test_the_scan_reads_whole_discographies_once_for_everyone(self):
+        self.setup_artists()
+        year = time.localtime().tm_year
+        # Paul Kelly's albums carousel shows two of four; "More" holds them all.
+        more = f"MPADUC{'x' * 22}"
+        self.fake.pages[PK]["albums"].update(browseId=more, params="p")
+        self.fake.more[more] = [
+            {"browseId": "MPREb_seventy", "title": "Seventy", "type": "Album", "year": str(year - 1)},
+            {"browseId": "MPREb_gossip", "title": "Gossip", "type": "Album", "year": "1986"},
+            {"browseId": "MPREb_post", "title": "Post", "type": "Album", "year": "1985"},
+            {"browseId": "MPREb_manila", "title": "Manila", "type": "Album", "year": "1982"}]
+        await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)])
+        await self.scan()
+        titles = {r["title"] for r in await discover.new_releases(years=0)}
+        self.assertTrue({"Post", "Manila"} <= titles)
+        # Opening the artist afterwards asks YouTube nothing: the scan's copy is it.
+        calls = len(self.fake.calls)
+        view = await catalog.artist_view(PK)
+        self.assertEqual(len(self.fake.calls), calls)
+        self.assertEqual(len(view["releases"]), 5)
+        self.assertFalse(view["rereading"])
+
+    async def test_back_catalogue_found_later_is_not_new(self):
+        self.setup_artists()
+        await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)])
+        await self.scan()
+        # Two hours on, the next look follows "More" for the first time — and
+        # one release really is new, on the artist page itself.
+        await self.db.execute("UPDATE discover_artists SET first_checked = first_checked - 7200, "
+                              "next_check = 0 WHERE channel_id = ?", (PK,))
+        await self.db.execute("UPDATE discover_releases SET first_seen = first_seen - 7200 "
+                              "WHERE channel_id = ?", (PK,))
+        year = str(time.localtime().tm_year)
+        more = f"MPADUC{'y' * 22}"
+        page = self.fake.pages[PK]
+        page["albums"]["results"].insert(
+            0, {"browseId": "MPREb_brand", "title": "Brand New", "type": "Album", "year": year})
+        page["albums"].update(browseId=more, params="p")
+        self.fake.more[more] = page["albums"]["results"] + [
+            {"browseId": "MPREb_deep", "title": "Deep Cut", "type": "Album", "year": year}]
+        await self.scan()
+        new = {r["title"]: r["is_new"] for r in await discover.new_releases()}
+        self.assertTrue(new["Brand New"])
+        self.assertFalse(new["Deep Cut"])
+
+    async def test_an_old_discography_is_shown_and_read_again_behind_it(self):
+        self.setup_artists()
+        await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)])
+        await self.scan()
+        row = await self.db.fetchone("SELECT data FROM catalog_cache WHERE key = ?",
+                                     (f"artist:{PK}",))
+        doc = json.loads(row["data"])
+        doc["fetched_at"] -= catalog.ARTIST_STALE + 60
+        await self.db.execute("UPDATE catalog_cache SET data = ?, fetched_at = ? WHERE key = ?",
+                              (json.dumps(doc), doc["fetched_at"], f"artist:{PK}"))
+        calls = sum(1 for c in self.fake.calls if c == ("get_artist", PK))
+        view = await catalog.artist_view(PK)
+        self.assertTrue(view["rereading"])
+        self.assertEqual(len(view["releases"]), 3)            # the old copy, at once
+        for _ in range(50):
+            if not catalog._rereading:
+                break
+            await asyncio.sleep(0.05)
+        self.assertEqual(sum(1 for c in self.fake.calls if c == ("get_artist", PK)), calls + 1)
+        self.assertFalse((await catalog.artist_view(PK))["rereading"])
+
+    async def test_search_finds_releases_and_songs_already_known(self):
+        self.setup_artists()
+        self.fake.albums["MPREb_rita"] = {
+            "title": "Rita Wrote A Letter", "artists": [{"name": "Paul Kelly", "id": PK}],
+            "tracks": [{"videoId": "v1", "title": "Rita Wrote A Letter", "isAvailable": True},
+                       {"videoId": "v2", "title": "Bradman", "isAvailable": True},
+                       {"videoId": None, "title": "Gone", "isAvailable": False}]}
+        await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)])
+        await self.scan()
+        await catalog.album("MPREb_rita")
+        found = await discover.search_local("bradman")
+        self.assertEqual([t["title"] for t in found["tracks"]["items"]], ["Bradman"])
+        self.assertEqual(found["tracks"]["items"][0]["album_id"], "MPREb_rita")
+        self.assertEqual(found["releases"]["total"], 0)
+        found = await discover.search_local("RITA")
+        self.assertEqual([r["title"] for r in found["releases"]["items"]],
+                         ["Rita Wrote A Letter"])
+        # Owned releases are found too, marked as such; any year.
+        seventy = (await discover.search_local("seventy"))["releases"]["items"]
+        self.assertTrue(seventy[0]["in_library"])
+        self.assertEqual(len((await discover.search_local("gossip"))["releases"]["items"]), 1)
+
+    async def test_youtube_search_is_one_request_cached_and_annotated(self):
+        self.setup_artists()
+        await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)])
+        await self.scan()
+        self.fake.results[("Paul Kelly", None)] = [
+            {"category": "Top result", "resultType": "artist",
+             "artists": [{"name": "Paul Kelly", "id": PK}], "subscribers": "210K"},
+            {"resultType": "song", "videoId": "s1", "title": "To Her Door",
+             "artists": [{"name": "Paul Kelly", "id": PK}],
+             "album": {"name": "Under The Sun", "id": "MPREb_sun"}, "duration_seconds": 200},
+            {"resultType": "album", "browseId": "MPREb_seventy", "title": "Seventy",
+             "type": "Album", "artists": [{"name": "Paul Kelly", "id": PK}], "year": "2024"},
+            {"resultType": "video", "videoId": "x", "title": "To Her Door (Live)"},
+            # ytmusicapi 1.12 credits some rows' type label as the artist.
+            {"resultType": "song", "videoId": "s2", "title": "Dumb Things",
+             "artists": [{"name": "Song", "id": None}], "duration_seconds": 180},
+        ]
+        first = await discover.annotate_youtube(await catalog.search_youtube("Paul  Kelly"))
+        self.assertEqual([(a["name"], a["source"]) for a in first["artists"]],
+                         [("Paul Kelly", "library")])
+        self.assertEqual([(s["title"], s["artist"]) for s in first["songs"]],
+                         [("To Her Door", "Paul Kelly"), ("Dumb Things", None)])
+        self.assertEqual([(a["title"], a["in_library"]) for a in first["albums"]],
+                         [("Seventy", True)])
+        searches = sum(1 for c in self.fake.calls if c[0] == "search")
+        await catalog.search_youtube("paul kelly")
+        self.assertEqual(sum(1 for c in self.fake.calls if c[0] == "search"), searches)
+
+    async def test_artist_view_carries_discovers_side(self):
+        self.setup_artists()
+        await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)],
+                           "Hilltop Hoods/State Of The Art/01.opus")
+        await self.scan()
+        await discover.dismiss_releases(["MPREb_gossip"])
+        view = await catalog.artist_view(PK)
+        context = await discover.artist_context(view)
+        self.assertEqual((context["source"], context["tracks"]), ("library", 12))
+        flags = {r["title"]: (r["known"], r["dismissed"]) for r in view["releases"]}
+        self.assertEqual(flags["Gossip"], (True, True))
+        self.assertEqual(flags["Seventy"], (True, False))
+        recommended = await discover.artist_context(await catalog.artist_view(POWDERFINGER))
+        self.assertEqual(recommended["source"], "suggested")
+        self.assertEqual(set(recommended["because"]), {"Paul Kelly", "Hilltop Hoods"})
+
+    async def test_the_rail_lists_every_followed_artist(self):
+        self.setup_artists()
+        await self.library(*[f"Paul Kelly/Seventy/{i:02d}.m4a" for i in range(1, 13)])
+        await self.scan()
+        rail = {a["name"]: a for a in await discover.known_artists()}
+        self.assertEqual(rail["Paul Kelly"]["source"], "library")
+        self.assertEqual(rail["Paul Kelly"]["releases"], 3)
+        self.assertEqual(rail["Paul Kelly"]["missing"], 2)       # Seventy is here
+        self.assertEqual(rail["Powderfinger"]["source"], "suggested")
 
     async def test_a_release_that_appears_later_is_new(self):
         self.setup_artists()

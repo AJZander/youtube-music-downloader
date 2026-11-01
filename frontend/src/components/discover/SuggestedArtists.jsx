@@ -21,7 +21,7 @@ function recent(artist) {
 }
 
 /** Artists your artists' pages list as related, that the library lacks. */
-export default function SuggestedArtists({ status, onBrowseArtist }) {
+export default function SuggestedArtists({ status, onBrowseArtist, onChanged }) {
   const [artists, setArtists] = useState(null)
   const [error, setError] = useState(null)
   // Re-rank as the scan reads more pages — but not on every single one.
@@ -35,6 +35,7 @@ export default function SuggestedArtists({ status, onBrowseArtist }) {
     try {
       await api.discoverDismissArtist(a.channel_id, a.name)
       setArtists((list) => list.filter((x) => x.channel_id !== a.channel_id))
+      onChanged?.()
     } catch (e) {
       setError(e.message)
     }

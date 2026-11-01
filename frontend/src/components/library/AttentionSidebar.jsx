@@ -22,6 +22,7 @@ const DUPE_TAB = { dup_album: 'albums', dup_track: 'tracks', split_artist: 'arti
 function Group({ group, onApply, onReview, onResolve }) {
   const kind = KINDS[group.kind]
   const applyable = group.applyable ?? kind?.applyable
+  const open = group.count - (group.queued_count || 0)
   return (
     <Box sx={{
       px: 1, py: 0.75, borderLeft: 3, borderLeftColor: `${severityColor(group.severity)}.main`,
@@ -40,9 +41,17 @@ function Group({ group, onApply, onReview, onResolve }) {
       <Stack direction="row" spacing={0.5} sx={{ mt: 0.5 }}>
         {applyable && group.auto_count > 0 && (
           <Button size="small" variant="outlined" sx={{ py: 0, fontSize: '0.72rem' }}
-            onClick={() => onApply(group)}>
+            onClick={() => onApply(group, true)}>
             Apply all ({group.auto_count.toLocaleString()})
           </Button>
+        )}
+        {applyable && !group.auto_count && kind?.bulkAll && open > 0 && (
+          <Tooltip title={kind.help || ''} placement="left">
+            <Button size="small" variant="outlined" sx={{ py: 0, fontSize: '0.72rem' }}
+              onClick={() => onApply(group, false)}>
+              {group.action_label || 'Apply'} all ({open.toLocaleString()})
+            </Button>
+          </Tooltip>
         )}
         <Button size="small" sx={{ py: 0, fontSize: '0.72rem' }} onClick={() => onReview(group)}>
           Review
@@ -185,7 +194,7 @@ export default function AttentionSidebar({
           )}
           {groups.map((g) => (
             <Group key={g.kind} group={g}
-              onApply={(grp) => onApply(grp, scopedArtist)}
+              onApply={(grp, onlyAuto) => onApply(grp, scopedArtist, onlyAuto)}
               onReview={(grp) => onReview(grp, scopedArtist)}
               onResolve={(grp) => onResolveDupes(DUPE_TAB[grp.kind] || 'albums')} />
           ))}

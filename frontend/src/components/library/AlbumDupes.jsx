@@ -8,6 +8,7 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import ExpandLessIcon from '@mui/icons-material/ExpandLess'
 
 import { api } from '../../api.js'
+import { keepTextSelection, useShiftRange } from '../rangeSelect.js'
 import { HealthChips, QualityChip, bytes } from './shared.jsx'
 
 const PAGE = 25
@@ -16,7 +17,8 @@ function FileRow({ file, checked, onToggle }) {
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25 }}>
       {onToggle && (
-        <Checkbox size="small" checked={checked} onChange={onToggle} sx={{ p: 0.5 }} />
+        <Checkbox size="small" checked={checked} onMouseDown={keepTextSelection}
+          onChange={onToggle} sx={{ p: 0.5 }} />
       )}
       <Typography variant="caption" sx={{ width: 28, color: 'text.secondary' }}>
         {file.track_number ?? '–'}
@@ -42,13 +44,21 @@ function FileRow({ file, checked, onToggle }) {
 
 /** One physical album folder. Keeping is a checkbox, not a radio: three
  *  folders that share tracks are often three real compilations. */
-function Instance({ inst, isKeeper, onToggleKeep, canUnkeep, selected,
-                   onToggleFile, onToggleAll }) {
+function Instance({ inst, isKeeper, onToggleKeep, canUnkeep, selected, onToggleAll }) {
   const [open, setOpen] = useState(false)
   const removable = inst.covered || []
   const orphans = inst.orphans || []
   const allChecked = removable.length > 0 && removable.every((f) => selected.has(f.path))
   const pickedHere = removable.filter((f) => selected.has(f.path)).length
+  const fileRange = useShiftRange()
+
+  /** Tick or untick a file; with Shift, every file from the last one
+   *  clicked (in the order shown: the covered ones, then the rest). */
+  const toggleFile = (path, event) => {
+    const files = [...removable, ...orphans]
+    const ids = new Set(fileRange(files.map((f) => f.path), path, event))
+    onToggleAll(files.filter((f) => ids.has(f.path)), !selected.has(path))
+  }
 
   return (
     <Paper variant="outlined" sx={{
@@ -117,7 +127,7 @@ function Instance({ inst, isKeeper, onToggleKeep, canUnkeep, selected,
                     </Typography>} />
                   {removable.map((f) => (
                     <FileRow key={f.path} file={f} checked={selected.has(f.path)}
-                      onToggle={() => onToggleFile(f.path)} />
+                      onToggle={(e) => toggleFile(f.path, e)} />
                   ))}
                 </>
               )}
@@ -129,7 +139,7 @@ function Instance({ inst, isKeeper, onToggleKeep, canUnkeep, selected,
                   </Typography>
                   {orphans.map((f) => (
                     <FileRow key={f.path} file={f} checked={selected.has(f.path)}
-                      onToggle={() => onToggleFile(f.path)} />
+                      onToggle={(e) => toggleFile(f.path, e)} />
                   ))}
                 </Box>
               )}
@@ -177,11 +187,6 @@ export function AlbumDupeGroup({ group, onResolved }) {
     } catch (e) { setError(e.message) } finally { setBusy(false) }
   }
 
-  const toggleFile = (path) => setSelected((prev) => {
-    const next = new Set(prev)
-    if (next.has(path)) next.delete(path); else next.add(path)
-    return next
-  })
   const toggleAll = (files, on) => setSelected((prev) => {
     const next = new Set(prev)
     files.forEach((f) => (on ? next.add(f.path) : next.delete(f.path)))
@@ -262,7 +267,7 @@ export function AlbumDupeGroup({ group, onResolved }) {
           isKeeper={keepers.has(inst.dirpath)}
           canUnkeep={keepers.size > 1}
           onToggleKeep={toggleKeep}
-          selected={selected} onToggleFile={toggleFile} onToggleAll={toggleAll} />
+          selected={selected} onToggleAll={toggleAll} />
       ))}
 
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1, flexWrap: 'wrap' }}>

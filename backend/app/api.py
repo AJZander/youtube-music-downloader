@@ -423,22 +423,6 @@ async def resolve_track(track_id: str, body: ResolveIn):
 
 
 # ------------------------------------------------------------------ search / browse
-@router.get("/search")
-async def search(q: str):
-    try:
-        results = await catalog.call("search", q, filter="songs", limit=10)
-    except catalog.CatalogError as exc:
-        raise HTTPException(exc.status, f"search failed: {exc}")
-    return [{
-        "video_id": r.get("videoId"),
-        "title": r.get("title"),
-        "artists": ", ".join(a.get("name", "") for a in (r.get("artists") or [])),
-        "album": (r.get("album") or {}).get("name") if isinstance(r.get("album"), dict) else None,
-        "duration": r.get("duration"),
-        "url": f"https://music.youtube.com/watch?v={r.get('videoId')}",
-    } for r in results if r.get("videoId")]
-
-
 @router.get("/spotify/resolve")
 async def spotify_resolve(url: str):
     """Preview a Spotify URL's contents before queueing."""
@@ -515,6 +499,7 @@ async def catalog_artist(ref: str, refresh: bool = False):
         tuple(ACTIVE_JOB_STATUSES))}
     for release in view["releases"]:
         release["queued"] = release["url"] in waiting
+    view["discover"] = await discover.artist_context(view)
     return view
 
 
@@ -643,6 +628,30 @@ async def discover_releases(years: int = Query(2, ge=0, le=100), source: str | N
     for release in page["releases"]:
         release["queued"] = release["url"] in waiting
     return {**page, "status": await discover.status()}
+
+
+@router.get("/discover/known-artists")
+async def discover_known_artists():
+    """Every artist Discover follows, with what each has to find — the rail."""
+    return {"artists": await discover.known_artists()}
+
+
+@router.get("/discover/search")
+async def discover_search(q: str = Query(..., min_length=1)):
+    """Search what Discover already knows: releases and loaded tracklists.
+    Instant; YouTube Music is not asked (see /discover/search/youtube)."""
+    return await discover.search_local(q)
+
+
+@router.get("/discover/search/youtube")
+async def discover_search_youtube(q: str, kind: str = "all"):
+    """Search YouTube Music — `all` for a few of each kind in one request,
+    or artists / songs / albums for more of one. Cached for a week."""
+    try:
+        found = await catalog.search_youtube(q, kind)
+    except catalog.CatalogError as exc:
+        raise HTTPException(exc.status, str(exc))
+    return await discover.annotate_youtube(found)
 
 
 @router.get("/discover/releases/artists")

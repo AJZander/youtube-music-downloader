@@ -35,13 +35,13 @@ UNRESOLVED_RETRY = 30 * 86400
 PENDING_RETRY = 86400
 IMPORT_SETTLE = 150      # seconds after the last import before checking
 CHECK_CONCURRENCY = 3
-# Albums whose file changes share one Plex rescan: a scan costs most of a
-# minute however little it looks at, the file changes a second or two.
-APPLY_CHUNK = 100
-MOVE_KINDS = frozenset({"move"})
 # Bumped when what an album *should* look like changes (naming, release
 # choice, what is flagged), so the next pass re-plans everything.
-RULES_VERSION = 4
+# 9: damaged files are their own issue, a box set's albums stay in the set,
+# another album of the same name gets its own folder, matches are triaged
+# 10: a single beside its album takes "[Single]" whichever came first, and
+# one album under two release groups is a copy, not "[12 Tracks]"
+RULES_VERSION = 10
 
 
 class Cancelled(Exception):
@@ -59,6 +59,12 @@ class Runner:
         self.run: dict | None = None
         self._requested: dict | None = None       # {"kind", "report_only"}
         self._apply_queue: list[list[int]] = []
+        # the user's calls on albums ("accept the match", "not on
+        # MusicBrainz"), made between fixes: [(issue ids, decision)]
+        self._decisions: list[tuple[list[int], str]] = []
+        # follow-up fixes queued straight after an apply, by issue: two fixes
+        # that undo each other would otherwise take turns forever
+        self._followed: dict[int, int] = {}
         self._imports: dict[str, float] = {}
         self._last_cycle = 0.0
         self._last_publish = 0.0
@@ -70,10 +76,16 @@ class Runner:
         self._apply_task: asyncio.Task | None = None
         self._apply_wake = asyncio.Event()
         self.applying: str | None = None
+        self.apply_note: str | None = None
+        # albums whose files are done and whose Plex side waits for the rescan
+        self._plex_due: dict[str, dict] = {}
+        self._plex_later: list[tuple[tuple, list[dict]]] = []     # artists, ghosts
         self._key_locks: dict[str, asyncio.Lock] = {}
+        self._started_at = utcnow()
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
+        self._started_at = utcnow()
         if settings.metadata_enabled and self.task is None:
             self.task = asyncio.create_task(self._loop(), name="metadata-runner")
             self._apply_task = asyncio.create_task(self._apply_loop(), name="metadata-apply")
@@ -152,6 +164,34 @@ class Runner:
             await self.publish(force=True)
         return len(chosen)
 
+    DECISIONS = {"accept_match": ("review_match",),
+                 "no_release": ("review_match", "unresolved")}
+
+    async def request_decide(self, ids: list[int], decision: str) -> int:
+        """Queue a call the user made on these issues' albums: accept the
+        best match, or "MusicBrainz has no release for this". Each album is
+        then checked again, and its fixes follow like any other check's."""
+        kinds = self.DECISIONS[decision]
+        if not ids:
+            return 0
+        chosen = []
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            chosen += [r["id"] for r in await db.fetchall(
+                f"SELECT id FROM md_issues WHERE id IN ({','.join('?' * len(chunk))}) "
+                f"AND state IN ('open', 'failed') AND kind IN ({','.join('?' * len(kinds))})",
+                (*chunk, *kinds))]
+        for i in range(0, len(chosen), 400):
+            chunk = chosen[i:i + 400]
+            await db.execute(
+                f"UPDATE md_issues SET state = 'queued', updated_at = ? "
+                f"WHERE id IN ({','.join('?' * len(chunk))})", (utcnow(), *chunk))
+        if chosen:
+            self._decisions.append((chosen, decision))
+            self._apply_wake.set()
+            await self.publish(force=True)
+        return len(chosen)
+
     async def note_import(self, library_path: str) -> None:
         folder = units.unit_dir(library_path.rsplit("/", 1)[0])
         self._imports[folder] = time.time()
@@ -183,13 +223,13 @@ class Runner:
             rate = run["done"] / elapsed if elapsed > 10 and run["done"] else None
             run["eta_sec"] = int((run["total"] - run["done"]) / rate) if rate else None
         phase = self.phase
-        if phase == "idle" and self.applying:
+        if phase == "idle" and (self.applying or self.apply_note):
             phase = "applying"
         return {
             "enabled": settings.metadata_enabled,
             "running": self.run is not None or phase not in ("idle", "waiting"),
             "paused": self.paused, "phase": phase, "current": self.current,
-            "applying": self.applying,
+            "applying": self.applying, "apply_note": self.apply_note,
             "run": run, "last_run": _run_out(last) if last else None,
             "auto_apply": await self.auto_apply(),
             "interval_min": settings.metadata_interval_min,
@@ -218,11 +258,36 @@ class Runner:
         bus.publish("library.issues", {"open": sum(by_kind.values()), "by_kind": by_kind})
 
     # ------------------------------------------------------------ loop
+    async def _resume_queue(self) -> None:
+        """The apply queue lives in memory: after a restart, carry on with the
+        fixes it held, or, with auto-apply now off, leave them open. Only
+        what was queued before this start: anything asked for since is in
+        the queue already."""
+        before = self._started_at
+        # a decision queued before the restart is asked for again
+        await db.execute("UPDATE md_issues SET state = 'open' WHERE state = 'queued' "
+                         "AND updated_at < ? AND kind IN ('review_match', 'unresolved')", (before,))
+        left = [r["id"] for r in await db.fetchall(
+            "SELECT id FROM md_issues WHERE state = 'queued' AND updated_at < ?", (before,))]
+        if left and await self.auto_apply():
+            log.info("carrying on with %d fixes queued before the restart", len(left))
+            self._apply_queue.append(left)
+            self._apply_wake.set()
+        elif left:
+            await db.execute("UPDATE md_issues SET state = 'open' WHERE state = 'queued' "
+                             "AND updated_at < ?", (before,))
+
     async def _loop(self) -> None:
+        # what a restart cut off, first: before anything new is queued
+        try:
+            back = await apply.restore_hidden()
+            if back:
+                log.info("put back %d files a Plex re-add had hidden before the restart", back)
+        except Exception:
+            log.exception("putting back hidden files failed")
+        await self._resume_queue()
         await asyncio.sleep(60)      # let startup, crash recovery and the worker go first
         await db.execute("UPDATE md_runs SET status = 'interrupted' WHERE status = 'running'")
-        # the apply queue lives in memory: what a restart cut off is open again
-        await db.execute("UPDATE md_issues SET state = 'open' WHERE state = 'queued'")
         await _rules_changed()
         interval = max(5, settings.metadata_interval_min) * 60
         self._last_cycle = time.time() - interval + 120
@@ -436,6 +501,24 @@ class Runner:
             if auto and auto_ids:
                 await self.request_apply(auto_ids)
             await self.publish()
+        # 6. albums held in more than one folder (library-wide, from the plans),
+        # and missing tracks asked for while YouTube Music couldn't be asked
+        if kind != "single":
+            from . import missing
+            try:
+                wanted = await missing.wanted_downloads()
+                if wanted:
+                    log.info("asking YouTube Music again for %d albums' missing tracks",
+                             len(wanted))
+                    await self.request_apply(wanted)
+            except Exception:
+                log.exception("retrying wanted downloads failed")
+            try:
+                await issues.save(await issues.plan_album_copies(), scope_kinds=("album_copies",),
+                                  all_scope=True)
+            except Exception:
+                log.exception("album copies check failed")
+            await self.publish_issues()
         if auto:
             ghosts = await db.fetchall("SELECT id FROM md_issues WHERE kind = 'plex_ghost' "
                                        "AND state = 'open' AND auto = 1")
@@ -477,19 +560,29 @@ class Runner:
         plex_info = await plexsync.album_for_paths([r["path"] for r in rows])
         plex_album = (plex_info or {}).get("album")
         plex_artist = (plex_info or {}).get("artist")
+        # an album Plex shares with other albums' tracks carries their match
+        # and genres: no hints from it
+        hint_album, hint_artist = ((None, None) if plexsync.shares_album(plex_info, rows)
+                                   else (plex_album, plex_artist))
         manual = manual_release or (record["release_mbid"] if record["manual"] else None)
-        try:
-            res = await resolve(rows, plex_mbid=(plex_album or {}).get("mbid"), manual=manual)
-        except mb.MusicBrainzError as exc:
-            res = Resolution(status="pending", error=str(exc))
+        no_release = bool(record["no_release"]) and not manual_release
+        if no_release:
+            # the user says MusicBrainz has none: not looked up again
+            res = Resolution(status="unresolved", error="Not on MusicBrainz (your call)")
+        else:
+            try:
+                res = await resolve(rows, plex_mbid=(hint_album or {}).get("mbid"), manual=manual)
+            except mb.MusicBrainzError as exc:
+                res = Resolution(status="pending", error=str(exc))
         want = None
         if res.release is not None and res.status in ("resolved", "review"):
             overrides = await desired_mod.overrides_for("album", key)
-            want = await desired_mod.build_album(rows, res, plex_album=plex_album,
-                                                 plex_artist=plex_artist, overrides=overrides)
+            want = await desired_mod.build_album(rows, res, plex_album=hint_album,
+                                                 plex_artist=hint_artist, overrides=overrides)
         plan = await issues.plan_unit(
             key, rows, want if res.status == "resolved" else None, res, plex_info,
-            plex_synced=bool(await plexsync.last_sync()), ours_locked=apply.ours_locked)
+            plex_synced=bool(await plexsync.last_sync()), ours_locked=apply.ours_locked,
+            no_release=no_release)
         await issues.save(plan, scope_kinds=issues.UNIT_KINDS, album_key=key)
         now = time.time()
         if res.status == "resolved":
@@ -502,13 +595,14 @@ class Runner:
             "UPDATE md_albums SET release_mbid = ?, releasegroup_mbid = ?, artist_mbid = ?, "
             "confidence = ?, source = ?, status = ?, manual = ?, desired = ?, candidates = ?, "
             "plex_key = ?, file_sig = ?, plex_sig = ?, checked_at = ?, next_check = ?, "
-            "priority = 0, error = ? WHERE key = ?",
+            "priority = 0, error = ?, no_release = ? WHERE key = ?",
             ((res.release or {}).get("id"),
              (want or {}).get("releasegroup_mbid"), (want or {}).get("albumartist_mbid"),
              res.score, res.source, res.status, int(bool(manual)),
              json.dumps(want) if want else None, json.dumps(res.candidates),
              (plex_album or {}).get("rating_key"), units.signature(rows),
-             str((plex_album or {}).get("updated_at") or ""), now, next_check, res.error, key))
+             str((plex_album or {}).get("updated_at") or ""), now, next_check, res.error,
+             int(no_release), key))
         # the release's missing tracks, across all of its folders (and the
         # release this album was identified as before, if that changed)
         from . import missing
@@ -561,35 +655,95 @@ class Runner:
 
     # ------------------------------------------------------------ applying
     async def _apply_loop(self) -> None:
-        """Run queued fixes as they come. Everything queued by the time a
-        batch starts is taken together, so fixes clicked one at a time for the
-        same album (tags, then move, then genres) run as one apply, in order,
-        with one Plex rescan."""
+        """Run queued fixes in three passes, however many there are:
+
+        1. every album's file changes (tags, numbers, moves), as they are
+           queued; fixes queued meanwhile join this pass;
+        2. once no file work is left, one Plex rescan of everything that
+           changed, waited out, and one refresh of the Plex mirror;
+        3. every album's Plex changes, from a plan made after the rescan.
+
+        Plex is never waited for album by album: a rescan costs most of a
+        minute however little it looks at, a file change a second or two."""
         while True:
             try:
+                if self._decisions:
+                    batch, self._decisions = self._decisions, []
+                    await self._decide(batch)
+                    continue
                 if self._apply_queue:
                     ids = sorted({i for batch in self._apply_queue for i in batch})
                     self._apply_queue.clear()
-                    outcome = await self.apply_ids(ids)
-                    if self.run is not None:
-                        self.run["counts"]["applied"] += outcome["applied"]
-                        self.run["counts"]["failed"] += outcome["failed"]
+                    self._count(*await self._files_pass(ids))
+                    continue
+                if self._plex_due or self._plex_later:
+                    self._count(*await self._plex_pass())
                     continue
                 self._apply_wake.clear()
                 await self._apply_wake.wait()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("apply batch failed")
+                log.exception("apply pass failed")
             finally:
-                if not self._apply_queue and self.applying:
-                    self.applying = None
+                if not self._apply_queue and not self._plex_due and not self._plex_later \
+                        and not self._decisions and (self.applying or self.apply_note):
+                    self.applying = self.apply_note = None
                     await self.publish(force=True)
 
-    async def apply_ids(self, ids: list[int]) -> dict:
-        """Apply issues, grouped by album (or artist), in dependency order."""
-        if not ids:
-            return {"applied": 0, "failed": 0}
+    async def _decide(self, batch: list[tuple[list[int], str]]) -> None:
+        """The user's calls, album by album: set what they decided, check the
+        album again, and queue the fixes the new plan has (auto-apply on)."""
+        auto = await self.auto_apply()
+        todo = [(i, decision) for ids, decision in batch for i in ids]
+        follow: list[int] = []
+        for n, (issue_id, decision) in enumerate(todo, start=1):
+            row = await db.fetchone("SELECT * FROM md_issues WHERE id = ?", (issue_id,))
+            if row is None or row["state"] != "queued":
+                continue
+            issue = issues.issue_out(row)
+            self.applying = issue["album_key"] or issue["artist_dir"]
+            self.apply_note = f"{'accepting matches' if decision == 'accept_match' else 'marking not on MusicBrainz'} ({n:,} of {len(todo):,})"
+            await self.publish()
+            try:
+                follow += await self._decide_one(issue, decision)
+                await self._mark(issue, "applied")
+            except Exception as exc:
+                log.info("%s for %s failed: %s", decision, issue["key"], exc)
+                await self._mark(issue, "failed", str(exc)[:300])
+            if auto and len(follow) >= 200:
+                await self.request_apply(follow)
+                follow = []
+        if auto and follow:
+            await self.request_apply(follow)
+        await self.publish_issues()
+
+    async def _decide_one(self, issue: dict, decision: str) -> list[int]:
+        key = issue["album_key"]
+        if decision == "accept_match":
+            best = next((c for c in issue["detail"].get("candidates") or [] if c.get("selected")),
+                        None) or (issue["detail"].get("candidates") or [None])[0]
+            if not best or not best.get("release_mbid"):
+                raise apply.ApplyError("no candidate release to accept")
+            await db.execute("UPDATE md_albums SET manual = 1, no_release = 0, release_mbid = ? "
+                             "WHERE key = ?", (best["release_mbid"], key))
+            result = await self.check_unit(key, manual_release=best["release_mbid"])
+        else:
+            await db.execute("UPDATE md_albums SET no_release = 1, manual = 0 WHERE key = ?",
+                             (key,))
+            result = await self.check_unit(key)
+        bus.publish("library.changed", {"album_keys": [key], "artist_dirs": [issue["artist_dir"]]
+                                        if issue["artist_dir"] else []})
+        return result.get("auto_ids") or []
+
+    def _count(self, applied: int, failed: int) -> None:
+        if self.run is not None:
+            self.run["counts"]["applied"] += applied
+            self.run["counts"]["failed"] += failed
+
+    async def _files_pass(self, ids: list[int]) -> tuple[int, int]:
+        """Pass 1: the file changes of these fixes, album by album. Each
+        album's Plex side is kept for pass 3."""
         rows = [issues.issue_out(r) for r in await db.fetchall(
             f"SELECT * FROM md_issues WHERE id IN ({','.join('?' * len(ids))})", tuple(ids))]
         groups: dict[tuple, list[dict]] = {}
@@ -601,26 +755,159 @@ class Runner:
             else:
                 groups.setdefault(("album", issue["album_key"]), []).append(issue)
         applied = failed = 0
-        albums = [(ref, members) for (scope, ref), members in groups.items() if scope == "album"]
-        for i in range(0, len(albums), APPLY_CHUNK):
-            a, f = await self._apply_albums(albums[i:i + APPLY_CHUNK])
+        rescan: set[str] = set()       # artist folders albums moved out of or into
+        current = None
+        # artist by artist, so each artist's folder is rescanned once its albums are done
+        for (scope, ref), members in sorted(groups.items(), key=lambda g: (g[0][0], g[0][1] or "")):
+            if scope != "album":
+                self._plex_later.append(((scope, ref), members))
+                continue
+            artist = ref.split("/", 1)[0]
+            if rescan and artist != current:
+                await self._rescan(rescan)
+            current = artist
+            self.applying = ref
+            self.apply_note = (f"changing files ({len(self._plex_due):,} albums done): {ref}")
+            await self.publish()
+            # merging copies changes their folders too: hold them all
+            keys = sorted({ref} | {k for i in members if i["kind"] == "album_copies"
+                                   for k in (i["detail"].get("copies") or [])})
+            try:
+                async with contextlib.AsyncExitStack() as held:
+                    for k in keys:
+                        await held.enter_async_context(self._lock(k))
+                    a, f, state = await self._start_album(ref, members)
+                    if state:
+                        b, g = await self._apply_simple(state["files"], state["ctx"],
+                                                        apply.FILE_STAGE)
+                        a, f = a + b, f + g
+            except Exception:
+                log.exception("applying %s failed", ref)
+                continue
             applied += a
             failed += f
-        for (scope, ref), members in groups.items():
-            if scope == "album":
+            if state:
+                self._keep_for_plex(state)
+                if state["ctx"].moved:
+                    rescan |= {p.split("/", 1)[0] for p in state["ctx"].moved}
+                    rescan.add(state["ctx"].artist_dir or "")
+        if rescan:
+            await self._rescan(rescan)
+        return applied, failed
+
+    async def _rescan(self, folders: set[str]) -> None:
+        try:
+            await apply.scan_artists(folders)
+        except Exception as exc:
+            log.info("plex rescan of %s failed: %s", sorted(folders), exc)
+        folders.clear()
+
+    def _keep_for_plex(self, state: dict) -> None:
+        """Remember an album for pass 3 (one entry per album, however many
+        times its fixes were queued)."""
+        key = state["ctx"].key
+        held = self._plex_due.get(key)
+        if held is None:
+            self._plex_due[key] = state
+            return
+        held["plex_stage"] += state["plex_stage"]
+        held["ctx"].plex_dirty |= state["ctx"].plex_dirty
+        held["ctx"].touched_folders |= state["ctx"].touched_folders
+        held["ctx"].new_folders |= state["ctx"].new_folders
+        held["ctx"].moved.update(state["ctx"].moved)
+        held["ctx"].batches += state["ctx"].batches
+
+    async def _plex_pass(self) -> tuple[int, int]:
+        """Passes 2 and 3: one Plex rescan for everything pass 1 changed,
+        then each album's Plex changes, then artists'."""
+        due, self._plex_due = list(self._plex_due.values()), {}
+        later, self._plex_later = self._plex_later, []
+        dirty = [state["ctx"] for state in due if state["ctx"].plex_dirty]
+        if dirty:
+            self.applying = None
+            self.apply_note = f"waiting for Plex to rescan {len(dirty):,} changed albums"
+            await self.publish(force=True)
+            try:
+                await apply.plex_catch_up(*dirty)
+            except Exception as exc:
+                log.info("plex catch-up after %d albums failed: %s", len(dirty), exc)
+        applied = failed = 0
+        for n, state in enumerate(due, start=1):
+            self.applying = state["ctx"].key
+            self.apply_note = f"updating Plex ({n:,} of {len(due):,} albums): {state['ctx'].key}"
+            await self.publish()
+            try:
+                async with self._lock(state["ctx"].key):
+                    a, f = await self._apply_plex(state)
+            except Exception:
+                log.exception("plex changes for %s failed", state["ctx"].key)
+                continue
+            applied += a
+            failed += f
+        ghosts = [issue for (scope, _ref), members in later if scope == "ghost" for issue in members]
+        for (scope, ref), members in later:
+            if scope != "artist":
                 continue
             self.applying = ref
-            await self.publish(force=True)
-            if scope == "artist":
+            self.apply_note = None
+            await self.publish()
+            try:
                 a, f = await self._apply_artist(ref, members)
-            else:
-                a, f = await self._apply_simple(members, apply.Ctx(ref, [], None, None))
-                await issues.save(await issues.plan_ghosts(), scope_kinds=("plex_ghost",),
-                                  all_scope=True)
+            except Exception:
+                log.exception("applying %s failed", ref)
+                continue
             applied += a
             failed += f
+        if ghosts:
+            # old Plex entries, in one go: one rescan, one emptying of the
+            # trash. Plex often drops them itself first (when a long scan of
+            # its own finishes), so look again: only what is left costs a scan.
+            self.applying = None
+            self.apply_note = "checking which old Plex entries are still there"
+            await self.publish(force=True)
+            try:
+                await plexsync.sync()
+                still = {i["key"]: i for i in await issues.plan_ghosts()}
+                left = [still[g["key"]] for g in ghosts if g["key"] in still]
+                log.info("old Plex entries: %d of %d folders still have them",
+                         len(left), len(ghosts))
+                if left:
+                    self.apply_note = f"clearing old Plex entries from {len(left):,} folders"
+                    await self.publish(force=True)
+                    await apply.clean_ghosts(left)
+                for issue in ghosts:
+                    await self._mark(issue, "applied")
+                applied += len(ghosts)
+            except Exception as exc:
+                log.info("clearing old Plex entries failed: %s", exc)
+                for issue in ghosts:
+                    await self._mark(issue, "failed", str(exc)[:300])
+                failed += len(ghosts)
+            await issues.save(await issues.plan_ghosts(), scope_kinds=("plex_ghost",),
+                              all_scope=True)
         await self.publish_issues()
-        return {"applied": applied, "failed": failed}
+        return applied, failed
+
+    async def _start_album(self, key: str, members: list[dict]) -> tuple[int, int, dict | None]:
+        """Load an album for applying, and queue its downloads."""
+        record = await db.fetchone("SELECT * FROM md_albums WHERE key = ?", (key,))
+        rows = await units.load_unit(key)
+        if not rows or record is None:
+            # moved or merged away (a singles-folder track filed into its
+            # album): nothing left to fix, so the fix closes, not fails
+            for issue in members:
+                await self._mark(issue, "applied", None)
+            log.info("%s: the album is no longer there; closed %d fixes", key, len(members))
+            return 0, 0, None
+        want = (json.loads(record["desired"])
+                if record["desired"] and record["status"] == "resolved" else None)
+        ctx = apply.Ctx(key, rows, want, rows[0].get("artist_dir"))
+        state = {"key": key, "ctx": ctx, "old_artist": ctx.artist_dir,
+                 "files": [i for i in members if i["kind"] in apply.FILE_STAGE],
+                 "plex_stage": [i for i in members if i["kind"] in apply.PLEX_STAGE]}
+        queue_stage = [i for i in members if i["kind"] in apply.QUEUE_STAGE]
+        applied, failed = await self._apply_simple(queue_stage, ctx, apply.QUEUE_STAGE)
+        return applied, failed, state
 
     async def _mark(self, issue: dict, state: str, error: str | None = None) -> None:
         await db.execute("UPDATE md_issues SET state = ?, error = ?, updated_at = ? WHERE id = ?",
@@ -651,67 +938,6 @@ class Runner:
                 failed += 1
         return applied, failed
 
-    async def _apply_albums(self, batch: list[tuple[str, list[dict]]]) -> tuple[int, int]:
-        """Apply a batch of albums in rounds, one Plex rescan after each:
-        every album's moves, then every album's tag writes, then every
-        album's Plex changes. Plex follows a moved file to its new place,
-        play history and all, only while the file is unchanged, so a file is
-        never moved and re-tagged before Plex has seen the move."""
-        applied = failed = 0
-        async with contextlib.AsyncExitStack() as stack:
-            for key in sorted({key for key, _ in batch}):
-                await stack.enter_async_context(self._lock(key))
-            started = []
-            for key, members in batch:
-                self.applying = key
-                await self.publish(force=True)
-                a, f, state = await self._start_album(key, members)
-                applied += a
-                failed += f
-                if state:
-                    started.append(state)
-            for kinds in (MOVE_KINDS, None):
-                for state in started:
-                    todo = [i for i in state["files"]
-                            if (i["kind"] in MOVE_KINDS) == (kinds is not None)]
-                    if todo:
-                        self.applying = state["ctx"].key
-                        await self.publish(force=True)
-                        a, f = await self._apply_simple(todo, state["ctx"], apply.FILE_STAGE)
-                        applied += a
-                        failed += f
-                dirty = [state["ctx"] for state in started if state["ctx"].plex_dirty]
-                if dirty:
-                    try:
-                        await apply.plex_catch_up(*dirty)
-                    except Exception as exc:
-                        log.info("plex catch-up after %d albums failed: %s", len(dirty), exc)
-            for state in started:
-                self.applying = state["ctx"].key
-                await self.publish(force=True)
-                a, f = await self._apply_plex(state)
-                applied += a
-                failed += f
-        return applied, failed
-
-    async def _start_album(self, key: str, members: list[dict]) -> tuple[int, int, dict | None]:
-        """Load an album for applying, and queue its downloads."""
-        record = await db.fetchone("SELECT * FROM md_albums WHERE key = ?", (key,))
-        rows = await units.load_unit(key)
-        if not rows or record is None:
-            for issue in members:
-                await self._mark(issue, "failed", "the album is no longer there")
-            return 0, len(members), None
-        want = (json.loads(record["desired"])
-                if record["desired"] and record["status"] == "resolved" else None)
-        ctx = apply.Ctx(key, rows, want, rows[0].get("artist_dir"))
-        state = {"key": key, "ctx": ctx, "old_artist": ctx.artist_dir,
-                 "files": [i for i in members if i["kind"] in apply.FILE_STAGE],
-                 "plex_stage": [i for i in members if i["kind"] in apply.PLEX_STAGE]}
-        queue_stage = [i for i in members if i["kind"] in apply.QUEUE_STAGE]
-        applied, failed = await self._apply_simple(queue_stage, ctx, apply.QUEUE_STAGE)
-        return applied, failed, state
-
     async def _apply_plex(self, state: dict) -> tuple[int, int]:
         key, ctx, plex_stage = state["key"], state["ctx"], state["plex_stage"]
         applied = failed = 0
@@ -732,7 +958,18 @@ class Runner:
             for issue in plex_stage:
                 if issue["album_key"] != ctx.key:
                     await self._mark(issue, "applied")    # planned again, and applied, under the new key
-        await self._check_unit(ctx.key)
+        result = await self._check_unit(ctx.key)
+        # What the files' changes made due (a moved album's genres, tags of
+        # tracks just filed in) follows now rather than at the next check —
+        # but never a fix this pass just ran, or one that won't stay fixed
+        # would run round and round.
+        ran = {i["id"] for i in state["files"] + state["plex_stage"]}
+        follow = [i for i in result.get("auto_ids") or []
+                  if i not in ran and self._followed.get(i, 0) < 2]
+        if follow and await self.auto_apply():
+            for i in follow:
+                self._followed[i] = self._followed.get(i, 0) + 1
+            await self.request_apply(follow)
         bus.publish("library.changed", {
             "album_keys": sorted({key, ctx.key}),
             "artist_dirs": sorted({d for d in (state["old_artist"], ctx.artist_dir) if d}),
@@ -791,7 +1028,13 @@ async def _rules_changed() -> None:
 
 
 async def _scan_library() -> None:
-    """An incremental library scan (a stat per file, a read per changed one)."""
+    """An incremental library scan (a stat per file, a read per changed one).
+    Not while a Plex re-add has files hidden: the scan would forget them."""
+    async with apply.SCAN_HOLD:
+        await _scan_library_now()
+
+
+async def _scan_library_now() -> None:
     while library.scan_state.running:
         await asyncio.sleep(5)
     last = 0.0

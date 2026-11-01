@@ -15,10 +15,6 @@ export const categoryLabel = (key) => CATEGORY[key]?.one || key
 
 export const isSingleFamily = (r) => r.category === 'ep' || r.category === 'single'
 
-/** A reference the server can open directly, rather than a name to search. */
-export const looksLikeArtistRef = (v) =>
-  /^https?:\/\//i.test(v) || v.startsWith('@') || /^UC[\w-]{22}$/.test(v)
-
 export function trackTime(seconds) {
   if (!seconds) return ''
   const s = Math.round(seconds)

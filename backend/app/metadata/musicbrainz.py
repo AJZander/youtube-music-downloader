@@ -144,6 +144,14 @@ async def artist(mbid: str) -> dict | None:
                             ttl=ARTIST_TTL, cache_key=f"mb:artist:{mbid}")
 
 
+async def artist_aliases(mbid: str) -> list[dict]:
+    """An artist's other names (an old name, a full name), not search hints."""
+    data = await client.get(f"artist/{mbid}", {"inc": "aliases"}, ttl=ARTIST_TTL,
+                            cache_key=f"mb:artist-aliases:{mbid}")
+    return [a for a in (data or {}).get("aliases") or []
+            if a.get("name") and (a.get("type") or "") != "Search hint"]
+
+
 async def isrc_releases(isrc: str) -> list[str]:
     data = await client.get(f"isrc/{isrc}", {"inc": "releases"}, ttl=ISRC_TTL,
                             cache_key=f"mb:isrc:{isrc}")

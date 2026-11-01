@@ -3,6 +3,7 @@
 The tag tests write real files (generated with ffmpeg), because the whole
 point of tagio is what lands in each container."""
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -21,9 +22,12 @@ from app.metadata import desired, issues, resolver, seed, units
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None
 
 
+@contextlib.contextmanager
 def as_spelled():
     """build_album without a library index: folders are taken as spelled."""
-    return mock.patch.object(desired, "on_disk", mock.AsyncMock(side_effect=lambda f, *_: f))
+    with mock.patch.object(desired, "on_disk", mock.AsyncMock(side_effect=lambda f, *_: f)), \
+            mock.patch.object(desired, "_existing_artists", mock.AsyncMock(return_value={})):
+        yield
 
 
 def make_audio(path: Path, seconds: float = 2.0) -> Path:
@@ -375,6 +379,24 @@ class DesiredTestCase(unittest.TestCase):
         rel = release(date="1969", disambiguation="mono, one EMI box", rg_date="1963-03-22")
         self.assertEqual(desired.edition_of(rel, "1963"), ("1969 Reissue", None))
 
+    def test_pressing_and_store_notes_stay_out_of_an_edition(self):
+        cases = [
+            ("2020-04-01", "20th anniversary reissue, translucent yellow", "2020 20th Anniversary Reissue"),
+            ("2023-01-01", "re-release with Ultra catalog number", "2023 Re-release"),
+            ("2016-01-01", "16 Bit - 44.1 kHz remastered deluxe edition", "2016 Remastered Deluxe Edition"),
+            ("1999-01-01", "1999 24 bit digitally remastered; matrix, runout: 5219100 . 1 :2:1 EMI SWINDON",
+             "1999 Digitally Remastered"),
+            ("2010-01-01", "expanded edition - explicit, Deezer", "2010 Expanded Edition"),
+            ("2010-01-01", "2001 remaster", "2001 Remaster"),     # a later pressing of it
+        ]
+        for date, dis, want in cases:
+            rel = release(date=date, disambiguation=dis, rg_date="1990-01-01")
+            self.assertEqual(desired.edition_of(rel, "1990")[0], want, dis)
+
+    def test_a_note_that_only_looks_like_a_variant_is_not_one(self):
+        rel = release(disambiguation="No specialty 'S' logo in matrix")
+        self.assertEqual(desired.edition_of(rel, "2001"), (None, None))
+
     def test_an_edition_the_title_already_carries_is_not_repeated(self):
         self.assertTrue(desired._said_in("2021 20th Anniversary, Deluxe",
                                          "The Better Life (20th anniversary deluxe)"))
@@ -397,11 +419,14 @@ class DesiredTestCase(unittest.TestCase):
         self.assertTrue(aa["various"])
         self.assertEqual(aa["name"], "Various Artists")
 
-    def test_the_album_artist_is_named_as_credited(self):
-        rel = release(artist="Kanye West")
-        rel["artist-credit"][0]["artist"] = {"id": "ye", "name": "Ye", "sort-name": "Ye"}
+    def test_the_album_artist_is_musicbrainzs_name_for_the_artist(self):
+        rel = release(artist="Eskimo Callboy")
+        rel["artist-credit"][0]["artist"] = {"id": "ec", "name": "Electric Callboy",
+                                             "sort-name": "Electric Callboy"}
         aa = desired.album_artist_of(rel)
-        self.assertEqual((aa["name"], aa["sort"], aa["mbid"]), ("Kanye West", "Kanye West", "ye"))
+        self.assertEqual((aa["name"], aa["sort"], aa["mbid"], aa["credited"]),
+                         ("Electric Callboy", "Electric Callboy", "ec", "Eskimo Callboy"))
+        self.assertEqual(aa["credit"], "Eskimo Callboy")       # the tracks keep the credit
 
     def test_a_spelling_of_the_artists_name_is_written_as_listed(self):
         rel = release(artist="Art vs Science")
@@ -471,6 +496,24 @@ class DesiredTestCase(unittest.TestCase):
         self.assertEqual(want["genres"], ["Boy Band"])
         self.assertEqual(want["genre_source"], "override")
 
+    def test_a_release_without_a_date_keeps_the_first_releases(self):
+        # the index reads the year from originaldate when a file has no date,
+        # so planning "no date" would come back after every apply
+        rows = [file_row("A/B/a.flac", "Pop", track=1, originaldate="2001-07-24")]
+        rel = release(date=None, rg_date="2001-07-24")
+        score, mapping = resolver.score_release(rows, rel)
+        res = resolver.Resolution(status="resolved", release=rel, score=score, track_map=mapping)
+        with mock.patch.object(desired.mb, "release_group", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(desired.lastfm, "album_tags", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(desired.lastfm, "artist_tags", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(desired.mb, "artist", mock.AsyncMock(return_value={})), \
+                as_spelled():
+            want = asyncio.run(desired.build_album(rows, res, plex_album=None, plex_artist=None,
+                                                   overrides={}))
+        tags = want["tracks"]["A/B/a.flac"]["tags"]
+        self.assertEqual(tags["date"], ["2001-07-24"])
+        self.assertNotIn("date", issues.tag_diff(rows[0], tags))
+
 
 class IssuesTestCase(unittest.TestCase):
     def test_tag_diff_ignores_what_is_already_right(self):
@@ -499,7 +542,7 @@ class TrackOrderTestCase(unittest.TestCase):
                 mock.patch.object(desired.lastfm, "album_tags", mock.AsyncMock(return_value=[])), \
                 mock.patch.object(desired.lastfm, "artist_tags", mock.AsyncMock(return_value=[])), \
                 mock.patch.object(desired.mb, "artist", mock.AsyncMock(return_value={})), \
-                mock.patch.object(issues, "move_conflict", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(issues, "conflict_of", mock.AsyncMock(return_value=None)), \
                 as_spelled():
             want = asyncio.run(desired.build_album(rows, res, plex_album=None, plex_artist=None,
                                                    overrides={}))
@@ -526,6 +569,155 @@ class TrackOrderTestCase(unittest.TestCase):
     def test_right_numbers_raise_nothing(self):
         rows = [file_row("A/B/1.flac", "Pop", track=1, duration=177.0)]
         self.assertNotIn("track_order", {p["kind"] for p in self.plan(rows)})
+
+
+class SharedPlexAlbumTestCase(unittest.TestCase):
+    """Plex files a track it first saw untagged in an untitled album and
+    never regroups it: such an album holds tracks of many of ours, and each
+    one matching or tagging it overwrites the last."""
+
+    def plan(self, rows, plex, changed=False):
+        rel = release()
+        score, mapping = resolver.score_release(rows, rel)
+        res = resolver.Resolution(status="resolved", release=rel, score=score, track_map=mapping)
+        with mock.patch.object(desired.mb, "release_group", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(desired.lastfm, "album_tags", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(desired.lastfm, "artist_tags", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(desired.mb, "artist", mock.AsyncMock(return_value={})), \
+                mock.patch.object(issues, "conflict_of", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(issues, "changed_by_us", mock.AsyncMock(return_value=changed)), \
+                as_spelled():
+            want = asyncio.run(desired.build_album(rows, res, plex_album=None, plex_artist=None,
+                                                   overrides={}))
+            want["genres"] = ["Pop"]
+            return {p["kind"]: p for p in asyncio.run(issues.plan_unit(
+                "A/B", rows, want, res, plex, plex_synced=False,
+                ours_locked=mock.AsyncMock(return_value=False)))}
+
+    def plex(self, others):
+        return {"album": {"rating_key": "50", "title": "", "guid": "local://50", "genres": "[]",
+                          "moods": "[]", "locked": None, "thumb": None, "mbid": None},
+                "tracks": {"A/B/1.flac": {"rating_key": "9", "parent_key": "50", "idx": 1,
+                                          "parent_idx": 1, "genres": "[]"}},
+                "others": others}
+
+    rows = [file_row("A/B/1.flac", "Pop", track=1)]
+
+    def test_an_album_shared_with_another_albums_tracks_is_left_alone(self):
+        plan = self.plan(self.rows, self.plex([{"path": "K/Singles/x.opus", "album": None,
+                                                "mb_releasegroupid": None}]))
+        for kind in ("unmatched", "wrong_match", "moods", "poster", "plex_shared"):
+            self.assertNotIn(kind, plan)
+        self.assertIs(plan["genres"]["detail"]["album"], False)
+        self.assertEqual(plan["genres"]["detail"]["tracks"], ["9"])
+
+    def test_what_we_did_to_a_shared_album_is_put_back(self):
+        plan = self.plan(self.rows, self.plex([{"path": "K/x.opus", "album": "Other",
+                                                "mb_releasegroupid": None}]), changed=True)
+        self.assertEqual(plan["plex_shared"]["detail"]["rating_key"], "50")
+
+    def test_the_same_albums_tracks_from_another_folder_are_not_another_album(self):
+        plan = self.plan(self.rows, self.plex([{"path": "A/B (bonus)/2.flac", "album": "Celebrity",
+                                                "mb_releasegroupid": None}]))
+        self.assertIn("unmatched", plan)
+        self.assertNotIn("album", plan["genres"]["detail"])
+
+    def test_a_stray_track_does_not_take_the_album_from_its_owner(self):
+        from app.metadata.plexsync import shares_album
+        rows = [file_row(f"A/B/{i}.flac", "Pop", track=i) for i in (1, 2, 3)]
+        info = {"album": {"rating_key": "50"},
+                "tracks": {r["path"]: {"rating_key": str(i), "parent_key": "50"}
+                           for i, r in enumerate(rows)},
+                "others": [{"path": "K/x.opus", "album": None, "mb_releasegroupid": None}]}
+        self.assertFalse(shares_album(info, rows))
+
+    def test_the_stray_leaves_the_owners_album_to_the_owner(self):
+        """Stankonia's own check puts right what a stray track's fix did."""
+        owner = [{"path": f"O/Stankonia/{i}.flac", "album": "Stankonia",
+                  "mb_releasegroupid": "rg-s"} for i in range(3)]
+        plan = self.plan(self.rows, self.plex(owner), changed=True)
+        self.assertNotIn("plex_shared", plan)
+        self.assertNotIn("unmatched", plan)
+        self.assertIs(plan["genres"]["detail"]["album"], False)
+
+    def test_release_groups_decide_when_both_are_tagged(self):
+        from app.metadata.plexsync import shares_album
+        rows = [dict(self.rows[0], mb_releasegroupid="rg-1")]
+        same = {"others": [{"path": "x", "album": "Anything", "mb_releasegroupid": "rg-1"}]}
+        other = {"others": [{"path": "x", "album": "Celebrity", "mb_releasegroupid": "rg-2"}]}
+        self.assertFalse(shares_album(same, rows))
+        self.assertTrue(shares_album(other, rows))
+        self.assertFalse(shares_album({"others": []}, rows))
+
+
+class SharedPlexAlbumApplyTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from app.config import settings
+        from app.db import db
+        self.tmp = Path(tempfile.mkdtemp())
+        self.patch = mock.patch.object(settings, "data_dir", self.tmp / "data")
+        self.patch.start()
+        await db.connect()
+        self.db = db
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def change(self, field, old, new):
+        await self.db.execute(
+            "INSERT INTO md_changes (batch_id, target, ref, field, old_value, new_value, summary, "
+            "applied_at) VALUES ('b', 'plex', '50', ?, ?, ?, '', '')",
+            (field, json.dumps(old), json.dumps(new)))
+
+    async def test_the_album_goes_back_to_how_plex_had_it(self):
+        from app.metadata import apply
+        await self.change("match", {"guid": "local://50", "title": "", "year": 2015},
+                          {"guid": "mbid://first"})
+        await self.change("match", {"guid": "mbid://first"}, {"guid": "mbid://second"})
+        await self.change("genre", {"values": ["Rap"], "locked": False},
+                          {"values": ["Trap"], "type": 9})
+        await self.change("genre", {"values": ["Trap"], "locked": True},
+                          {"values": ["House"], "type": 9})
+        fake = mock.MagicMock(unmatch=mock.AsyncMock(), match=mock.AsyncMock(),
+                              set_tags=mock.AsyncMock())
+        with mock.patch.object(apply, "plex", fake), \
+                mock.patch.object(apply.plexsync, "refresh_items", mock.AsyncMock()):
+            await apply.do_plex_shared({"detail": {"rating_key": "50"}}, None)
+            again = await apply.do_plex_shared({"detail": {"rating_key": "50"}}, None)
+        fake.unmatch.assert_awaited_once_with("50")
+        fake.match.assert_not_awaited()
+        self.assertEqual(fake.set_tags.await_args.args[:4], (apply.ALBUM, "50", "genre", ["Rap"]))
+        self.assertFalse(fake.set_tags.await_args.kwargs["lock"])
+        self.assertEqual(again, "nothing of ours to put back")
+
+    async def test_a_fix_planned_before_is_not_applied_to_a_shared_album(self):
+        from app.metadata import apply
+        ctx = apply.Ctx("A/B", [file_row("A/B/1.flac", "Pop")], {"album": "Celebrity"}, "A")
+        info = {"album": {"rating_key": "50"},
+                "tracks": {"A/B/1.flac": {"rating_key": "9", "parent_key": "50"}},
+                "others": [{"path": "K/x.opus", "album": None, "mb_releasegroupid": None}]}
+        fake = mock.MagicMock(match=mock.AsyncMock())
+        with mock.patch.object(apply.plexsync, "album_for_paths", mock.AsyncMock(return_value=info)), \
+                mock.patch.object(apply, "plex", fake):
+            note = await apply.do_match({"kind": "unmatched", "detail": {
+                "rating_key": "50", "release_mbid": "rel-1"}}, ctx)
+        self.assertEqual(note, apply.SHARED_NOTE)
+        fake.match.assert_not_awaited()
+
+    async def test_genres_for_tracks_in_a_shared_album_touch_only_the_tracks(self):
+        from app.metadata import apply
+        ctx = apply.Ctx("A/B", [], {"genres": ["Trap"]}, "A")
+        calls = []
+
+        async def set_tags(batch, type_num, keys, tag, values, ctx, summary):
+            calls.append((type_num, keys))
+        with mock.patch.object(apply, "_set_plex_tags", set_tags), \
+                mock.patch.object(apply.plexsync, "refresh_items", mock.AsyncMock()):
+            await apply.do_genres({"detail": {"rating_key": "50", "album": False,
+                                              "tracks": ["9"], "to": ["Trap"]}}, ctx)
+        self.assertEqual(calls, [(apply.TRACK, ["9"])])
 
 
 class MissingMatchTestCase(unittest.TestCase):
@@ -660,16 +852,17 @@ class ApplyRoundTripTestCase(unittest.IsolatedAsyncioTestCase):
         ctx = apply.Ctx("NSYNC/old", rows, want, "NSYNC")
         await apply.do_move({"kind": "move", "detail": {}}, ctx)
         await apply.do_tags({"kind": "tags", "detail": {}}, ctx)
-        target = self.lib / "_NSYNC" / "(2001) Celebrity" / "01 - Pop.flac"
+        # "*NSYNC" files in the library's own NSYNC folder, not a new "_NSYNC"
+        target = self.lib / "NSYNC" / "(2001) Celebrity" / "01 - Pop.flac"
         self.assertTrue(target.exists())
-        self.assertTrue((self.lib / "_NSYNC" / "(2001) Celebrity" / "folder.jpg").exists())
+        self.assertTrue((self.lib / "NSYNC" / "(2001) Celebrity" / "folder.jpg").exists())
         self.assertFalse((self.lib / "NSYNC" / "old").exists())
         fields = tagio.read(target)["fields"]
         self.assertEqual(fields["albumartist"], ["*NSYNC"])
         self.assertEqual(fields["mb_albumid"], ["rel-1"])
         self.assertNotIn("genre", fields)    # junk "Music" gone, no real genre known
         row = await self.db.fetchone("SELECT path FROM library_index WHERE path = ?",
-                                     ("_NSYNC/(2001) Celebrity/01 - Pop.flac",))
+                                     ("NSYNC/(2001) Celebrity/01 - Pop.flac",))
         self.assertIsNotNone(row)
 
         # undo the move, then the tags (written after it, so found back home)
@@ -724,10 +917,10 @@ class ApplyQueueTestCase(unittest.IsolatedAsyncioTestCase):
 
         async def fake_apply(ids):
             calls.append(ids)
-            return {"applied": len(ids), "failed": 0}
+            return len(ids), 0
 
         r._apply_queue = [[3], [1], [2, 3]]
-        with mock.patch.object(r, "apply_ids", fake_apply), \
+        with mock.patch.object(r, "_files_pass", fake_apply), \
                 mock.patch.object(r, "publish", mock.AsyncMock()):
             task = asyncio.create_task(r._apply_loop())
             r._apply_wake.set()
@@ -750,8 +943,10 @@ class PlexCatchUpTestCase(unittest.IsolatedAsyncioTestCase):
             ctxs.append(ctx)
         fake = mock.MagicMock(configured=True, refresh_path=mock.AsyncMock(),
                               refresh_all=mock.AsyncMock(), wait_for_scan=mock.AsyncMock())
+        fake.sync = mock.AsyncMock()
         with mock.patch.object(apply, "plex", fake), \
                 mock.patch.object(apply.plexsync, "sync_recent", mock.AsyncMock()), \
+                mock.patch.object(apply.plexsync, "sync", fake.sync), \
                 mock.patch.object(apply.plexsync, "forget_paths", mock.AsyncMock()):
             await apply.plex_catch_up(*ctxs)
         self.assertFalse(any(ctx.plex_dirty for ctx in ctxs))
@@ -787,42 +982,176 @@ class PlexCatchUpTestCase(unittest.IsolatedAsyncioTestCase):
         fake = await self.catch_up([[f"{a}/x"] for a in "ABCDEFGH"])
         fake.refresh_path.assert_not_called()
         fake.refresh_all.assert_awaited_once()
+        fake.sync.assert_awaited_once_with(full=True)      # the mirror, in one go
 
 
-class ApplyBatchTestCase(unittest.IsolatedAsyncioTestCase):
-    async def test_moves_then_tags_then_plex_with_one_rescan_after_each_round(self):
+class OldPlexEntriesTestCase(unittest.IsolatedAsyncioTestCase):
+    """Plex notices a moved album's old folder is gone only when the folder
+    above it is rescanned; a vanished folder can't be scanned itself."""
+
+    async def asyncSetUp(self):
+        from app.config import settings
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "Arctic Monkeys" / "(2013) AM").mkdir(parents=True)
+        (self.tmp / "Queen").mkdir()
+        self.patch = mock.patch.object(settings, "library_dir", self.tmp)
+        self.patch.start()
+
+    async def asyncTearDown(self):
+        self.patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fake_plex(self):
+        return mock.MagicMock(configured=True, refresh_path=mock.AsyncMock(),
+                              refresh_all=mock.AsyncMock(), wait_for_scan=mock.AsyncMock(),
+                              empty_trash=mock.AsyncMock())
+
+    async def test_the_folder_above_a_vanished_one_is_rescanned(self):
+        from app.metadata import apply
+        fake = self.fake_plex()
+        ghosts = [{"detail": {"folder": "Arctic Monkeys/AM", "paths": ["Arctic Monkeys/AM/1.opus"]}},
+                  {"detail": {"folder": "Arctic Monkeys/The Car", "paths": []}},
+                  {"detail": {"folder": "Queen/Old/CD1", "paths": []}}]
+        with mock.patch.object(apply, "plex", fake), \
+                mock.patch.object(apply.plexsync, "forget_paths", mock.AsyncMock()) as forget:
+            await apply.clean_ghosts(ghosts)
+        self.assertEqual([c.args[0] for c in fake.refresh_path.call_args_list],
+                         ["Arctic Monkeys", "Queen"])
+        fake.empty_trash.assert_awaited_once()
+        forget.assert_awaited_once_with(["Arctic Monkeys/AM/1.opus"])
+
+    async def test_a_vanished_artist_folder_means_a_library_scan(self):
+        from app.metadata import apply
+        fake = self.fake_plex()
+        with mock.patch.object(apply, "plex", fake), \
+                mock.patch.object(apply.plexsync, "forget_paths", mock.AsyncMock()):
+            await apply.clean_ghosts([{"detail": {"folder": "3doorsdown/The Better Life"}},
+                                      {"detail": {"folder": "Queen/Old"}}])
+        fake.refresh_all.assert_awaited_once()
+        self.assertEqual([c.args[0] for c in fake.refresh_path.call_args_list], ["Queen"])
+        fake.empty_trash.assert_awaited_once()
+
+    async def test_only_artist_folders_still_there_are_rescanned(self):
+        from app.metadata import apply
+        fake = self.fake_plex()
+        with mock.patch.object(apply, "plex", fake):
+            await apply.scan_artists({"Arctic Monkeys", "3doorsdown", ""})
+        self.assertEqual([c.args[0] for c in fake.refresh_path.call_args_list], ["Arctic Monkeys"])
+
+
+class WaitForScanTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_a_scan_that_shows_up_late_is_still_waited_for(self):
+        from app import plex as plexmod
+        scanning = mock.AsyncMock(side_effect=[False, False, True, True, False])
+        with mock.patch.object(plexmod.plex, "scanning", scanning), \
+                mock.patch.object(plexmod.asyncio, "sleep", mock.AsyncMock()):
+            self.assertTrue(await plexmod.plex.wait_for_scan(timeout=60, settle=0, start=30))
+        self.assertEqual(scanning.await_count, 5)
+
+
+class ApplyPassesTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_every_file_change_comes_before_one_plex_rescan(self):
         from app.metadata import apply
         from app.metadata import runner as runmod
         r = runmod.Runner()
         order = []
+        queued = {i: {"id": i, "kind": kind, "entity": "album", "album_key": key,
+                      "artist_dir": "A", "ref": key}
+                  for i, kind, key in [(1, "move", "A/x"), (2, "genres", "A/x"),
+                                       (3, "tags", "A/y"), (4, "move", "A/z")]}
+
+        async def fetchall(sql, params):
+            return [queued[i] for i in params]
 
         async def start(key, members):
-            order.append(("start", key))
-            ctx = apply.Ctx(key, [], None, "A")
-            return 0, 0, {"key": key, "ctx": ctx, "old_artist": "A", "plex_stage": [],
-                          "files": [{"kind": "tags"}, {"kind": "move"}]}
+            return 0, 0, {"key": key, "ctx": apply.Ctx(key, [], None, "A"), "old_artist": "A",
+                          "files": [m for m in members if m["kind"] in apply.FILE_STAGE],
+                          "plex_stage": [m for m in members if m["kind"] in apply.PLEX_STAGE]}
 
         async def simple(todo, ctx, executors):
             order.extend((i["kind"], ctx.key) for i in todo)
             ctx.plex_dirty = True
+            if ctx.key == "A/x":
+                r._apply_queue.append([4])          # queued while files are being changed
             return len(todo), 0
 
         async def plex_stage(state):
-            order.append(("plex", state["key"]))
+            order.append(("plex", state["key"], len(state["plex_stage"])))
             return 1, 0
 
         catch_up = mock.AsyncMock(side_effect=lambda *ctxs: order.append(("scan", len(ctxs))))
-        with mock.patch.object(r, "_start_album", start), \
+        with mock.patch.object(runmod.db, "fetchall", fetchall), \
+                mock.patch.object(runmod.issues, "issue_out", lambda row: row), \
+                mock.patch.object(r, "_start_album", start), \
                 mock.patch.object(r, "_apply_simple", simple), \
                 mock.patch.object(r, "_apply_plex", plex_stage), \
                 mock.patch.object(r, "publish", mock.AsyncMock()), \
+                mock.patch.object(r, "publish_issues", mock.AsyncMock()), \
                 mock.patch.object(apply, "plex_catch_up", catch_up):
-            result = await r._apply_albums([("A/x", []), ("A/y", [])])
-        self.assertEqual(result, (6, 0))
-        self.assertEqual(order, [("start", "A/x"), ("start", "A/y"),
-                                 ("move", "A/x"), ("move", "A/y"), ("scan", 2),
-                                 ("tags", "A/x"), ("tags", "A/y"), ("scan", 2),
-                                 ("plex", "A/x"), ("plex", "A/y")])
+            r._apply_queue = [[1, 2, 3]]
+            task = asyncio.create_task(r._apply_loop())
+            r._apply_wake.set()
+            await asyncio.sleep(0.1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(order, [("move", "A/x"), ("tags", "A/y"), ("move", "A/z"),
+                                 ("scan", 3),
+                                 ("plex", "A/x", 1), ("plex", "A/y", 0), ("plex", "A/z", 0)])
+        self.assertIsNone(r.apply_note)
+
+    async def test_old_plex_entries_plex_already_dropped_cost_no_scan(self):
+        from app.metadata import apply
+        from app.metadata import runner as runmod
+        r = runmod.Runner()
+        gone = {"id": 1, "kind": "plex_ghost", "key": "plex_ghost:A/old", "ref": "A/old"}
+        left = {"id": 2, "kind": "plex_ghost", "key": "plex_ghost:B/old", "ref": "B/old"}
+        fresh = {"key": "plex_ghost:B/old", "detail": {"folder": "B/old", "paths": ["B/old/1.flac"]}}
+        r._plex_later = [(("ghost", "A/old"), [gone]), (("ghost", "B/old"), [left])]
+        mark = mock.AsyncMock()
+        with mock.patch.object(runmod.plexsync, "sync", mock.AsyncMock()) as sync, \
+                mock.patch.object(runmod.issues, "plan_ghosts", mock.AsyncMock(return_value=[fresh])), \
+                mock.patch.object(runmod.issues, "save", mock.AsyncMock()), \
+                mock.patch.object(apply, "clean_ghosts", mock.AsyncMock()) as clean, \
+                mock.patch.object(r, "_mark", mark), \
+                mock.patch.object(r, "publish", mock.AsyncMock()), \
+                mock.patch.object(r, "publish_issues", mock.AsyncMock()):
+            self.assertEqual(await r._plex_pass(), (2, 0))
+        sync.assert_awaited_once()
+        clean.assert_awaited_once_with([fresh])
+        self.assertEqual(sorted((c.args[0]["id"], c.args[1]) for c in mark.call_args_list),
+                         [(1, "applied"), (2, "applied")])
+
+    async def test_a_restart_carries_on_with_the_queue(self):
+        from app.metadata import runner as runmod
+        for auto, queue, reopened in ((True, [[4, 7]], False), (False, [], True)):
+            r = runmod.Runner()
+            r._started_at = "2026-01-01T00:00:00Z"
+            execute = mock.AsyncMock()
+            with mock.patch.object(runmod.db, "fetchall",
+                                   mock.AsyncMock(return_value=[{"id": 4}, {"id": 7}])), \
+                    mock.patch.object(runmod.db, "execute", execute), \
+                    mock.patch.object(r, "auto_apply", mock.AsyncMock(return_value=auto)):
+                await r._resume_queue()
+            self.assertEqual(r._apply_queue, queue)
+            self.assertEqual(r._apply_wake.is_set(), auto)
+            # queued decisions always reopen; queued fixes only without auto-apply
+            self.assertEqual(execute.await_count, 1 + int(reopened))
+
+    async def test_none_left_means_no_scan_at_all(self):
+        from app.metadata import apply
+        from app.metadata import runner as runmod
+        r = runmod.Runner()
+        r._plex_later = [(("ghost", "A/old"), [{"id": 1, "kind": "plex_ghost",
+                                                "key": "plex_ghost:A/old", "ref": "A/old"}])]
+        with mock.patch.object(runmod.plexsync, "sync", mock.AsyncMock()), \
+                mock.patch.object(runmod.issues, "plan_ghosts", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(runmod.issues, "save", mock.AsyncMock()), \
+                mock.patch.object(apply, "clean_ghosts", mock.AsyncMock()) as clean, \
+                mock.patch.object(r, "_mark", mock.AsyncMock()), \
+                mock.patch.object(r, "publish", mock.AsyncMock()), \
+                mock.patch.object(r, "publish_issues", mock.AsyncMock()):
+            await r._plex_pass()
+        clean.assert_not_awaited()
 
 
 if __name__ == "__main__":
@@ -900,9 +1229,53 @@ class LibraryAwareTestCase(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO md_issues (key, kind, entity, ref, album_key, severity, summary, state, "
             "created_at, updated_at) VALUES ('g', 'genres', 'album', 'A/old', 'A/old', 'info', "
             "'x', 'queued', '', '')")
+        await self.db.execute(
+            "INSERT INTO md_issues (key, kind, entity, ref, album_key, severity, summary, state, "
+            "error, created_at, updated_at) VALUES ('f', 'move', 'album', 'A/Singles|x', "
+            "'A/Singles|x', 'info', 'x', 'failed', 'the album is no longer there', '', '')")
         await units.sync_registry()
         row = await self.db.fetchone("SELECT state FROM md_issues WHERE key = 'g'")
         self.assertEqual(row["state"], "applied")
+        row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 'f'")
+        self.assertEqual((row["state"], row["error"]), ("applied", None))
+
+    async def test_a_fix_for_an_album_that_is_gone_closes_rather_than_fails(self):
+        from app.metadata import runner as runmod
+        r = runmod.Runner()
+        await self.db.execute(
+            "INSERT INTO md_issues (key, kind, entity, ref, album_key, severity, summary, state, "
+            "created_at, updated_at) VALUES ('t', 'tags', 'album', 'A/Singles|x', 'A/Singles|x', "
+            "'info', 'x', 'queued', '', '')")
+        issue = dict(await self.db.fetchone("SELECT * FROM md_issues WHERE key = 't'"))
+        self.assertEqual(await r._start_album("A/Singles|x", [issue]), (0, 0, None))
+        row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 't'")
+        self.assertEqual((row["state"], row["error"]), ("applied", None))
+
+    async def named(self, credited, listed, aliases=()):
+        rel = release(artist=credited)
+        rel["artist-credit"][0]["artist"] = {"id": "a1", "name": listed, "sort-name": listed}
+        found = mock.AsyncMock(return_value=[{"name": a, "sort-name": a} for a in aliases])
+        with mock.patch.object(desired.mb, "artist_aliases", found):
+            return (await desired.library_name(desired.album_artist_of(rel)))["name"]
+
+    async def test_an_artist_is_named_as_the_library_names_them(self):
+        await self.index("Kanye West/Ye/01.flac", "Kanye West/Yeezus/01.flac", "Ye/Bully/01.flac",
+                         "Electric Callboy/TEKKNO/01.flac",
+                         "Art vs Science/Magic Fountain/01.flac", "Other/x/01.flac")
+        # a small "Ye" folder beside the big "Kanye West" one: the big one wins
+        self.assertEqual(await self.named("Kanye West", "Ye"), "Kanye West")
+        self.assertEqual(await self.named("Ye", "Ye", aliases=["Kanye West"]), "Kanye West")
+        self.assertEqual(await self.named("Eskimo Callboy", "Electric Callboy"), "Electric Callboy")
+        self.assertEqual(await self.named("Art vs. Science", "Art vs. Science"), "Art vs. Science")
+        self.assertEqual(await desired.on_disk("Art vs. Science/(2010) Magic Fountain"),
+                         "Art vs Science/(2010) Magic Fountain")      # one folder all the same
+        # nobody the library has yet: MusicBrainz's name, not the credit
+        self.assertEqual(await self.named("Madilyn", "Madilyn Bailey"), "Madilyn Bailey")
+
+    async def test_a_run_together_folder_name_is_not_kept(self):
+        await self.index("ARTVSSCIENCE/Big Overdrive/01.flac")
+        self.assertEqual(await desired.on_disk("Art vs. Science/(2022) Big Overdrive"),
+                         "Art vs. Science/(2022) Big Overdrive")
 
     async def test_a_release_credited_to_a_short_name_files_with_the_artist(self):
         await self.index("Alanis Morissette/Jagged Little Pill/01.flac")
@@ -946,3 +1319,98 @@ class LibraryAwareTestCase(unittest.IsolatedAsyncioTestCase):
         info, issue = await self.album("NSYNC/Celebrity", have=1, total=13)
         self.assertFalse(info["partial"])
         self.assertEqual(issue["state"], "open")
+
+
+class PlexMirrorPagesTestCase(unittest.IsolatedAsyncioTestCase):
+    """List views carry at most two genres an item; pages carry them all."""
+
+    async def asyncSetUp(self):
+        from app.config import settings
+        from app.db import db
+        self.tmp = Path(tempfile.mkdtemp())
+        self.patch = mock.patch.object(settings, "data_dir", self.tmp / "data")
+        self.patch.start()
+        await db.connect()
+        self.db = db
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def item(key, genres, updated, type_="album"):
+        return {"ratingKey": key, "type": type_, "title": f"t{key}", "updatedAt": updated,
+                "Genre": [{"tag": g} for g in genres],
+                "Field": [{"name": "genre", "locked": True}]}
+
+    async def genres(self, key):
+        row = await self.db.fetchone("SELECT genres, detail_at FROM plex_items "
+                                     "WHERE rating_key = ?", (key,))
+        return json.loads(row["genres"] or "[]"), row["detail_at"]
+
+    async def test_a_list_view_does_not_cut_an_unchanged_items_genres(self):
+        from app.metadata import plexsync
+        from app.plex import ALBUM
+        five = ["Pop", "Pop Rock", "Teen Pop", "Pop Punk", "Alternative Rock"]
+        await self.db.execute(plexsync._UPSERT, plexsync._row(self.item("1", five[:2], 100), ALBUM, 1.0))
+        await self.db.executemany(plexsync._DETAIL, [plexsync._detail_row(self.item("1", five, 100))])
+        await self.db.execute(plexsync._UPSERT, plexsync._row(self.item("1", five[:2], 100), ALBUM, 2.0))
+        self.assertEqual(await self.genres("1"), (five, 100))
+        # changed since its page was read: the list's genres stand until it is read again
+        await self.db.execute(plexsync._UPSERT, plexsync._row(self.item("1", ["Rock"], 200), ALBUM, 3.0))
+        self.assertEqual(await self.genres("1"), (["Rock"], None))
+
+    async def test_pages_are_read_a_hundred_to_a_request_tracks_too(self):
+        from app.metadata import plexsync
+        keys = [str(k) for k in range(1, 152)]
+        await self.db.executemany(
+            "INSERT INTO plex_items (rating_key, type, genres, seen_at) VALUES (?, 'track', ?, 0)",
+            [(k, json.dumps(["Pop", "Pop Rock"])) for k in keys])
+        five = ["Pop", "Pop Rock", "Teen Pop", "Pop Punk", "Alternative Rock"]
+        asked = []
+
+        async def many(batch):
+            asked.append(len(batch))
+            return [self.item(k, five, 100, "track") for k in batch if k != "7"]
+
+        fake = mock.MagicMock(metadata_many=mock.AsyncMock(side_effect=many),
+                              metadata=mock.AsyncMock(return_value=None))
+        with mock.patch.object(plexsync, "plex", fake):
+            self.assertEqual(await plexsync.read_details(), 150)
+        self.assertEqual(sorted(asked), [51, 100])
+        fake.metadata.assert_awaited_once_with("7")         # left out: asked alone, and gone
+        self.assertIsNone(await self.db.fetchone("SELECT 1 FROM plex_items WHERE rating_key = '7'"))
+        self.assertEqual(await self.genres("150"), (five, 100))
+
+
+class PlexTagEditTestCase(unittest.TestCase):
+    def test_a_value_with_a_comma_is_removed_whole(self):
+        from app.plex import PlexClient
+        pairs = PlexClient.tag_pairs("genre", ["Pop"], ["Pop", "Pop, Rock", "Rock & Roll"])
+        self.assertIn(("genre[].tag.tag-", "Pop%2C%20Rock,Rock%20%26%20Roll"), pairs)
+        self.assertEqual(pairs[0], ("genre[0].tag.tag", "Pop"))
+
+
+class SameFileTestCase(unittest.TestCase):
+    """The library share ignores case but gives each spelling of a name its
+    own inode number, so samefile says no to a case-only rename."""
+
+    def same(self, a, b, listing):
+        with mock.patch.object(issues.os.path, "samefile", return_value=False), \
+                mock.patch.object(issues.os, "listdir", side_effect=lambda d: listing[str(d)]):
+            return issues.same_file(Path(a), Path(b))
+
+    def test_a_case_only_rename_is_the_same_file(self):
+        self.assertTrue(self.same("/lib/T/07 - Keyz To Vampa.m4a", "/lib/T/07 - Keyz to Vampa.m4a",
+                                  {"/lib/T": ["07 - Keyz To Vampa.m4a", "07 - Keyz To Vampa.lrc"]}))
+
+    def test_both_spellings_listed_are_two_files(self):
+        self.assertFalse(self.same("/lib/T/a.flac", "/lib/T/A.flac", {"/lib/T": ["a.flac", "A.flac"]}))
+
+    def test_a_folder_spelt_differently_is_the_same_folder(self):
+        self.assertTrue(self.same("/lib/SAM SMITH/x.flac", "/lib/Sam Smith/x.flac",
+                                  {"/lib": ["SAM SMITH"]}))
+
+    def test_other_names_are_other_files(self):
+        self.assertFalse(self.same("/lib/T/a.flac", "/lib/T/b.flac", {"/lib/T": ["a.flac", "b.flac"]}))

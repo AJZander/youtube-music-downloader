@@ -12,6 +12,7 @@ import TrendingUpIcon from '@mui/icons-material/TrendingUp'
 
 import { api } from '../../api.js'
 import { describeQueue } from '../artist/selection.js'
+import { keepTextSelection, useShiftRange } from '../rangeSelect.js'
 
 const COUNTRY_KEY = 'mdl-chart-country'
 const GENRE_KEY = 'mdl-chart-genre'
@@ -161,15 +162,24 @@ export default function Charts({ onQueued, onBrowseArtist }) {
     }
   }
 
-  const toggleIn = (setter, id) => setter((prev) => {
-    const next = new Set(prev)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    return next
-  })
+  // Tick or untick one; with Shift, everything from the last one clicked.
+  const songRange = useShiftRange()
+  const albumRange = useShiftRange()
+  const toggleIn = (setter, range, order, id, event) => {
+    const ids = range(order, id, event)
+    setter((prev) => {
+      const on = !prev.has(id)
+      const next = new Set(prev)
+      ids.forEach((x) => (on ? next.add(x) : next.delete(x)))
+      return next
+    })
+  }
 
   const newSongs = useMemo(
     () => (page?.songs || []).filter((s) => s.library !== 'have').map((s) => s.video_id), [page])
+  const openAlbums = useMemo(
+    () => (page?.albums || []).filter((a) => !a.in_library && !a.queued).map((a) => a.browse_id),
+    [page])
 
   const topArtists = charts ? (allArtists ? charts.artists : charts.artists.slice(0, 20)) : []
 
@@ -301,7 +311,8 @@ export default function Charts({ onQueued, onBrowseArtist }) {
                       <span>
                         <Checkbox size="small" sx={{ p: 0.5 }} disabled={owned}
                           checked={songs.has(s.video_id)}
-                          onChange={() => toggleIn(setSongs, s.video_id)}
+                          onMouseDown={keepTextSelection}
+                          onChange={(e) => toggleIn(setSongs, songRange, newSongs, s.video_id, e)}
                           inputProps={{ 'aria-label': `Select ${s.title}` }} />
                       </span>
                     </Tooltip>
@@ -354,7 +365,8 @@ export default function Charts({ onQueued, onBrowseArtist }) {
                           opacity: a.in_library ? 0.55 : 1 }} />
                       <Checkbox size="small" checked={albums.has(a.browse_id)}
                         disabled={a.in_library || a.queued}
-                        onChange={() => toggleIn(setAlbums, a.browse_id)}
+                        onMouseDown={keepTextSelection}
+                        onChange={(e) => toggleIn(setAlbums, albumRange, openAlbums, a.browse_id, e)}
                         sx={{ position: 'absolute', top: 2, left: 2, bgcolor: 'background.paper',
                           borderRadius: 1, p: 0.25, '&:hover': { bgcolor: 'background.paper' } }}
                         inputProps={{ 'aria-label': `Select ${a.title}` }} />

@@ -23,6 +23,7 @@ import { buildHash, parseHash } from './library/issues.js'
 /** Which pane tab answers an issue of this kind. */
 const TAB_FOR_KIND = {
   review_match: 'match', unresolved: 'match', unmatched: 'match', wrong_match: 'match',
+  plex_shared: 'match',
   artist_unknown: 'match', folder_artist: 'match',
   dup_album: 'duplicates', dup_track: 'duplicates',
   move: 'files', move_conflict: 'files',
@@ -383,8 +384,9 @@ export default function Library() {
             width={sidebarWidth} onWidth={setSidebarWidth}
             artistDir={artistDir} meta={meta} overview={overview}
             version={versions.attention}
-            onApply={(group, dir) => setModal({
-              type: 'apply', kind: group.kind, count: group.auto_count, artistDir: dir })}
+            onApply={(group, dir, onlyAuto = true) => setModal({
+              type: 'apply', kind: group.kind, artistDir: dir, onlyAuto,
+              count: onlyAuto ? group.auto_count : group.count - (group.queued_count || 0) })}
             onReview={(group, dir) => setModal({ type: 'issues', kind: group.kind, artistDir: dir })}
             onResolveDupes={(tab) => setModal({ type: 'dupes', tab })}
             onTrash={() => setModal({ type: 'trash' })}
@@ -413,7 +415,8 @@ export default function Library() {
       )}
       {modal?.type === 'apply' && (
         <ConfirmApplyDialog kind={modal.kind} count={modal.count} artistDir={modal.artistDir}
-          notify={notify} onClose={() => setModal(null)} onDone={onChanged} />
+          onlyAuto={modal.onlyAuto} notify={notify} onClose={() => setModal(null)}
+          onDone={onChanged} />
       )}
       {modal?.type === 'issues' && (
         <IssueListDialog kind={modal.kind} artistDir={modal.artistDir} notify={notify}

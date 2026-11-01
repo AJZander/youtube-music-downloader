@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert, Box, Button, Checkbox, Chip, CircularProgress, FormControlLabel,
   LinearProgress, Paper, Radio, Stack, Switch, Tooltip, Typography,
@@ -7,6 +7,7 @@ import {
 import { api } from '../../api.js'
 import BlockIcon from '@mui/icons-material/Block'
 
+import { keepTextSelection, useShiftRange } from '../rangeSelect.js'
 import { QualityChip, bytes } from './shared.jsx'
 
 const PAGE = 50
@@ -16,7 +17,7 @@ function Copy({ file, isKeeper, onMakeKeeper, checked, onToggle }) {
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25 }}>
       <Radio size="small" checked={isKeeper} onChange={onMakeKeeper} sx={{ p: 0.5 }} />
       <Checkbox size="small" checked={checked} disabled={isKeeper}
-        onChange={onToggle} sx={{ p: 0.5 }} />
+        onMouseDown={keepTextSelection} onChange={onToggle} sx={{ p: 0.5 }} />
       <Box sx={{ flexGrow: 1, minWidth: 0 }}>
         <Typography variant="body2" noWrap title={file.path}
           sx={{ fontFamily: 'monospace', fontSize: '0.78rem' }}>
@@ -40,11 +41,16 @@ function Copy({ file, isKeeper, onMakeKeeper, checked, onToggle }) {
   )
 }
 
-export function TrackDupeGroup({ group, selection, setSelection, onDismissed }) {
+/** `pickers` and `onPickGroup` (from the list) let a Shift-click tick a
+ *  range of groups: each group is ticked through its own toggle, which knows
+ *  the copy it keeps. */
+export function TrackDupeGroup({ group, selection, setSelection, onDismissed, pickers,
+                                 onPickGroup }) {
   const [keeper, setKeeper] = useState(group.copies[0].path)
   const [busy, setBusy] = useState(false)
   const [dismissed, setDismissed] = useState(false)
   const picked = selection.get(group.id) || new Set()
+  const copyRange = useShiftRange()
 
   const setPicked = (next) => setSelection((prev) => {
     const map = new Map(prev)
@@ -62,6 +68,23 @@ export function TrackDupeGroup({ group, selection, setSelection, onDismissed }) 
   const toggleGroup = (on) => setPicked(on
     ? new Set(group.copies.map((c) => c.path).filter((p) => p !== keeper))
     : new Set())
+
+  // a group marked "not duplicates" is never part of a range
+  useEffect(() => {
+    if (!pickers || dismissed) return undefined
+    pickers.current.set(group.id, toggleGroup)
+    return () => { pickers.current.delete(group.id) }
+  })
+
+  /** Tick or untick a copy; with Shift, every copy from the last one clicked. */
+  const toggleCopy = (path, event) => {
+    const order = group.copies.map((c) => c.path).filter((p) => p !== keeper)
+    const ids = copyRange(order, path, event)
+    const on = !picked.has(path)
+    const next = new Set(picked)
+    ids.forEach((p) => (on ? next.add(p) : next.delete(p)))
+    setPicked(next)
+  }
 
   const notDuplicates = async () => {
     setBusy(true)
@@ -90,7 +113,9 @@ export function TrackDupeGroup({ group, selection, setSelection, onDismissed }) 
         <Checkbox size="small" sx={{ p: 0.5 }}
           checked={picked.size > 0}
           indeterminate={picked.size > 0 && picked.size < group.copies.length - 1}
-          onChange={(e) => toggleGroup(e.target.checked)} />
+          onMouseDown={keepTextSelection}
+          onChange={(e) => (onPickGroup
+            ? onPickGroup(group.id, e.target.checked, e) : toggleGroup(e.target.checked))} />
         <Typography variant="body2" sx={{ flexGrow: 1, minWidth: 180 }}>
           <strong>{group.title}</strong> — {group.artist}
         </Typography>
@@ -118,11 +143,7 @@ export function TrackDupeGroup({ group, selection, setSelection, onDismissed }) 
           <Copy key={c.path} file={c} isKeeper={c.path === keeper}
             onMakeKeeper={() => makeKeeper(c.path)}
             checked={picked.has(c.path)}
-            onToggle={() => {
-              const next = new Set(picked)
-              if (next.has(c.path)) next.delete(c.path); else next.add(c.path)
-              setPicked(next)
-            }} />
+            onToggle={(e) => toggleCopy(c.path, e)} />
         ))}
       </Box>
     </Paper>
@@ -202,6 +223,16 @@ export default function TrackDupes({ onChanged }) {
   const [selection, setSelection] = useState(new Map())
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState(null)
+  const pickers = useRef(new Map())
+  const groupRange = useShiftRange()
+
+  /** Tick or untick a group; with Shift, every group shown from the last
+   *  one clicked. */
+  const pickGroup = (id, on, event) => {
+    const order = (data?.items || []).slice(0, shown).map((g) => g.id)
+      .filter((g) => g === id || pickers.current.has(g))
+    for (const g of groupRange(order, id, event)) pickers.current.get(g)?.(on)
+  }
 
   const refresh = useCallback(() => {
     setLoading(true); setError(null); setSelection(new Map())
@@ -278,7 +309,8 @@ export default function TrackDupes({ onChanged }) {
 
       {data?.items.slice(0, shown).map((group) => (
         <TrackDupeGroup key={group.id} group={group} onDismissed={onChanged}
-          selection={selection} setSelection={setSelection} />
+          selection={selection} setSelection={setSelection}
+          pickers={pickers} onPickGroup={pickGroup} />
       ))}
 
       {data?.items.length > shown && (

@@ -351,6 +351,19 @@ function MatchTab({ album, onDetail, notify }) {
             ignored ? 'Album will be checked again' : 'Album ignored')}>
           {ignored ? 'Stop ignoring' : 'Ignore album'}
         </Button>
+        {(album.no_release || ['review', 'unresolved'].includes(album.status)) && (
+          <Tooltip title={album.no_release
+            ? 'Look this album up on MusicBrainz again'
+            : 'MusicBrainz has no release for these files (a YouTube single, say): keep their own tags and stop asking'}>
+            <span>
+              <Button size="small" disabled={busy}
+                onClick={() => run(() => api.libraryAlbumNoRelease(album.key, !album.no_release),
+                  album.no_release ? 'Looking it up again' : 'Marked not on MusicBrainz')}>
+                {album.no_release ? 'Look up again' : 'Not on MusicBrainz'}
+              </Button>
+            </span>
+          </Tooltip>
+        )}
         {album.can_seed && (
           <Tooltip title="Opens MusicBrainz's add-release form, pre-filled from these files">
             <span>
@@ -370,7 +383,8 @@ function MatchTab({ album, onDetail, notify }) {
       {busy && <LinearProgress sx={{ mb: 1 }} />}
       {album.status && (
         <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
-          Status: {STATUS[album.status]?.label || album.status}
+          Status: {album.no_release ? STATUS.no_release.label
+            : STATUS[album.status]?.label || album.status}
           {album.confidence != null && ` · confidence ${Math.round(album.confidence * 100)}%`}
           {album.release_mbid && ` · release ${album.release_mbid}`}
         </Typography>
