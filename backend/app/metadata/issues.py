@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -296,9 +297,12 @@ def junk_fix_fields(row: dict) -> dict[str, list[str]]:
 
 # ------------------------------------------------------------------ planning
 async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex: dict | None,
-                    *, plex_synced: bool, ours_locked, no_release: bool = False) -> list[dict]:
+                    *, plex_synced: bool, ours_locked, no_release: bool = False,
+                    merge_keeper: bool = False) -> list[dict]:
     """`no_release`: the user says MusicBrainz has no release for these files,
-    so nothing asks them to identify it; the files keep their own tags."""
+    so nothing asks them to identify it; the files keep their own tags.
+    `merge_keeper`: a merge of copies made this folder the album's lately
+    (see merged_into), so its files stay in it."""
     artist_dir = rows[0].get("artist_dir") if rows else None
     out: list[dict] = []
     # A file nothing can open can't be tagged, numbered or shown in Plex: it
@@ -428,6 +432,10 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
                 retarget(desired, alt)
                 moves = planned_moves(rows, desired)
                 found = await conflict_of(key, rows, desired, moves) if moves else None
+        if moves and merge_keeper and desired["folder"].casefold() != folder_of(rows[0]).casefold():
+            # Moving out of the folder a merge just filled would undo the
+            # merge, which would then be planned again (renames in it are fine).
+            moves = []
         if moves:
             conflict = found["message"] if found else None
             detail = {"from": folder_of(rows[0]), "to": desired["folder"], "files": moves,
@@ -818,6 +826,25 @@ def matched_recordings(desired: dict) -> dict[str, list[str]]:
         if t.get("matched") and t.get("recording_mbid"):
             out.setdefault(t["recording_mbid"], []).append(path)
     return out
+
+
+# How long a file's moves are remembered against moving it back and forth,
+# and a merged album's folder is kept as it is.
+OSCILLATION_WINDOW = 14 * 86400
+# md_state key, + the folder casefolded: {"at", "release", "batch"} of the
+# last merge of copies into it
+MERGE_KEEPER = "merge_keeper:"
+
+
+async def merged_into(folder: str) -> bool:
+    """Whether a merge of copies made `folder` an album's within the window."""
+    row = await db.fetchone("SELECT value FROM md_state WHERE key = ?",
+                            (MERGE_KEEPER + folder.casefold(),))
+    try:
+        at = float(json.loads(row["value"])["at"]) if row and row["value"] else 0.0
+    except (ValueError, KeyError, TypeError):
+        return False
+    return time.time() - at < OSCILLATION_WINDOW
 
 
 async def plan_album_copies() -> list[dict]:

@@ -582,7 +582,7 @@ class Runner:
         plan = await issues.plan_unit(
             key, rows, want if res.status == "resolved" else None, res, plex_info,
             plex_synced=bool(await plexsync.last_sync()), ours_locked=apply.ours_locked,
-            no_release=no_release)
+            no_release=no_release, merge_keeper=await issues.merged_into(units.unit_folder(key)))
         await issues.save(plan, scope_kinds=issues.UNIT_KINDS, album_key=key)
         now = time.time()
         if res.status == "resolved":
@@ -613,7 +613,10 @@ class Runner:
             except Exception:
                 log.debug("missing-tracks refresh failed for %s", release, exc_info=True)
         auto_ids = []
-        if res.status == "resolved" or any(p["kind"] == "tags" for p in plan):
+        # an album whose files were caught going back and forth waits for the
+        # user (apply.refuse_oscillation), with all of its fixes
+        if (res.status == "resolved" or any(p["kind"] == "tags" for p in plan)) \
+                and not await apply.auto_paused(key):
             rows_ = await db.fetchall(
                 "SELECT id FROM md_issues WHERE album_key = ? AND state = 'open' AND auto = 1",
                 (key,))
