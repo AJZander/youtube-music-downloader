@@ -274,10 +274,7 @@ class Runner:
             log.debug("status publish failed", exc_info=True)
 
     async def publish_issues(self) -> None:
-        rows = await db.fetchall("SELECT kind, COUNT(*) AS n FROM md_issues "
-                                 "WHERE state IN ('open', 'failed', 'queued') GROUP BY kind")
-        by_kind = {r["kind"]: r["n"] for r in rows}
-        bus.publish("library.issues", {"open": sum(by_kind.values()), "by_kind": by_kind})
+        bus.publish("library.issues", await issues.counts())
 
     # ------------------------------------------------------------ loop
     async def _resume_queue(self) -> None:
@@ -809,6 +806,7 @@ class Runner:
                 groups.setdefault(("album", issue["album_key"]), []).append(issue)
         applied = failed = 0
         rescan: set[str] = set()       # artist folders albums moved out of or into
+        changed = {"album_keys": set(), "unit_ids": set(), "artist_dirs": set()}
         current = None
         # artist by artist, so each artist's folder is rescanned once its albums are done
         for (scope, ref), members in sorted(groups.items(), key=lambda g: (g[0][0], g[0][1] or "")):
@@ -855,8 +853,17 @@ class Runner:
                 if state["ctx"].moved:
                     rescan |= {p.split("/", 1)[0] for p in state["ctx"].moved}
                     rescan.add(state["ctx"].artist_dir or "")
+                changed["album_keys"] |= {ref, state["ctx"].key}
+                changed["unit_ids"] |= {state.get("unit_id"), state["ctx"].unit_id}
+                changed["artist_dirs"] |= {state.get("old_artist"), state["ctx"].artist_dir}
         if rescan:
             await self._rescan(rescan)
+        # what the files' fixes did shows now, not after the Plex pass (which
+        # waits for Plex to rescan everything)
+        await self.publish_issues()
+        if changed["album_keys"]:
+            bus.publish("library.changed", {k: sorted(v - {None, ""})
+                                            for k, v in changed.items()})
         return applied, failed
 
     async def _rescan(self, folders: set[str]) -> None:

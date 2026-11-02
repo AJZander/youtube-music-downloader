@@ -155,6 +155,29 @@ APPLY_ORDER = ("bad_file", "missing_tracks", "tags", "track_order", "move", "mov
                "artist_moods", "artist_poster")
 
 
+# What Needs attention counts: what needs the user (a failed fix shows its
+# reason). A fix under way (queued) and the Tried bucket are shown beside
+# it, not in it.
+ATTENTION_STATES = ("open", "failed")
+
+
+async def counts() -> dict:
+    """{"open": what needs the user, "by_kind": the same by kind,
+    "in_progress": fixes queued, "tried": the Tried bucket}: what the
+    sidebar, the overview and library.issues count."""
+    by_kind: Counter = Counter()
+    beside: Counter = Counter()
+    for r in await db.fetchall("SELECT kind, state, COUNT(*) AS n FROM md_issues "
+                               "WHERE state IN ('open', 'failed', 'queued', 'tried') "
+                               "GROUP BY kind, state"):
+        if r["state"] in ATTENTION_STATES:
+            by_kind[r["kind"]] += r["n"]
+        else:
+            beside[r["state"]] += r["n"]
+    return {"open": sum(by_kind.values()), "by_kind": dict(by_kind),
+            "in_progress": beside["queued"], "tried": beside["tried"]}
+
+
 def issue_out(row) -> dict:
     d = dict(row)
     meta = KINDS.get(d["kind"], {})

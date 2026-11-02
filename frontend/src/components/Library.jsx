@@ -29,6 +29,8 @@ const TAB_FOR_KIND = {
   move: 'files', move_conflict: 'files',
   extra_tracks: 'tracks', not_in_plex: 'tracks', plex_ghost: 'tracks',
   track_order: 'tracks', missing_tracks: 'tracks',
+  // which tracks Plex files together
+  plex_foreign: 'tracks',
 }
 
 function stored(key) {
@@ -408,8 +410,9 @@ export default function Library() {
               type: 'apply', kind: group.kind, artistDir: dir, onlyAuto,
               filter: onlyAuto ? undefined : group.bulk_filter,
               count: onlyAuto ? group.auto_count
-                : group.bulk_count ?? group.count - (group.queued_count || 0) })}
-            onReview={(group, dir) => setModal({ type: 'issues', kind: group.kind, artistDir: dir })}
+                : group.bulk_count ?? group.count })}
+            onReview={(group, dir, state) => setModal({
+              type: 'issues', kind: group.kind, artistDir: dir, state })}
             onResolveDupes={(tab) => setModal({ type: 'dupes', tab })}
             onTrash={() => setModal({ type: 'trash' })}
             onIgnored={() => setModal({ type: 'ignored' })}
@@ -442,8 +445,9 @@ export default function Library() {
           onDone={onChanged} />
       )}
       {modal?.type === 'issues' && (
-        <IssueListDialog kind={modal.kind} artistDir={modal.artistDir} notify={notify}
-          onClose={() => setModal(null)} onNavigate={navigateIssue} onChanged={onChanged} />
+        <IssueListDialog kind={modal.kind} artistDir={modal.artistDir} state={modal.state}
+          notify={notify} onClose={() => setModal(null)} onNavigate={navigateIssue}
+          onChanged={onChanged} />
       )}
       {modal?.type === 'dupes' && (
         <DupesManagerDialog initial={modal.tab} scanRunning={scan?.running}

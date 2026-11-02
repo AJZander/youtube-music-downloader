@@ -49,13 +49,16 @@ class IgnoreIn(BaseModel):
 
 class SelectIn(BaseModel):
     """Which issues a bulk action takes: these ids, or every open issue of a
-    kind (for one artist, matching a search or a filter), less `exclude`."""
+    kind (for one artist, matching a search or a filter), less `exclude`.
+    `state`: the list they were picked from (ISSUE_STATES), so "select all"
+    takes what that list shows, as far as the action can take it."""
     ids: list[int] | None = None
     kind: str | None = None
     artist_dir: str | None = None
     q: str | None = None
     filter: str | None = None
     exclude: list[int] | None = None
+    state: str | None = None
 
 
 class ApplyIn(SelectIn):
@@ -250,11 +253,17 @@ async def attention(artist_dir: str | None = None):
     return await views.attention(artist_dir)
 
 
-ISSUE_STATES = {"open": views.OPEN_STATES,
+# A list's states. "actionable" is what needs the user (Review lists it, and
+# its select-all is what Apply takes); "tried" is the Tried bucket.
+ISSUE_STATES = {"open": views.OPEN_STATES, "actionable": issues_mod.ATTENTION_STATES,
                 "all": ("open", "failed", "queued", "tried", "applied", "dismissed", "superseded",
                         "cleared"),
-                "dismissed": ("dismissed",), "applied": ("applied",), "failed": ("failed",),
-                "tried": ("tried",), "superseded": ("superseded",), "cleared": ("cleared",)}
+                "queued": ("queued",), "dismissed": ("dismissed",), "applied": ("applied",),
+                "failed": ("failed",), "tried": ("tried",), "superseded": ("superseded",),
+                "cleared": ("cleared",)}
+# what each bulk action takes (of the list's states, these)
+APPLY_TAKES = ("open", "failed")
+DISMISS_TAKES = ("open", "failed", "tried")
 
 
 @router.get("/issues")
@@ -269,8 +278,9 @@ async def list_issues(kind: str | None = None, artist_dir: str | None = None,
     return {"total": total, "items": items}
 
 
-async def _selected(body: SelectIn, states=("open", "failed")) -> list[dict]:
-    """The issues a bulk action takes (see SelectIn)."""
+async def _selected(body: SelectIn, takes=APPLY_TAKES) -> list[dict]:
+    """The issues a bulk action takes (see SelectIn): of the list's states,
+    those the action `takes`."""
     if body.ids:
         ids = list(dict.fromkeys(body.ids))
         rows = []
@@ -280,9 +290,13 @@ async def _selected(body: SelectIn, states=("open", "failed")) -> list[dict]:
                 f"SELECT * FROM md_issues WHERE id IN ({','.join('?' * len(chunk))})",
                 tuple(chunk))]
     elif body.kind:
-        _, rows = await views.issues_for(artist_dir=body.artist_dir, kinds=[body.kind],
-                                         states=states, q=body.q, filter_=body.filter,
-                                         limit=100000)
+        listed = ISSUE_STATES.get(body.state, takes) if body.state else takes
+        states = tuple(s for s in listed if s in takes)
+        rows = []
+        if states:
+            _, rows = await views.issues_for(artist_dir=body.artist_dir, kinds=[body.kind],
+                                             states=states, q=body.q, filter_=body.filter,
+                                             limit=100000)
     else:
         raise HTTPException(422, "pass ids, or a kind")
     skip = set(body.exclude or ())
@@ -323,7 +337,7 @@ async def triage_matches(body: SelectIn):
 
 @router.post("/issues/dismiss")
 async def dismiss_issues(body: IdsIn):
-    rows = await _selected(body, states=views.OPEN_STATES) if (body.ids or body.kind) else []
+    rows = await _selected(body, takes=DISMISS_TAKES) if (body.ids or body.kind) else []
     if not rows:
         return {"dismissed": 0}
     for issue in rows:

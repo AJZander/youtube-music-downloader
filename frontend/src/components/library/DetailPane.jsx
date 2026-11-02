@@ -49,10 +49,12 @@ function Empty({ children }) {
   )
 }
 
-/** Open issues first, resolved ones behind a toggle. */
+const LISTED = new Set(['open', 'failed', 'queued', 'tried'])
+
+/** Open issues (with those under way and the Tried bucket) first, resolved ones behind a toggle. */
 function IssuesSection({ issues, onChanged, notify }) {
   const [showAll, setShowAll] = useState(false)
-  const open = (issues || []).filter((i) => i.state === 'open' || i.state === 'failed' || i.state === 'queued')
+  const open = (issues || []).filter((i) => LISTED.has(i.state))
   const rest = (issues || []).filter((i) => !open.includes(i))
   if (!issues?.length) return null
   return (
@@ -152,6 +154,18 @@ function MissingTracks({ album, onDetail, notify }) {
   // A download already ran: what it fetched, or skipped as already in the
   // library, isn't fetched again unless retried.
   const tried = !queued && (m.download?.attempts?.length > 0 || !!m.download?.job_id)
+  // the Tried bucket: asked again, nothing was left to fetch
+  const bucket = m.state === 'tried'
+  const accept = async () => {
+    setBusy(true)
+    try {
+      await api.libraryDismissIssues([m.issue_id])
+      notify?.('Accepted incomplete: not reported again', 'success')
+      onDetail?.(await api.libraryAlbum(albumRef(album)))
+    } catch (e) {
+      notify?.(e.message, 'error')
+    } finally { setBusy(false) }
+  }
   const download = async (force = false) => {
     setBusy(true)
     try {
@@ -175,7 +189,7 @@ function MissingTracks({ album, onDetail, notify }) {
   // A few songs of a bigger album aren't an album with gaps: the rest is
   // shown, not flagged.
   return (
-    <Alert severity={m.partial ? 'info' : 'warning'} sx={{ m: 1 }}
+    <Alert severity={m.partial || bucket ? 'info' : 'warning'} sx={{ m: 1 }}
       action={(
         <Stack direction="row" spacing={0.5}>
           <Button size="small" color="inherit" disabled={busy} onClick={() => download()}
@@ -192,14 +206,26 @@ function MissingTracks({ album, onDetail, notify }) {
               </span>
             </Tooltip>
           )}
+          {bucket && m.issue_id && (
+            <Tooltip title="Stop reporting the tracks YouTube Music doesn't have">
+              <span>
+                <Button size="small" color="inherit" disabled={busy} onClick={accept}
+                  startIcon={<VisibilityOffIcon fontSize="small" />}>
+                  Accept incomplete
+                </Button>
+              </span>
+            </Tooltip>
+          )}
         </Stack>
       )}>
       <Typography variant="body2" sx={{ fontWeight: 500 }}>
-        {m.partial
-          ? `${m.have} of the album's ${m.total} tracks are in the library`
-          : `${m.tracks.length} of ${m.total} tracks missing`}
+        {bucket
+          ? `Tried — ${m.tracks.length} of ${m.total} not available`
+          : m.partial
+            ? `${m.have} of the album's ${m.total} tracks are in the library`
+            : `${m.tracks.length} of ${m.total} tracks missing`}
         {queued && ' — download queued'}
-        {tried && ' — already tried'}
+        {tried && !bucket && ' — already tried'}
       </Typography>
       <Box sx={{ columns: m.tracks.length > 8 ? 2 : 1, mt: 0.25 }}>
         {m.tracks.map((t) => (

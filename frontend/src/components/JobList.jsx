@@ -1,5 +1,6 @@
+import { useState } from 'react'
 import {
-  Box, Chip, IconButton, LinearProgress, Paper, Tooltip, Typography,
+  Alert, Box, Chip, IconButton, LinearProgress, Paper, Tooltip, Typography,
 } from '@mui/material'
 import DeleteIcon from '@mui/icons-material/Delete'
 import ReplayIcon from '@mui/icons-material/Replay'
@@ -18,6 +19,10 @@ const RETRYABLE = new Set(['partial', 'failed', 'cancelled'])
 function JobCard({ job, selected, onSelect, onChanged }) {
   const handled = job.completed_tracks + job.skipped_tracks + job.failed_tracks
   const progress = job.total_tracks ? Math.round(100 * handled / job.total_tracks) : 0
+  // what went wrong with Retry or Remove, said rather than swallowed
+  const [error, setError] = useState(null)
+  const run = (fn) => fn().then(() => { setError(null); onChanged?.() })
+    .catch((e) => setError(e.message))
 
   return (
     <Paper
@@ -50,13 +55,13 @@ function JobCard({ job, selected, onSelect, onChanged }) {
         <Box sx={{ display: 'flex' }} onClick={(e) => e.stopPropagation()}>
           {RETRYABLE.has(job.status) && (
             <Tooltip title="Retry failed tracks">
-              <IconButton size="small" onClick={() => api.retryJob(job.id).then(onChanged)}>
+              <IconButton size="small" onClick={() => run(() => api.retryJob(job.id))}>
                 <ReplayIcon fontSize="small" />
               </IconButton>
             </Tooltip>
           )}
           <Tooltip title="Remove from history (files stay)">
-            <IconButton size="small" onClick={() => api.deleteJob(job.id).then(onChanged)}>
+            <IconButton size="small" onClick={() => run(() => api.deleteJob(job.id))}>
               <DeleteIcon fontSize="small" />
             </IconButton>
           </Tooltip>
@@ -66,6 +71,12 @@ function JobCard({ job, selected, onSelect, onChanged }) {
         <Typography variant="caption" color="error" sx={{ wordBreak: 'break-word' }}>
           {job.error_code}: {job.error_message}
         </Typography>
+      )}
+      {error && (
+        <Alert severity="error" sx={{ mt: 0.75, py: 0 }} onClick={(e) => e.stopPropagation()}
+          onClose={() => setError(null)}>
+          {error}
+        </Alert>
       )}
     </Paper>
   )

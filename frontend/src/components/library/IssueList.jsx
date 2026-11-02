@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert, Box, Button, Checkbox, Chip, CircularProgress, Dialog, DialogActions, DialogContent,
   DialogTitle, IconButton, InputAdornment, LinearProgress, Stack, TextField, ToggleButton,
@@ -10,9 +10,11 @@ import SearchIcon from '@mui/icons-material/Search'
 import UndoIcon from '@mui/icons-material/Undo'
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
 
-import { api } from '../../api.js'
+import { api, subscribeEvents } from '../../api.js'
 import { keepTextSelection, useShiftRange } from '../rangeSelect.js'
-import { BULK, KINDS, asText, kindLabel, severityColor, when } from './issues.js'
+import {
+  BULK, ISSUE_STATES, KINDS, asText, kindLabel, readRows, severityColor, stateLabel, when,
+} from './issues.js'
 
 const PAGE = 100
 
@@ -118,6 +120,9 @@ export function IssueRow({
   const kind = KINDS[issue.kind]
   const applyable = kind ? kind.applyable : !!issue.action_label
   const open = issue.state === 'open' || issue.state === 'failed'
+  // the Tried bucket: never queued again by itself; accepted, or retried
+  // from the album
+  const tried = issue.state === 'tried'
 
   const act = async (fn, message) => {
     setBusy(true)
@@ -153,10 +158,11 @@ export function IssueRow({
             </Tooltip>
           )}
           {issue.state !== 'open' && (
-            <Chip size="small" label={issue.state}
-              color={issue.state === 'failed' ? 'error'
-                : issue.state === 'applied' ? 'success' : 'default'}
-              sx={{ height: 18, fontSize: '0.68rem' }} />
+            <Tooltip title={ISSUE_STATES[issue.state]?.help || ''}>
+              <Chip size="small" label={stateLabel(issue)}
+                color={ISSUE_STATES[issue.state]?.color || 'default'}
+                sx={{ height: 18, fontSize: '0.68rem' }} />
+            </Tooltip>
           )}
         </Stack>
         <Typography variant="caption" color="text.secondary" display="block"
@@ -188,10 +194,11 @@ export function IssueRow({
             </span>
           </Tooltip>
         )}
-        {open && (
+        {(open || tried) && (
           <Tooltip title={issue.state === 'failed'
             ? "Clear it — don't report it again"
-            : "Not a problem — don't report it again"}>
+            : tried ? "Accept it incomplete — don't report it again"
+              : "Not a problem — don't report it again"}>
             <span>
               <IconButton size="small" disabled={busy}
                 onClick={() => act(() => api.libraryDismissIssues([issue.id]), 'Dismissed')}>
@@ -216,15 +223,21 @@ export function IssueRow({
 }
 
 /**
- * Every open issue of one kind, paged — the sidebar's "Review" — with
- * search, the kind's filters, and bulk actions on what is ticked: a page,
- * a shift-click range, or every issue that matches (less any unticked).
+ * Every issue of one kind that needs the user (open or failed), paged — the
+ * sidebar's "Review" — with search, the kind's filters, and bulk actions on
+ * what is ticked: a page, a shift-click range, or every issue that matches
+ * (less any unticked); "select all" takes what this list shows. `state`
+ * 'tried' lists the Tried bucket instead, where the action is to accept
+ * them incomplete. The list follows the runner as it works.
  */
-export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChanged, notify }) {
+export function IssueListDialog({
+  kind, artistDir, state = 'actionable', onClose, onNavigate, onChanged, notify,
+}) {
   const bulk = BULK[kind] || {}
-  const filters = [...(bulk.filters || []),
+  const inTried = state === 'tried'
+  const filters = inTried ? [] : [...(bulk.filters || []),
     { value: 'failed', label: 'Failed', help: 'Fixes that were tried and failed' }]
-  const applyable = !!KINDS[kind]?.applyable
+  const applyable = !!KINDS[kind]?.applyable && !inTried
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -245,24 +258,42 @@ export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChange
 
   const clearPicks = () => { setPicked(new Set()); setAll(false); setSkipped(new Set()) }
 
-  const load = useCallback((offset = 0) => {
+  const shown = useRef(0)
+  const load = useCallback((offset = 0, limit = PAGE) => {
     setLoading(true); setError(null)
-    api.libraryIssues({ kind, artist_dir: artistDir, state: 'open', q: query, filter,
-      limit: PAGE, offset })
+    readRows((o, l) => api.libraryIssues({
+      kind, artist_dir: artistDir, state, q: query, filter, limit: l, offset: o,
+    }), offset, limit)
       .then((d) => {
         setTotal(d.total)
-        setItems((prev) => (offset ? [...prev, ...d.items] : d.items))
+        setItems((prev) => {
+          const next = offset ? [...prev, ...d.items] : d.items
+          shown.current = next.length
+          return next
+        })
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
-  }, [kind, artistDir, query, filter])
+  }, [kind, artistDir, state, query, filter])
   useEffect(() => { clearPicks(); load(0) }, [load])
+
+  // As the runner applies fixes, what it has taken leaves the list: the
+  // pages shown are read again (picks stay), once a burst of events settles.
+  useEffect(() => {
+    let timer
+    const reload = () => {
+      clearTimeout(timer)
+      timer = setTimeout(() => load(0, Math.max(PAGE, shown.current)), 1500)
+    }
+    const stop = subscribeEvents({ 'library.issues': reload, 'library.changed': reload })
+    return () => { clearTimeout(timer); stop() }
+  }, [load])
 
   const isPicked = (id) => (all ? !skipped.has(id) : picked.has(id))
   const count = all ? Math.max(0, (total || 0) - skipped.size) : picked.size
   const pageOn = items.length > 0 && items.every((i) => isPicked(i.id))
   const selection = () => (all
-    ? { kind, artist_dir: artistDir, q: query || undefined, filter: filter || undefined,
+    ? { kind, artist_dir: artistDir, state, q: query || undefined, filter: filter || undefined,
       exclude: [...skipped] }
     : { ids: [...picked] })
 
@@ -309,7 +340,8 @@ export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChange
   const dismiss = () => act(
     (sel) => api.libraryDismissIssues(sel),
     (r) => `Dismissed ${r.dismissed}`,
-    count > 20 ? `${bulk.dismissLabel || 'Dismiss'} ${many(count)}${scope}? `
+    count > 20 ? `${inTried ? 'Accept incomplete' : bulk.dismissLabel || 'Dismiss'} `
+      + `${many(count)}${scope}? `
       + 'They will not be reported again.' : null)
   const triage = () => act(
     () => api.libraryTriageMatches({ artist_dir: artistDir }),
@@ -334,9 +366,9 @@ export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChange
     <Dialog open fullWidth maxWidth="md" onClose={onClose}>
       <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, pr: 1 }}>
         <Box sx={{ flexGrow: 1 }}>
-          {kindLabel(kind)}
+          {kindLabel(kind)}{inTried && ' — tried'}
           <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
-            {total != null && `${total.toLocaleString()} open`}
+            {total != null && `${total.toLocaleString()} ${inTried ? 'not available' : 'open'}`}
             {artistDir ? ` · ${artistDir}` : ' · whole library'}
           </Typography>
         </Box>
@@ -352,12 +384,12 @@ export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChange
         <IconButton onClick={onClose} aria-label="Close"><CloseIcon /></IconButton>
       </DialogTitle>
       <DialogContent dividers sx={{ p: 0 }}>
-        {KINDS[kind]?.help && (
+        {(inTried ? ISSUE_STATES.tried.help : KINDS[kind]?.help) && (
           <Typography variant="body2" color="text.secondary" sx={{ px: 2, pt: 1 }}>
-            {KINDS[kind].help}
+            {inTried ? ISSUE_STATES.tried.help : KINDS[kind].help}
           </Typography>
         )}
-        {bulk.triage && !artistDir && (
+        {bulk.triage && !artistDir && !inTried && (
           <Alert severity="info" sx={{ mx: 2, mt: 1 }}
             action={<Button size="small" disabled={busy} onClick={triage}>Settle them</Button>}>
             Settle what the files settle: accept matches where every file matched and the
@@ -410,7 +442,7 @@ export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChange
               {actionLabel}
             </Button>
           )}
-          {(bulk.decisions || []).map((d) => (
+          {(inTried ? [] : bulk.decisions || []).map((d) => (
             <Tooltip key={d.decision} title={d.help || ''}>
               <span>
                 <Button size="small" variant="outlined" disabled={!count || busy}
@@ -420,11 +452,12 @@ export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChange
               </span>
             </Tooltip>
           ))}
-          <Tooltip title="Not a problem — don't report these again">
+          <Tooltip title={inTried ? "Accept them incomplete — don't report these again"
+            : "Not a problem — don't report these again"}>
             <span>
               <Button size="small" disabled={!count || busy} onClick={dismiss}
                 startIcon={<VisibilityOffIcon fontSize="small" />}>
-                {bulk.dismissLabel || 'Dismiss'}
+                {inTried ? 'Accept incomplete' : bulk.dismissLabel || 'Dismiss'}
               </Button>
             </span>
           </Tooltip>
@@ -433,7 +466,7 @@ export function IssueListDialog({ kind, artistDir, onClose, onNavigate, onChange
         {error && <Alert severity="error" sx={{ m: 2 }}>{error}</Alert>}
         {total === 0 && (
           <Typography color="text.secondary" sx={{ p: 3, textAlign: 'center' }}>
-            {query || filter ? 'Nothing open matches.' : 'Nothing open.'}
+            {query || filter ? 'Nothing matches.' : inTried ? 'Nothing tried.' : 'Nothing open.'}
           </Typography>
         )}
         {items.map((issue) => (

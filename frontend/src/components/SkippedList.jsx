@@ -15,16 +15,23 @@ export default function SkippedList({ onChanged }) {
 
   const [recheck, setRecheck] = useState(null)
   const [notice, setNotice] = useState(null)
+  // what went wrong with the last action or load, said rather than swallowed
+  const [error, setError] = useState(null)
 
   const refresh = useCallback(() => {
     api.skipped({ limit: 500, only_different_album: onlyDifferent })
-      .then(setData).catch(() => {})
+      .then(setData).catch((e) => setError(e.message))
     api.skippedRecheckPreview().then(setRecheck).catch(() => {})
   }, [onlyDifferent])
   useEffect(() => { refresh(); setShown(PAGE) }, [refresh])
 
   const act = async (id, action) => {
-    await api.resolveTrack(id, action)
+    try {
+      await api.resolveTrack(id, action)
+      setError(null)
+    } catch (e) {
+      setError(e.message)
+    }
     refresh(); onChanged?.()
   }
 
@@ -34,6 +41,7 @@ export default function SkippedList({ onChanged }) {
       + 'clears the list.')) return
     setBusy(true)
     try { await api.acknowledgeSkipped(null); refresh(); onChanged?.() }
+    catch (e) { setError(e.message) }
     finally { setBusy(false) }
   }
 
@@ -47,6 +55,8 @@ export default function SkippedList({ onChanged }) {
       const r = await api.skippedRecheck()
       setNotice(`Re-queued ${r.requeued} tracks from ${r.jobs} downloads.`)
       refresh(); onChanged?.()
+    } catch (e) {
+      setError(e.message)
     } finally { setBusy(false) }
   }
 
@@ -56,6 +66,8 @@ export default function SkippedList({ onChanged }) {
     <>
       {notice && <Alert severity="success" sx={{ mb: 1.5 }} onClose={() => setNotice(null)}>
         {notice}</Alert>}
+      {error && <Alert severity="error" sx={{ mb: 1.5 }} onClose={() => setError(null)}>
+        {error}</Alert>}
       {recheck?.tracks > 0 && (
         <Alert severity="info" sx={{ mb: 1.5 }}
           action={<Button size="small" color="inherit" disabled={busy} onClick={runRecheck}>

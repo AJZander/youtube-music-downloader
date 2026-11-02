@@ -61,14 +61,11 @@ async def overview() -> dict:
         "albums_total", "albums_checked", "albums_resolved", "plex_artists",
         "plex_unmatched_artists", "plex_albums", "plex_unmatched_albums", "plex_tracks",
         "files_not_in_plex", "files_with_mbids", "albums_with_genre", "albums_with_mood")}
-    rows = await db.fetchall("SELECT kind, COUNT(*) AS n FROM md_issues "
-                             "WHERE state IN ('open', 'failed', 'queued') GROUP BY kind")
-    by_kind = {r["kind"]: r["n"] for r in rows}
     prefs_row = await one("SELECT value FROM md_state WHERE key = 'plex_prefs'")
     prefs = json.loads(prefs_row["value"]) if prefs_row and prefs_row["value"] else {}
     return {
         **base, "coverage": coverage,
-        "issues": {"open": sum(by_kind.values()), "by_kind": by_kind},
+        "issues": await issues_mod.counts(),
         "metadata": await runner.status(),
         "plex": {"reachable": await plex.reachable(), "last_sync": _iso(synced),
                  "settings": {k: prefs.get(k) for k in ("respectTags", "genres", "albumPosters")}},
@@ -77,9 +74,10 @@ async def overview() -> dict:
 
 # ------------------------------------------------------------------ issues
 async def _issue_counts_by_artist() -> dict[str, Counter]:
+    """What needs the user, by artist and kind (issues.ATTENTION_STATES)."""
     rows = await db.fetchall(
         "SELECT r.artist_dir, i.kind, COUNT(DISTINCT i.id) AS n FROM md_issues i "
-        "JOIN md_issue_refs r ON r.issue_id = i.id WHERE i.state IN ('open', 'failed', 'queued') "
+        "JOIN md_issue_refs r ON r.issue_id = i.id WHERE i.state IN ('open', 'failed') "
         "AND r.artist_dir IS NOT NULL GROUP BY r.artist_dir, i.kind")
     out: dict[str, Counter] = {}
     for r in rows:
@@ -179,7 +177,11 @@ async def _unit_ids(keys: list[str]) -> dict[str, str]:
 
 
 async def attention(artist_dir: str | None = None) -> dict:
-    joins, where, params = "", "i.state IN ('open', 'failed', 'queued')", []
+    """Needs attention, by kind: `count` is what needs the user (open and
+    failed, issues.ATTENTION_STATES), and the total is theirs. Beside it,
+    what is under way (`queued_count`) and the Tried bucket (`tried_count`),
+    so a kind with only those still shows."""
+    joins, where, params = "", "i.state IN ('open', 'failed', 'queued', 'tried')", []
     if artist_dir is not None:
         joins = "JOIN md_issue_refs r ON r.issue_id = i.id"
         where += " AND r.artist_dir = ?"
@@ -187,10 +189,12 @@ async def attention(artist_dir: str | None = None) -> dict:
     bulk = " OR ".join(f"(i.kind = '{kind}' AND ({ISSUE_FILTERS[f]}))"
                        for kind, f in BULK_FILTERS.items())
     rows = await db.fetchall(
-        f"SELECT i.kind, COUNT(DISTINCT i.id) AS n, "
+        f"SELECT i.kind, "
+        f"COUNT(DISTINCT CASE WHEN i.state IN ('open', 'failed') THEN i.id END) AS n, "
         f"COUNT(DISTINCT CASE WHEN i.auto = 1 AND i.state = 'open' THEN i.id END) AS auto_n, "
         f"COUNT(DISTINCT CASE WHEN i.state = 'failed' THEN i.id END) AS failed_n, "
         f"COUNT(DISTINCT CASE WHEN i.state = 'queued' THEN i.id END) AS queued_n, "
+        f"COUNT(DISTINCT CASE WHEN i.state = 'tried' THEN i.id END) AS tried_n, "
         f"COUNT(DISTINCT CASE WHEN i.state IN ('open', 'failed') AND ({bulk}) "
         f"THEN i.id END) AS bulk_n "
         f"FROM md_issues i {joins} WHERE {where} GROUP BY i.kind", tuple(params))
@@ -200,7 +204,8 @@ async def attention(artist_dir: str | None = None) -> dict:
         groups.append({"kind": r["kind"], "label": meta.get("label", r["kind"]),
                        "severity": meta.get("severity", "info"), "count": r["n"],
                        "auto_count": r["auto_n"], "failed_count": r["failed_n"],
-                       "queued_count": r["queued_n"], "applyable": bool(meta.get("applyable")),
+                       "queued_count": r["queued_n"], "tried_count": r["tried_n"],
+                       "applyable": bool(meta.get("applyable")),
                        "action_label": meta.get("action"),
                        "description": meta.get("description")})
         if r["kind"] in BULK_FILTERS:
@@ -513,7 +518,8 @@ async def album(key: str) -> dict | None:
                                 (f"missing_tracks:{record['release_mbid']}",))
         if row and row["state"] in OPEN_STATES:
             d = json.loads(row["detail"] or "{}")
-            missing = {"issue_id": row["id"], "total": d.get("total"), "have": d.get("have"),
+            missing = {"issue_id": row["id"], "state": row["state"],
+                       "total": d.get("total"), "have": d.get("have"),
                        "tracks": d.get("missing") or [], "download": d.get("download"),
                        "partial": False,
                        "other_folders": [u for u in d.get("units") or [] if u != key]}
@@ -522,8 +528,9 @@ async def album(key: str) -> dict | None:
             # is worth showing
             d = await missing_tracks.compute(record["release_mbid"])
             if d and d["missing"] and d["partial"]:
-                missing = {"issue_id": None, "total": d["total"], "have": d["have"],
-                           "tracks": d["missing"], "download": None, "partial": True,
+                missing = {"issue_id": None, "state": None, "total": d["total"],
+                           "have": d["have"], "tracks": d["missing"], "download": None,
+                           "partial": True,
                            "other_folders": [u for u in d["units"] if u != key]}
     return {
         **summary,
