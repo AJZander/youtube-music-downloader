@@ -16,10 +16,12 @@ log = logging.getLogger("mdl.index")
 AUDIO_SUFFIXES = {".mp3", ".flac", ".opus", ".m4a", ".ogg", ".wav", ".aac", ".wma"}
 
 
-async def find_duplicate(provider_track_id: str | None, artist: str | None,
-                         title: str | None, album: str | None = None,
-                         duration: float | None = None) -> str | None:
-    """The library path of this track on this album, if it is already there.
+async def find_duplicate_match(provider_track_id: str | None, artist: str | None,
+                               title: str | None, album: str | None = None,
+                               duration: float | None = None) -> dict | None:
+    """The library's copy of this track on this album, if it is already
+    there: the whole ownership lookup, so a skip can say what it matched and
+    how (`library_via`, `library_mismatch`).
 
     Same album only (ownership.LibraryIndex.lookup): the song on a
     compilation or a single is not a reason to skip it on the album being
@@ -29,7 +31,23 @@ async def find_duplicate(provider_track_id: str | None, artist: str | None,
     index = await ownership.load_index({artist or ""}, [primary], [provider_track_id])
     found = index.lookup(title=title, credit=artist, album=album,
                          video_id=provider_track_id, length=duration)
-    return found["library_path"] if found["library"] == "have" else None
+    return found if found["library"] == "have" else None
+
+
+async def find_duplicate(provider_track_id: str | None, artist: str | None,
+                         title: str | None, album: str | None = None,
+                         duration: float | None = None) -> str | None:
+    """The library path of this track on this album, if it is already there
+    (see find_duplicate_match)."""
+    found = await find_duplicate_match(provider_track_id, artist, title, album, duration)
+    return found["library_path"] if found else None
+
+
+def held_message(found: dict) -> str:
+    """Why the dedup gate skipped a track, for the Skipped list."""
+    note = "; version or length differs" if found.get("library_mismatch") else ""
+    return (f"Already in the library: {found['library_path']} "
+            f"(matched by {found.get('library_via') or 'title'}{note})")
 
 
 async def in_legacy_archive(provider: str, provider_id: str) -> bool:

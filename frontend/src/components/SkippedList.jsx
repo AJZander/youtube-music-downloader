@@ -118,6 +118,11 @@ export default function SkippedList({ onChanged }) {
           <Typography variant="caption" color="text.secondary" display="block">
             Already in library: {t.matched_path || '(unknown)'}
           </Typography>
+          {t.error_message && (
+            <Typography variant="caption" color="text.secondary" display="block">
+              Why: {t.error_message}
+            </Typography>
+          )}
           <Box sx={{ mt: 1, display: 'flex', gap: 1 }}>
             <Button size="small" variant="outlined"
               onClick={() => act(t.id, 'force_download')}

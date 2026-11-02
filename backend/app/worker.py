@@ -21,7 +21,7 @@ from .engine import tagger
 from .events import bus
 from .importer import (ImportError_, ensure_sentinel, import_track,
                        library_online, quarantine, scan_debouncer)
-from .library_index import add_entry, find_duplicate, in_legacy_archive
+from .library_index import add_entry, find_duplicate_match, held_message, in_legacy_archive
 from .models import ErrorClass, JobStatus, TrackStatus, TERMINAL_TRACK_STATUSES
 from .plex import plex
 from .validator import ALLOWED_SUFFIXES, ValidationError, validate_track
@@ -361,13 +361,16 @@ class Worker:
 
             # -------- pre-download dedup
             if not force_guards:
-                dup = await find_duplicate(track["provider_track_id"],
-                                           track["artist"], track["title"],
-                                           track["album"], track["expected_duration_sec"])
+                dup = await find_duplicate_match(track["provider_track_id"],
+                                                 track["artist"], track["title"],
+                                                 track["album"], track["expected_duration_sec"])
                 if dup:
+                    # The reason replaces whatever an earlier attempt left.
                     await self._update_track(
                         track_id, status=TrackStatus.SKIPPED_DUPLICATE,
-                        stage=None, library_path=dup, finished_at=utcnow())
+                        stage=None, library_path=dup["library_path"],
+                        error_code="held_same_album", error_message=held_message(dup)[:500],
+                        finished_at=utcnow())
                     await self._recompute_job(job_id)
                     return
             if track["provider_track_id"] and await in_legacy_archive(
@@ -626,6 +629,8 @@ class Worker:
                           ignore_errors=True)
             await self._update_track(track["id"], status=TrackStatus.SKIPPED_DUPLICATE,
                                      stage=None, library_path=exc.path,
+                                     error_code="dest_exists",
+                                     error_message=f"A file is already at {exc.path}"[:500],
                                      finished_at=utcnow())
             return
         # staging is intact — auto-retried by maintenance when the mount is healthy

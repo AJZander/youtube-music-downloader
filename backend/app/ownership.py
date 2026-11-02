@@ -144,10 +144,10 @@ def _info(row: dict) -> dict:
 def no_match() -> dict:
     return {"library": None, "library_path": None, "library_duration": None,
             "library_markers": [], "library_upload": False, "library_mismatch": False,
-            "library_folder": None}
+            "library_folder": None, "library_via": None}
 
 
-def _match(state: str, info: dict, mismatch: bool = False) -> dict:
+def _match(state: str, info: dict, mismatch: bool = False, via: str | None = None) -> dict:
     return {"library": state, "library_path": info["path"],
             "library_duration": info["duration"],
             "library_markers": sorted(info["markers"]),
@@ -155,7 +155,9 @@ def _match(state: str, info: dict, mismatch: bool = False) -> dict:
             "library_upload": info["upload"],
             # The copy looks like another recording: other version or length.
             "library_mismatch": mismatch,
-            "library_folder": info["folder"]}
+            "library_folder": info["folder"],
+            # How it was found: "video", "exact title" or "fuzzy".
+            "library_via": via}
 
 
 class LibraryIndex:
@@ -202,26 +204,32 @@ class LibraryIndex:
 
         same_video = self.by_id.get(video_id) or [] if video_id else []
         if not album:
-            return _match("have", same_video[0]) if same_video else no_match()
+            return _match("have", same_video[0], via="video") if same_video else no_match()
 
         # The old gate's rule — same video, or same artist + title — finds the
         # same song even where the version or length disagree; the wider
         # matching only counts copies that agree on both.
-        exact = same_video + self.exact.get(
-            (normalize(credit or ""), normalize(title or "")), [])
+        same_title = self.exact.get((normalize(credit or ""), normalize(title or "")), [])
+        exact = same_video + same_title
         fuzzy = sorted({id(c): c for key in title_keys(title)
                         for c in self.fuzzy.get(key, []) if agrees(c)}.values(), key=gap)
         wanted = album_identity(album)
 
+        def via(info):
+            if any(info is c for c in same_video):
+                return "video"
+            return "exact title" if any(info is c for c in same_title) else "fuzzy"
+
         for info in exact:
             if info["albums"] & wanted:
-                return _match("have", info, mismatch=not agrees(info))
+                return _match("have", info, mismatch=not agrees(info), via=via(info))
         for info in fuzzy:
             if info["albums"] & wanted:
-                return _match("have", info)
+                return _match("have", info, via="fuzzy")
         elsewhere = [i for i in exact if agrees(i)] + fuzzy + exact
         if elsewhere:
-            return _match("elsewhere", elsewhere[0], mismatch=not agrees(elsewhere[0]))
+            return _match("elsewhere", elsewhere[0], mismatch=not agrees(elsewhere[0]),
+                          via=via(elsewhere[0]))
         return no_match()
 
 
