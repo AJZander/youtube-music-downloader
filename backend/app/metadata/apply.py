@@ -112,12 +112,19 @@ async def journal(batch: str, target: str, ref: str, field: str, old, new, summa
          json.dumps(old, default=str), json.dumps(new, default=str), summary, utcnow()))
 
 
+# The journal's lookups, by name, so a test can ask SQLite how each is
+# answered (idx_changes_target_ref, idx_changes_target_field_at: db v14)
+OURS_LOCKED = ("SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? AND field = ? "
+               "AND reverted_at IS NULL LIMIT 1")
+OSCILLATION = ("SELECT id, ref, new_value FROM md_changes WHERE target = 'move' "
+               "AND field = 'file' AND reverted_at IS NULL AND applied_at >= ? ORDER BY id")
+CURRENT_PATH = ("SELECT new_value FROM md_changes WHERE target = 'move' AND ref = ? "
+                "AND reverted_at IS NULL ORDER BY id DESC LIMIT 1")
+
+
 async def ours_locked(rating_key: str, field: str) -> bool:
     """Did we lock this Plex field? (A lock we didn't set is the user's.)"""
-    row = await db.fetchone(
-        "SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? AND field = ? "
-        "AND reverted_at IS NULL LIMIT 1", (rating_key, field))
-    return row is not None
+    return await db.fetchone(OURS_LOCKED, (rating_key, field)) is not None
 
 
 def _require_online() -> None:
@@ -148,22 +155,23 @@ async def rekey_unit(old_key: str, new_key: str, artist_dir: str, paths=()) -> s
     already at new_key (another disc of it, the copy it merged into), it
     becomes that one, decisions and all (units.merge_into). Its issues keep
     their ids: the re-check updates them in place. Returns the unit id the
-    album has now."""
+    album has now. One transaction."""
     from . import units
-    uid = await units.unit_id_of(old_key)
-    if old_key != new_key:
-        there = await units.unit_id_of(new_key)
-        if there:
-            # the moved files are the mover's until the merge makes them
-            # that album's (so they don't count as what it already was)
-            await units.stamp(uid, paths)
-            await units.merge_into(uid, there, reason=f"moved into {new_key}")
-            uid = there
-        elif uid:
-            await units.rekey(old_key, new_key, artist_dir=artist_dir)
-        # what still names the old key (an album with no record of its own)
-        await units.repoint(old_key, new_key, artist_dir)
-    await units.stamp(uid, paths)
+    async with db.transaction():
+        uid = await units.unit_id_of(old_key)
+        if old_key != new_key:
+            there = await units.unit_id_of(new_key)
+            if there:
+                # the moved files are the mover's until the merge makes them
+                # that album's (so they don't count as what it already was)
+                await units.stamp(uid, paths)
+                await units.merge_into(uid, there, reason=f"moved into {new_key}")
+                uid = there
+            elif uid:
+                await units.rekey(old_key, new_key, artist_dir=artist_dir)
+            # what still names the old key (an album with no record of its own)
+            await units.repoint(old_key, new_key, artist_dir)
+        await units.stamp(uid, paths)
     return uid
 
 
@@ -422,9 +430,7 @@ async def oscillation(moves: list[dict]) -> tuple[str, str] | None:
         return None
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - OSCILLATION_WINDOW))
     arrived: dict[str, list[tuple[int, str]]] = {}     # path -> [(change id, where from)]
-    for r in await db.fetchall(
-            "SELECT id, ref, new_value FROM md_changes WHERE target = 'move' AND field = 'file' "
-            "AND reverted_at IS NULL AND applied_at >= ? ORDER BY id", (since,)):
+    for r in await db.fetchall(OSCILLATION, (since,)):
         try:
             new = json.loads(r["new_value"])
         except (TypeError, ValueError):
@@ -1521,9 +1527,7 @@ async def current_path(path: str) -> str:
     seen = set()
     while path not in seen:
         seen.add(path)
-        row = await db.fetchone(
-            "SELECT new_value FROM md_changes WHERE target = 'move' AND ref = ? "
-            "AND reverted_at IS NULL ORDER BY id DESC LIMIT 1", (path,))
+        row = await db.fetchone(CURRENT_PATH, (path,))
         if row is not None:
             path = json.loads(row["new_value"])
             continue

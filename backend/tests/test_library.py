@@ -1,5 +1,6 @@
 """Run with: python -m unittest discover backend/tests"""
 import asyncio
+import contextlib
 import os
 import sys
 import tempfile
@@ -13,6 +14,12 @@ from app import library
 from app.library import (LibraryError, album_key, find_album_duplicates,
                          find_split_artists, find_track_duplicates, score_file,
                          strict_key, title_keys, title_looks_like_junk)
+
+
+@contextlib.asynccontextmanager
+async def no_transaction():
+    """db.transaction, for a database stubbed out statement by statement."""
+    yield
 
 
 def file_row(path, title, *, fmt="flac", album=None, album_artist=None,
@@ -465,6 +472,7 @@ class TrashTestCase(unittest.TestCase):
             mock.patch.object(library, "_require_online", lambda: None),
             mock.patch.object(library, "_refresh_plex", mock.AsyncMock()),
             mock.patch.object(library.db, "execute", mock.AsyncMock()),
+            mock.patch.object(library.db, "transaction", no_transaction),
             mock.patch.object(library.db, "executemany",
                               mock.AsyncMock(side_effect=lambda sql, rows:
                                              self.executed.extend(rows))),
@@ -583,6 +591,7 @@ class MergeArtistsTestCase(unittest.TestCase):
             mock.patch.object(library.relocate, "relocate", mock.AsyncMock(return_value={})),
             mock.patch.object(library.db, "fetchall", mock.AsyncMock(return_value=[])),
             mock.patch.object(library.db, "execute", mock.AsyncMock()),
+            mock.patch.object(library.db, "transaction", no_transaction),
             mock.patch.object(library.db, "executemany",
                               mock.AsyncMock(side_effect=lambda sql, rows:
                                              self.trashed.extend(rows))),
@@ -917,6 +926,7 @@ class BoxSetSweepTestCase(unittest.TestCase):
             mock.patch.object(library, "_require_online", lambda: None),
             mock.patch.object(library, "_refresh_plex", mock.AsyncMock()),
             mock.patch.object(library.db, "execute", mock.AsyncMock()),
+            mock.patch.object(library.db, "transaction", no_transaction),
             mock.patch.object(library.db, "executemany",
                               mock.AsyncMock(side_effect=lambda sql, rows:
                                              self.recorded.extend(rows))),

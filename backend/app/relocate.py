@@ -15,7 +15,8 @@ registers the same function in SQL as path_key(). A folder the library
 already has, in any case, is spelled the library's way (on_disk).
 
 Only the database changes here: the files have moved already. Each call is
-one section of statements (P1-F5 makes it one transaction)."""
+one transaction (db.transaction), with what it reads from the files read
+before it starts."""
 from __future__ import annotations
 
 import asyncio
@@ -77,20 +78,22 @@ async def relocate(pairs, *, units: dict[str, str] | None = None,
     units = units or {}
     if not pairs and not units:
         return {}
-    if pairs:
-        # a row already at a new path is for a file that wasn't there (the
-        # move found the name free): it gives way
-        await db.executemany(
-            "UPDATE OR REPLACE library_index SET path = ?, dirpath = ?, artist_dir = ?, "
-            "path_key = ? WHERE path = ?",
-            [(new, *place(new), path_key(new), old) for old, new in pairs])
-        if reread:
-            await reread_files([new for _, new in pairs])
-        await _follow_tracks(pairs)
-        for old, new in pairs:
-            await rekey_exclusions("track", old, new)
-    moved = await _follow_folders(pairs, units)
-    await bump()
+    read = await read_files([new for _, new in pairs]) if pairs and reread else []
+    async with db.transaction():
+        if pairs:
+            # a row already at a new path is for a file that wasn't there (the
+            # move found the name free): it gives way
+            await db.executemany(
+                "UPDATE OR REPLACE library_index SET path = ?, dirpath = ?, artist_dir = ?, "
+                "path_key = ? WHERE path = ?",
+                [(new, *place(new), path_key(new), old) for old, new in pairs])
+            if read:
+                await _index(read)
+            await _follow_tracks(pairs)
+            for old, new in pairs:
+                await rekey_exclusions("track", old, new)
+        moved = await _follow_folders(pairs, units)
+        await bump()
     return moved
 
 
@@ -108,7 +111,12 @@ async def _follow_tracks(pairs: list[tuple[str, str]]) -> None:
                 (*olds, *(path_key(o) for o in olds))):
             updates.append((to[path_key(r["library_path"])], r["id"]))
     if updates:
-        await db.executemany("UPDATE tracks SET library_path = ? WHERE id = ?", updates)
+        await db.executemany(TRACK_PATH, updates)
+
+
+# by name, so a test can ask SQLite how it is answered (by the primary key;
+# the lookup above matches any spelling, path_key(), which no index serves)
+TRACK_PATH = "UPDATE tracks SET library_path = ? WHERE id = ?"
 
 
 async def rekey_exclusions(scope: str, old: str, new: str) -> None:
@@ -249,14 +257,15 @@ async def forget(paths, folders=()) -> None:
     library_path is the file's history, and a path in Trash is not lost),
     so a restore finds them named where they were."""
     paths = list(paths)
-    for i in range(0, len(paths), 400):
-        chunk = paths[i:i + 400]
-        await db.execute(f"DELETE FROM library_index WHERE path IN ({','.join('?' * len(chunk))})",
-                         tuple(chunk))
-    for folder in folders:
-        await db.execute("DELETE FROM library_index WHERE path >= ? AND path < ?",
-                         (folder + "/", folder + "0"))
-    await bump()
+    async with db.transaction():
+        for i in range(0, len(paths), 400):
+            chunk = paths[i:i + 400]
+            await db.execute(f"DELETE FROM library_index WHERE path IN "
+                             f"({','.join('?' * len(chunk))})", tuple(chunk))
+        for folder in folders:
+            await db.execute("DELETE FROM library_index WHERE path >= ? AND path < ?",
+                             (folder + "/", folder + "0"))
+        await bump()
 
 
 async def unforget(paths) -> int:
@@ -279,10 +288,12 @@ async def unforget(paths) -> int:
         return out
 
     files = await _run(audio)
-    read = await reread_files(files)
-    await _relink(files)
-    await bump()
-    return read
+    read = await read_files(files)
+    async with db.transaction():
+        await _index(read)
+        await _relink(files)
+        await bump()
+    return len(read)
 
 
 async def _relink(paths: list[str]) -> None:
@@ -307,6 +318,20 @@ async def reread_files(paths: list[str]) -> int:
     """Read these files into the index as the scan does (one not there, or
     that the scan wouldn't index, is skipped: a folder, a cover, a dot
     name). Returns how many were read."""
+    rows = await read_files(paths)
+    await _index(rows)
+    return len(rows)
+
+
+async def _index(rows: list[tuple]) -> None:
+    from . import library
+    if rows:
+        await db.executemany(library._UPSERT, rows)
+
+
+async def read_files(paths: list[str]) -> list[tuple]:
+    """The index rows of these files, read as the scan reads them (see
+    reread_files); nothing is written."""
     from . import library
     root = settings.library_dir
 
@@ -325,10 +350,7 @@ async def reread_files(paths: list[str]) -> int:
             out.append(library._read_file(root, rel, st.st_size, st.st_mtime))
         return out
 
-    rows = await _run(read_all)
-    if rows:
-        await db.executemany(library._UPSERT, rows)
-    return len(rows)
+    return await _run(read_all)
 
 
 async def on_disk(folder: str) -> str:

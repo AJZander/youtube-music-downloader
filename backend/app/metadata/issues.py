@@ -180,7 +180,14 @@ async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: st
                artist_dir: str | None = None, all_scope: bool = False,
                close_others: bool = True) -> None:
     """Upsert `items` and close every other open issue of `scope_kinds` in the
-    same scope (this album, this artist, or everywhere)."""
+    same scope (this album, this artist, or everywhere). All of it, or (on
+    an error) none: one transaction."""
+    async with db.transaction():
+        await _save(items, scope_kinds, album_key, artist_dir, all_scope, close_others)
+
+
+async def _save(items: list[dict], scope_kinds: tuple[str, ...], album_key: str | None,
+                artist_dir: str | None, all_scope: bool, close_others: bool) -> None:
     now = utcnow()
     keys = {i["key"] for i in items}
     for item in items:
@@ -630,6 +637,10 @@ async def foreign_detail(plex_album: dict, foreign: list[dict]) -> dict:
 # Matches of one Plex item to different releases within this long mean two
 # units take it for theirs, each undoing the other's match.
 FLIPFLOP_WINDOW = 14 * 86400
+# by name, like apply.OURS_LOCKED: served by idx_changes_target_ref (db v14)
+MATCH_FLIPFLOP = ("SELECT album_key, new_value, applied_at FROM md_changes WHERE target = 'plex' "
+                  "AND field = 'match' AND ref = ? AND reverted_at IS NULL AND applied_at >= ? "
+                  "ORDER BY id")
 
 
 async def match_flipflop(rating_key: str) -> list[dict]:
@@ -638,10 +649,7 @@ async def match_flipflop(rating_key: str) -> list[dict]:
     otherwise none."""
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - FLIPFLOP_WINDOW))
     matches = []
-    for r in await db.fetchall(
-            "SELECT album_key, new_value, applied_at FROM md_changes WHERE target = 'plex' "
-            "AND field = 'match' AND ref = ? AND reverted_at IS NULL AND applied_at >= ? "
-            "ORDER BY id", (rating_key, since)):
+    for r in await db.fetchall(MATCH_FLIPFLOP, (rating_key, since)):
         try:
             guid = (json.loads(r["new_value"]) or {}).get("guid")
         except (TypeError, ValueError, AttributeError):
@@ -652,14 +660,14 @@ async def match_flipflop(rating_key: str) -> list[dict]:
 
 
 SHARED_FIELDS = ("match", "genre", "mood")
+CHANGED_BY_US = ("SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? "
+                 f"AND reverted_at IS NULL AND field IN ({','.join('?' * len(SHARED_FIELDS))}) "
+                 "LIMIT 1")
 
 
 async def changed_by_us(rating_key: str) -> bool:
     """Whether we matched or tagged this Plex album and have not put it back."""
-    marks = ",".join("?" * len(SHARED_FIELDS))
-    return await db.fetchone(
-        "SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? AND reverted_at IS NULL "
-        f"AND field IN ({marks}) LIMIT 1", (rating_key, *SHARED_FIELDS)) is not None
+    return await db.fetchone(CHANGED_BY_US, (rating_key, *SHARED_FIELDS)) is not None
 
 
 def same_file(a: Path, b: Path) -> bool:

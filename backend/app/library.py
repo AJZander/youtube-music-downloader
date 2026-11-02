@@ -1263,6 +1263,9 @@ async def _trash(relpaths: list[str], reason: str) -> dict:
         except OSError as exc:
             log.warning("could not clear emptied folder %s: %s", dirrel, exc)
 
+    # Trash's record of them first, on its own: they are in Trash already,
+    # and a failure leaving the index mustn't take the record (what the
+    # Trash list and Restore read) with it
     if entries:
         await db.executemany(
             "INSERT INTO library_trash (batch_id, original_path, trash_path, kind, "

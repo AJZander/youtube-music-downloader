@@ -863,7 +863,7 @@ class PathKeyMigrationTestCase(unittest.IsolatedAsyncioTestCase):
                                                   "01 - crazy in love.flac")
         self.assertEqual(path_key(self.PATHS[3]), "strasse/(2001) gross/01 - eins.mp3")
         version, columns, indexes = self.inspect()
-        self.assertEqual(version, 13)
+        self.assertEqual(version, len(dbmod.MIGRATIONS))     # v13, and any after it
         self.assertIn("idx_li_path_key", indexes)
         # the SQL function the joins use is the same key
         got = await self.db.fetchone("SELECT path_key(?) AS k", (self.PATHS[0],))
@@ -873,7 +873,7 @@ class PathKeyMigrationTestCase(unittest.IsolatedAsyncioTestCase):
         await self.db.connect()
         again = await self.db.fetchall("SELECT path, path_key FROM library_index ORDER BY path")
         self.assertEqual([tuple(r) for r in again], [tuple(r) for r in rows])
-        self.assertEqual(self.inspect()[0], 13)
+        self.assertEqual(self.inspect()[0], len(dbmod.MIGRATIONS))
 
 
 if __name__ == "__main__":

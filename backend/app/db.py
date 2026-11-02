@@ -1,6 +1,10 @@
 """SQLite access layer. One shared connection, writes serialized by a lock —
-throughput here is a handful of rows per track, contention is not a concern."""
+throughput here is a handful of rows per track, contention is not a concern.
+
+Each statement commits on its own, unless it runs in a transaction():
+then the task's statements are one commit, or none."""
 import asyncio
+import contextlib
 import shutil
 from datetime import datetime, timezone
 
@@ -534,6 +538,14 @@ MIGRATIONS: list = [
     """,
     # v13 — library_index.path_key (see _v13_path_keys)
     _v13_path_keys,
+    # v14 — the journal, looked up without reading it all (285,911 rows on a
+    # copy of the live data): by what a change was made to (a Plex item's
+    # locks and matches, a file's moves), and the moves of the last weeks
+    # (apply.oscillation's window).
+    """
+    CREATE INDEX IF NOT EXISTS idx_changes_target_ref ON md_changes(target, ref, field);
+    CREATE INDEX IF NOT EXISTS idx_changes_target_field_at ON md_changes(target, field, applied_at);
+    """,
 ]
 
 
@@ -545,9 +557,12 @@ class Database:
     def __init__(self) -> None:
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None     # the task a transaction is open in
 
     async def connect(self) -> None:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
+        # the connection's own (one waited on belongs to the loop it was used in)
+        self._lock, self._owner = asyncio.Lock(), None
         self._conn = await aiosqlite.connect(settings.db_path)
         self._conn.row_factory = aiosqlite.Row
         # path_key(path) in SQL is identity.path_key: library_index.path_key
@@ -597,22 +612,68 @@ class Database:
                     await self._conn.rollback()
                 raise
 
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """The statements this task runs inside are one transaction: all
+        committed at the end, or, on an exception, none. They run as ever
+        (execute, fetchall, ... and every helper made of them), only without
+        a commit each. Other tasks' statements wait for the end. One opened
+        inside another is part of it.
+
+        Only database work goes inside: the lock is every writer's, so a
+        file read or an HTTP call in one holds them all up."""
+        if self._mine():
+            yield
+            return
+        async with self._lock:
+            self._owner = asyncio.current_task()
+            try:
+                # sqlite3 opened one for a statement on its own that failed
+                # (a constraint), and left it open: committed, as the next
+                # execute would (the failed statement itself is undone)
+                if self._conn.in_transaction:
+                    await self._conn.commit()
+                try:
+                    await self._conn.execute("BEGIN IMMEDIATE")
+                    yield
+                    await self._conn.commit()
+                except BaseException:
+                    if self._conn.in_transaction:
+                        await self._conn.rollback()
+                    raise
+            finally:
+                self._owner = None
+
+    def _mine(self) -> bool:
+        """Whether this task has a transaction open."""
+        return self._owner is not None and self._owner is asyncio.current_task()
+
     async def execute(self, sql: str, params: tuple = ()) -> None:
+        if self._mine():
+            await self._conn.execute(sql, params)
+            return
         async with self._lock:
             await self._conn.execute(sql, params)
             await self._conn.commit()
 
     async def executemany(self, sql: str, rows: list[tuple]) -> None:
+        if self._mine():
+            await self._conn.executemany(sql, rows)
+            return
         async with self._lock:
             await self._conn.executemany(sql, rows)
             await self._conn.commit()
 
     async def fetchone(self, sql: str, params: tuple = ()) -> aiosqlite.Row | None:
+        if self._mine():
+            return await (await self._conn.execute(sql, params)).fetchone()
         async with self._lock:
             cur = await self._conn.execute(sql, params)
             return await cur.fetchone()
 
     async def fetchall(self, sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
+        if self._mine():
+            return await (await self._conn.execute(sql, params)).fetchall()
         async with self._lock:
             cur = await self._conn.execute(sql, params)
             return await cur.fetchall()

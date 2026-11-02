@@ -197,10 +197,13 @@ async def repoint(old_key: str, new_key: str, artist_dir: str | None) -> None:
 
 
 async def rekey(old_key: str, new_key: str, *, artist_dir: str | None) -> None:
-    """A unit's record follows it to a new key, decisions and all."""
-    await db.execute("UPDATE md_albums SET key = ?, dirpath = ?, artist_dir = ?, next_check = 0 "
-                     "WHERE key = ?", (new_key, unit_folder(new_key), artist_dir, old_key))
-    await repoint(old_key, new_key, artist_dir)
+    """A unit's record follows it to a new key, decisions and all. One
+    transaction."""
+    async with db.transaction():
+        await db.execute("UPDATE md_albums SET key = ?, dirpath = ?, artist_dir = ?, "
+                         "next_check = 0 WHERE key = ?",
+                         (new_key, unit_folder(new_key), artist_dir, old_key))
+        await repoint(old_key, new_key, artist_dir)
 
 
 async def _tagged_groups(key: str, *, besides: str | None = None) -> set[str]:
@@ -226,11 +229,16 @@ async def merge_into(v_uid: str, k_uid: str, *, reason: str) -> None:
     either side ignored or dismissed stays so, a pinned release goes with
     its files only to an album of its release group (or one not known to be
     any), and k's own overrides win. v leaves an alias, so a link to it
-    finds k."""
-    from .apply import AUTO_PAUSED
-    from .issues import UNIT_KINDS
+    finds k. One transaction."""
     if not v_uid or not k_uid or v_uid == k_uid:
         return
+    async with db.transaction():
+        await _merge_into(v_uid, k_uid, reason)
+
+
+async def _merge_into(v_uid: str, k_uid: str, reason: str) -> None:
+    from .apply import AUTO_PAUSED
+    from .issues import UNIT_KINDS
     v = await db.fetchone("SELECT * FROM md_albums WHERE unit_id = ?", (v_uid,))
     k = await db.fetchone("SELECT * FROM md_albums WHERE unit_id = ?", (k_uid,))
     if v is None or k is None:
@@ -294,7 +302,13 @@ async def merge_into(v_uid: str, k_uid: str, *, reason: str) -> None:
 async def follow(key: str) -> str | None:
     """A unit whose files have left `key` follows them to the unit holding
     most of them: its record takes that key, or merges into the album
-    there. Returns where it went, or None."""
+    there. Returns where it went, or None. One transaction, what it reads
+    (the index) with what it writes."""
+    async with db.transaction():
+        return await _follow(key)
+
+
+async def _follow(key: str) -> str | None:
     row = await db.fetchone("SELECT unit_id FROM md_albums WHERE key = ?", (key,))
     to = await successor(row["unit_id"]) if row and row["unit_id"] else None
     if to is None or to == key:
@@ -348,8 +362,14 @@ async def sync_registry() -> dict:
     follows its files to the unit now holding most of them: it takes that
     unit's new key (a folder renamed or split by album tag), or merges into
     the album already there. One whose files are gone is dropped, and its
-    issues closed. Every file is then stamped with its unit. Returns counts."""
-    units = await all_units()
+    issues closed. Every file is then stamped with its unit. Returns counts.
+    What it reads and writes is one transaction (the index, not the files):
+    a move committed between the two would leave it a moved album to drop."""
+    async with db.transaction():
+        return await _sync(await all_units())
+
+
+async def _sync(units: dict[str, list[dict]]) -> dict:
     known = {r["key"]: dict(r) for r in await db.fetchall(
         "SELECT key, unit_id, file_sig, artist_dir FROM md_albums")}
     stamps = {r["path"]: r["unit_id"] for r in await db.fetchall(
