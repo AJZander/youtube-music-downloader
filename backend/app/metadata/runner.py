@@ -843,7 +843,7 @@ class Runner:
                     a, f, state = await self._start_album(ref, members, queue=queue_now)
                     if state:
                         b, g = await self._apply_simple(state["files"], state["ctx"],
-                                                        apply.FILE_STAGE)
+                                                        apply.FILE_STAGE, plex_follows=True)
                         a, f = a + b, f + g
             except Exception:
                 log.exception("applying %s failed", ref)
@@ -874,6 +874,7 @@ class Runner:
         if held is None:
             self._plex_due[key] = state
             return
+        held["files"] += state["files"]
         held["plex_stage"] += state["plex_stage"]
         held["later"] = (held.get("later") or []) + (state.get("later") or [])
         held["ctx"].plex_dirty |= state["ctx"].plex_dirty
@@ -1013,7 +1014,11 @@ class Runner:
                          (state, error, now, issue["id"]))
 
     async def _apply_simple(self, members: list[dict], ctx: apply.Ctx,
-                            executors: dict | None = None) -> tuple[int, int]:
+                            executors: dict | None = None, *,
+                            plex_follows: bool = False) -> tuple[int, int]:
+        """`plex_follows`: these are file parts, and the Plex pass follows
+        (_files_pass): a fix with a Plex part too (track_order) stays queued
+        for it, and is marked there (_apply_plex)."""
         executors = executors or {**apply.PLEX_STAGE, **apply.FILE_STAGE, **apply.QUEUE_STAGE}
         applied = failed = 0
         for issue in sorted(members, key=lambda i: issues.APPLY_ORDER.index(i["kind"])
@@ -1024,6 +1029,8 @@ class Runner:
                 continue
             try:
                 await executor(issue, ctx)
+                if plex_follows and issue["kind"] in apply.PLEX_STAGE:
+                    continue
                 await self._mark(issue, "applied", ran=True)
                 applied += 1
             except apply.KeepOpen as note:
@@ -1048,8 +1055,9 @@ class Runner:
         if plex_stage:
             # The plan may predate the file changes (a move gives Plex new
             # items): re-check, then apply the same kinds from the fresh plan.
+            planned = None
             if ctx.key != key or ctx.batches:
-                await self._check_unit(ctx.key)
+                planned = set((await self._check_unit(ctx.key)).get("planned") or ())
             kinds = {i["kind"] for i in plex_stage}
             fresh = [issues.issue_out(r) for r in await db.fetchall(
                 f"SELECT * FROM md_issues WHERE album_key = ? AND state IN ('open', 'queued', 'failed') "
@@ -1064,7 +1072,19 @@ class Runner:
                         and issue["album_key"] != ctx.key:
                     await self._mark(issue, "superseded",
                                      f"not planned again after the album moved to {ctx.key}")
-            applied, failed = await self._apply_simple(fresh, ctx, apply.PLEX_STAGE)
+            # A fix whose file part ran in pass 1 (track_order) waited queued
+            # for this: if that part failed, there is nothing to follow it; if
+            # the re-check no longer plans it, its file part did it all.
+            two_stage = {i["id"] for i in state["files"] if i["kind"] in apply.PLEX_STAGE}
+            for issue in [i for i in fresh if i["id"] in two_stage]:
+                if issue["state"] == "failed":
+                    fresh.remove(issue)
+                elif planned is not None and issue["key"] not in planned:
+                    await self._mark(issue, "applied", ran=True)
+                    applied += 1
+                    fresh.remove(issue)
+            a, f = await self._apply_simple(fresh, ctx, apply.PLEX_STAGE)
+            applied, failed = applied + a, failed + f
             for issue in plex_stage:
                 if issue["id"] not in fresh_ids and issue["kind"] in fresh_kinds \
                         and issue["album_key"] != ctx.key:

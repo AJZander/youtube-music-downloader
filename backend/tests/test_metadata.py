@@ -1078,7 +1078,7 @@ class ApplyPassesTestCase(unittest.IsolatedAsyncioTestCase):
                           "files": [m for m in members if m["kind"] in apply.FILE_STAGE],
                           "plex_stage": [m for m in members if m["kind"] in apply.PLEX_STAGE]}
 
-        async def simple(todo, ctx, executors):
+        async def simple(todo, ctx, executors, **kwargs):
             order.extend((i["kind"], ctx.key) for i in todo)
             ctx.plex_dirty = True
             if ctx.key == "A/x":

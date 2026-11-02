@@ -765,50 +765,37 @@ async def copy_keys(detail: dict) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-async def copies_plan(issue: dict, ctx: Ctx) -> dict:
-    """What merging an album's other copies into this one does, without
-    doing it: {"moves", "trash", "left"}. Only a file identified as a
-    recording on this album's release moves in or is trashed; for each
-    recording the best file stays (ties keep this album's own). Each move
-    carries the track of this release the file becomes, its index row, and
-    the file it replaces here (if any)."""
+def copy_decisions(desired: dict, rows: list[dict], rel: dict,
+                   copies: list[tuple[str, list[dict], dict]]) -> dict:
+    """What merging these copies into the album (its desired state, rows and
+    release) does with each of their files, without doing it: {"moves",
+    "trash", "left"}, and under "of", per copy key, how many of that
+    copy's own files move in, go to Trash and stay where they are. `copies`:
+    (key, rows, desired) of each other copy, in order. Only a file
+    identified as a recording on this album's release moves in or is
+    trashed; for each recording the best file stays (ties keep this album's
+    own). Each move carries the track of this release the file becomes, its
+    index row, and the file it replaces here (if any). Nothing is read:
+    copies_plan applies it, and issues.plan_album_copies plans by it."""
     from .. import identity
     from . import musicbrainz as mb
     from .issues import matched_recordings, plain_recordings
-    from .units import in_box_set, load_unit
-    if ctx.desired is None:
-        raise ApplyError("the album is not identified")
-    if await in_box_set(ctx.key, ctx.rows):
-        raise ApplyError("this album is part of a box set, which keeps its own copy")
-    try:
-        rel = await mb.release(ctx.desired["release_mbid"])
-    except mb.MusicBrainzError as exc:
-        raise ApplyError(f"MusicBrainz: {exc}") from exc
-    if not rel:
-        raise ApplyError("the release is gone from MusicBrainz")
     multi = len(rel.get("media") or []) > 1
     plain = plain_recordings(rel)
     on_release = {t["recording_id"]: t for t in mb.release_tracks(rel)
                   if t.get("recording_id") in plain}
-    folder = ctx.desired.get("folder") or folder_of(ctx.rows[0])
-    by_path = {r["path"]: r for r in ctx.rows}
+    folder = desired.get("folder") or folder_of(rows[0])
+    by_path = {r["path"]: r for r in rows}
     # this album's own file for each recording (the first, if it holds two)
     held: dict[str, dict] = {}
-    for rec, paths in matched_recordings(ctx.desired).items():
-        rows = [by_path[p] for p in paths if p in by_path and not by_path[p].get("unreadable")]
-        if rows:
-            held[rec] = rows[0]
-    plan = {"moves": [], "trash": [], "left": [], "pin": ctx.desired["release_mbid"],
-            "release": rel}
-    taken = {r["path"].casefold() for r in ctx.rows}
-    for key in await copy_keys(issue["detail"]):
-        rows = await load_unit(key)
-        record = await db.fetchone("SELECT desired, status FROM md_albums WHERE key = ?", (key,))
-        if not rows or not record or record["status"] != "resolved" or not record["desired"] \
-                or await in_box_set(key, rows):
-            continue
-        want = json.loads(record["desired"])
-        for row in rows:
+    for rec, paths in matched_recordings(desired).items():
+        mine = [by_path[p] for p in paths if p in by_path and not by_path[p].get("unreadable")]
+        if mine:
+            held[rec] = mine[0]
+    plan = {"moves": [], "trash": [], "left": []}
+    taken = {r["path"].casefold() for r in rows}
+    for _key, theirs, want in copies:
+        for row in theirs:
             t = want["tracks"].get(row["path"]) or {}
             rec = t.get("recording_mbid") if t.get("matched") else None
             if not rec or rec not in on_release or row.get("unreadable"):
@@ -821,7 +808,7 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
             track = on_release[rec]
             try:
                 name = build_track_relpath(
-                    ctx.desired.get("albumartist") or "x", ctx.desired.get("album") or "x",
+                    desired.get("albumartist") or "x", desired.get("album") or "x",
                     plain_title(track["title"]), Path(row["path"]).suffix, track["number"],
                     track["disc"] if multi else None).name
             except PathBuildError:
@@ -833,11 +820,15 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
                 if _audio_quality(row, ref) <= _audio_quality(there, ref):
                     plan["trash"].append(row["path"])
                     continue
+            free = taken - {there["path"].casefold()} if there is not None else taken
+            if target.casefold() in free:
+                # the name is another file's: this one stays, and so does the
+                # copy it would have replaced
+                plan["left"].append(row["path"])
+                continue
+            if there is not None:
                 plan["trash"].append(there["path"])
                 taken.discard(there["path"].casefold())
-            if target.casefold() in taken:
-                plan["left"].append(row["path"])    # the name is another file's
-                continue
             plan["moves"].append({"from": row["path"], "to": target, "track": track, "row": row,
                                   "replaces": there["path"] if there is not None else None})
             taken.add(target.casefold())
@@ -845,7 +836,41 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
     # a file can lose only once (two copies of a track, both beaten)
     plan["trash"] = list(dict.fromkeys(p for p in plan["trash"]
                                        if p not in {m["from"] for m in plan["moves"]}))
+    owner = {r["path"]: key for key, theirs, _ in copies for r in theirs}
+    plan["of"] = {key: {"moves": 0, "trash": 0, "left": 0} for key, _, _ in copies}
+    for what, paths in (("moves", [m["from"] for m in plan["moves"]]),
+                        ("trash", plan["trash"]), ("left", plan["left"])):
+        for p in paths:
+            if p in owner:
+                plan["of"][owner[p]][what] += 1
     return plan
+
+
+async def copies_plan(issue: dict, ctx: Ctx) -> dict:
+    """What merging an album's other copies into this one does, without
+    doing it (copy_decisions): {"moves", "trash", "left", "pin", "release"}."""
+    from . import musicbrainz as mb
+    from .units import in_box_set, load_unit
+    if ctx.desired is None:
+        raise ApplyError("the album is not identified")
+    if await in_box_set(ctx.key, ctx.rows):
+        raise ApplyError("this album is part of a box set, which keeps its own copy")
+    try:
+        rel = await mb.release(ctx.desired["release_mbid"])
+    except mb.MusicBrainzError as exc:
+        raise ApplyError(f"MusicBrainz: {exc}") from exc
+    if not rel:
+        raise ApplyError("the release is gone from MusicBrainz")
+    copies = []
+    for key in await copy_keys(issue["detail"]):
+        rows = await load_unit(key)
+        record = await db.fetchone("SELECT desired, status FROM md_albums WHERE key = ?", (key,))
+        if not rows or not record or record["status"] != "resolved" or not record["desired"] \
+                or await in_box_set(key, rows):
+            continue
+        copies.append((key, rows, json.loads(record["desired"])))
+    plan = copy_decisions(ctx.desired, ctx.rows, rel, copies)
+    return {**plan, "pin": ctx.desired["release_mbid"], "release": rel}
 
 
 @settles

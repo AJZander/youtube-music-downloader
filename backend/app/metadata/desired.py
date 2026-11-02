@@ -319,9 +319,12 @@ async def build_album(rows: list[dict], res: Resolution, *, plex_album: dict | N
     types = [t.lower() for t in [group.get("primary-type"), *(group.get("secondary-types") or [])]
              if t]
     compilation = aa["various"] or "compilation" in types
+    # a label the tag writer would strip as junk ("Siccness.net", "nugs.net")
+    # is never wanted: written, it would be planned again every check
     label = next((li.get("label", {}).get("name") for li in rel.get("label-info") or []
                   if (li.get("label") or {}).get("name")
-                  and li["label"]["name"].lower() not in ("[no label]", "no label")), None)
+                  and li["label"]["name"].lower() not in ("[no label]", "no label")
+                  and not tagio.spam(li["label"]["name"])), None)
     media = rel.get("media") or []
 
     # ---- genres

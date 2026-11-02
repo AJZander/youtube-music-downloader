@@ -1006,10 +1006,14 @@ async def plan_album_copies() -> list[dict]:
     has. A new remix shares no recording with the original mix, so it is
     another album; a box set keeps its own copies. A set one of whose copies
     a download is going into (locks.settling) waits: its issue, if it has
-    one, stays as it is."""
+    one, stays as it is. Only what the merge would take is planned
+    (apply.copy_decisions, the merge's own rule): a copy none of whose files
+    it would move or trash is left out, and a set left with none isn't one,
+    or it would be planned again after every merge that did nothing."""
     from collections import defaultdict
     from .. import locks
     from . import units as units_mod
+    from .apply import copy_decisions
     settling = await locks.settling()
     rows = await db.fetchall(
         "SELECT key, unit_id, artist_dir, release_mbid, releasegroup_mbid, desired FROM md_albums "
@@ -1044,7 +1048,6 @@ async def plan_album_copies() -> list[dict]:
                 continue
             others = [c for c in copies if c is not keep]
             album = keep["want"].get("album") or keep["key"]
-            shared = sum(len(c["recs"] & keep["recs"]) for c in others)
             # keyed by the albums, not their folders: the same set is the
             # same issue after a move. Their keys say where they were.
             ref = f"{group}:{min(c['unit_id'] or c['key'] for c in copies)}"
@@ -1052,16 +1055,36 @@ async def plan_album_copies() -> list[dict]:
                    [*(unit_folder(c["key"]) for c in copies), keep["want"].get("folder")] if f):
                 out.append(unchanged(f"album_copies:{ref}"))
                 continue
+            try:
+                rel = await mb.release(keep["release"])
+            except mb.MusicBrainzError:
+                continue
+            if not rel:
+                continue
+            plan = copy_decisions(keep["want"], keep["rows"], rel,
+                                  [(c["key"], c["rows"], c["want"]) for c in others])
+            # a copy the merge takes nothing from changes nothing by its
+            # dropping out: the others' files are decided the same
+            others = [c for c in others
+                      if plan["of"][c["key"]]["moves"] or plan["of"][c["key"]]["trash"]]
+            if not others:
+                continue
+            moves, trash = len(plan["moves"]), len(plan["trash"])
+            leaves = sum(plan["of"][c["key"]]["left"] for c in others)
+            shared = sum(len(c["recs"] & keep["recs"]) for c in others)
             out.append(planned(
                 "album_copies", ref,
-                f"{album}: {len(copies)} copies — merge into {keep['want'].get('folder') or keep['key']}",
+                f"{album}: {len(others) + 1} copies — merge into "
+                f"{keep['want'].get('folder') or keep['key']}: {moves} moved in, {trash} to Trash"
+                + (f", {leaves} left where they are" if leaves else ""),
                 {"keep": keep["key"], "copies": [c["key"] for c in others],
                  "keep_unit": keep["unit_id"], "copy_units": [c["unit_id"] for c in others],
-                 "folders": [c["key"] for c in copies], "album": album,
+                 "folders": [c["key"] for c in [keep, *others]], "album": album,
                  "release_mbid": keep["release"], "releasegroup_mbid": group,
-                 "shared": shared, "to": keep["want"].get("folder")},
+                 "shared": shared, "to": keep["want"].get("folder"),
+                 "moves": moves, "trash": trash, "leaves": leaves},
                 artist_dir=keep["artist_dir"], album_key=keep["key"],
-                refs=[(c["artist_dir"], c["key"]) for c in copies]))
+                refs=[(c["artist_dir"], c["key"]) for c in [keep, *others]]))
     return out
 
 
