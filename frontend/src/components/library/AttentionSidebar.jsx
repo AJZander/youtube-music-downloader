@@ -22,7 +22,8 @@ const DUPE_TAB = { dup_album: 'albums', dup_track: 'tracks', split_artist: 'arti
 function Group({ group, onApply, onReview, onResolve }) {
   const kind = KINDS[group.kind]
   const applyable = group.applyable ?? kind?.applyable
-  const open = group.count - (group.queued_count || 0)
+  // what "<action> all" takes: not queued (and, for missing tracks, never tried)
+  const open = group.bulk_count ?? group.count - (group.queued_count || 0)
   return (
     <Box sx={{
       px: 1, py: 0.75, borderLeft: 3, borderLeftColor: `${severityColor(group.severity)}.main`,

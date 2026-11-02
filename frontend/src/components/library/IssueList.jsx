@@ -514,15 +514,20 @@ export function ChangeList({ batches, onChanged, notify, dense = false }) {
 
 /** "Apply all" for one kind, after saying what that means. `onlyAuto`:
  *  just the fixes confident enough to apply automatically; otherwise every
- *  open one (missing tracks, merges, damaged files — never automatic). */
+ *  open one (missing tracks, merges, damaged files — never automatic), or
+ *  those `filter` picks (missing tracks: the ones never tried). */
 export function ConfirmApplyDialog({
-  kind, count, artistDir, onClose, onDone, notify, onlyAuto = true,
+  kind, count, artistDir, onClose, onDone, notify, onlyAuto = true, filter,
 }) {
   const [busy, setBusy] = useState(false)
+  const narrowed = !onlyAuto && filter
+    ? BULK[kind]?.filters?.find((f) => f.value === filter)?.label || filter : null
   const apply = async () => {
     setBusy(true)
     try {
-      const r = await api.libraryApplyIssues({ kind, artist_dir: artistDir, only_auto: onlyAuto })
+      const r = await api.libraryApplyIssues({
+        kind, artist_dir: artistDir, only_auto: onlyAuto,
+        filter: onlyAuto ? undefined : filter || undefined })
       notify?.(`Queued ${r.queued} fix${r.queued === 1 ? '' : 'es'}`)
       onDone?.(r)
       onClose()
@@ -537,7 +542,8 @@ export function ConfirmApplyDialog({
         </Typography>
         <Typography variant="body2" color="text.secondary">
           {onlyAuto ? 'Only fixes confident enough to apply automatically are included'
-            : 'Every open one is included'}
+            : narrowed ? `Only the open ones ${narrowed.toLowerCase()} are included`
+              : 'Every open one is included'}
           {artistDir ? <> for <strong>{artistDir}</strong></> : ' across the whole library'}.
           They run in the background, and every change is logged under
           Activity, where it can be undone.

@@ -386,7 +386,9 @@ export default function Library() {
             version={versions.attention}
             onApply={(group, dir, onlyAuto = true) => setModal({
               type: 'apply', kind: group.kind, artistDir: dir, onlyAuto,
-              count: onlyAuto ? group.auto_count : group.count - (group.queued_count || 0) })}
+              filter: onlyAuto ? undefined : group.bulk_filter,
+              count: onlyAuto ? group.auto_count
+                : group.bulk_count ?? group.count - (group.queued_count || 0) })}
             onReview={(group, dir) => setModal({ type: 'issues', kind: group.kind, artistDir: dir })}
             onResolveDupes={(tab) => setModal({ type: 'dupes', tab })}
             onTrash={() => setModal({ type: 'trash' })}
@@ -415,7 +417,8 @@ export default function Library() {
       )}
       {modal?.type === 'apply' && (
         <ConfirmApplyDialog kind={modal.kind} count={modal.count} artistDir={modal.artistDir}
-          onlyAuto={modal.onlyAuto} notify={notify} onClose={() => setModal(null)}
+          onlyAuto={modal.onlyAuto} filter={modal.filter} notify={notify}
+          onClose={() => setModal(null)}
           onDone={onChanged} />
       )}
       {modal?.type === 'issues' && (

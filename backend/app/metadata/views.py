@@ -85,6 +85,11 @@ async def _issue_counts_by_artist() -> dict[str, Counter]:
     return out
 
 
+# Missing tracks a download was queued for (missing.queue_download lists
+# each; one queued before that left only its job id)
+_DOWNLOAD_TRIED = ("COALESCE(json_array_length(i.detail, '$.download.attempts'), 0) > 0 "
+                   "OR json_extract(i.detail, '$.download.job_id') IS NOT NULL")
+
 # Narrower views of one kind's issues, for picking what a bulk action takes.
 ISSUE_FILTERS = {
     # Check match: every file matched a track and the artist is ours / the
@@ -100,12 +105,19 @@ ISSUE_FILTERS = {
               "(COALESCE(json_extract(i.detail, '$.artist'), -1) >= 1 AND "
               "COALESCE(json_extract(i.detail, '$.matched'), -1) = "
               "COALESCE(json_extract(i.detail, '$.files'), -2)))",
-    # Missing tracks: a download was tried (what is left isn't on YouTube
-    # Music, or hasn't arrived) / never tried
-    "tried": "json_extract(i.detail, '$.download') IS NOT NULL",
-    "untried": "json_extract(i.detail, '$.download') IS NULL",
+    # Missing tracks: a download was queued (what is left isn't on YouTube
+    # Music, was skipped as held, or hasn't arrived) / never queued (one
+    # asked for while YouTube Music was busy hasn't been)
+    "tried": _DOWNLOAD_TRIED,
+    "untried": f"NOT ({_DOWNLOAD_TRIED})",
     "failed": "i.state = 'failed'",
 }
+
+# What the sidebar's "<action> all" takes of a kind (the attention group
+# says, and the sidebar asks for it): "Download missing all" takes the
+# albums never tried; one already tried is retried from its own page, or
+# picked in Review.
+BULK_FILTERS = {"missing_tracks": "untried"}
 
 
 async def issues_for(*, artist_dir: str | None = None, album_keys: list[str] | None = None,
@@ -153,11 +165,15 @@ async def attention(artist_dir: str | None = None) -> dict:
         joins = "JOIN md_issue_refs r ON r.issue_id = i.id"
         where += " AND r.artist_dir = ?"
         params.append(artist_dir)
+    bulk = " OR ".join(f"(i.kind = '{kind}' AND ({ISSUE_FILTERS[f]}))"
+                       for kind, f in BULK_FILTERS.items())
     rows = await db.fetchall(
         f"SELECT i.kind, COUNT(DISTINCT i.id) AS n, "
         f"COUNT(DISTINCT CASE WHEN i.auto = 1 AND i.state = 'open' THEN i.id END) AS auto_n, "
         f"COUNT(DISTINCT CASE WHEN i.state = 'failed' THEN i.id END) AS failed_n, "
-        f"COUNT(DISTINCT CASE WHEN i.state = 'queued' THEN i.id END) AS queued_n "
+        f"COUNT(DISTINCT CASE WHEN i.state = 'queued' THEN i.id END) AS queued_n, "
+        f"COUNT(DISTINCT CASE WHEN i.state IN ('open', 'failed') AND ({bulk}) "
+        f"THEN i.id END) AS bulk_n "
         f"FROM md_issues i {joins} WHERE {where} GROUP BY i.kind", tuple(params))
     groups = []
     for r in rows:
@@ -168,6 +184,10 @@ async def attention(artist_dir: str | None = None) -> dict:
                        "queued_count": r["queued_n"], "applyable": bool(meta.get("applyable")),
                        "action_label": meta.get("action"),
                        "description": meta.get("description")})
+        if r["kind"] in BULK_FILTERS:
+            # what "<action> all" takes (open, failed: not queued)
+            groups[-1]["bulk_count"] = r["bulk_n"]
+            groups[-1]["bulk_filter"] = BULK_FILTERS[r["kind"]]
     groups.sort(key=lambda g: (_SEVERITY_RANK.get(g["severity"], 3), -g["count"]))
     return {"scope": artist_dir or "library", "total": sum(g["count"] for g in groups),
             "groups": groups}

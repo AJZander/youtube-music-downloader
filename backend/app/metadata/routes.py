@@ -33,6 +33,10 @@ class KeyIn(BaseModel):
     key: str
 
 
+class DownloadIn(KeyIn):
+    force: bool = False     # Retry: also what an earlier download fetched or skipped
+
+
 class MatchIn(BaseModel):
     key: str
     release_mbid: str
@@ -200,7 +204,7 @@ async def album_candidates(key: str, q: str | None = None):
 
 
 @router.post("/album/download-missing")
-async def album_download_missing(body: KeyIn):
+async def album_download_missing(body: DownloadIn):
     """Queue the album's missing tracks (found on YouTube Music) as one job."""
     from . import missing
     record = await db.fetchone("SELECT release_mbid, status FROM md_albums WHERE key = ?",
@@ -208,7 +212,7 @@ async def album_download_missing(body: KeyIn):
     if not record or record["status"] != "resolved" or not record["release_mbid"]:
         raise HTTPException(409, "the album isn't identified yet")
     try:
-        result = await missing.queue_download(record["release_mbid"])
+        result = await missing.queue_download(record["release_mbid"], force=body.force)
     except RuntimeError as exc:
         raise HTTPException(404, str(exc))
     await runner.publish_issues()

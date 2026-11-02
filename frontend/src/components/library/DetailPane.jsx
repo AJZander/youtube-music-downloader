@@ -149,14 +149,24 @@ function MissingTracks({ album, onDetail, notify }) {
   const m = album.missing
   if (!m || !m.tracks?.length) return null
   const queued = m.download?.job_id && m.download.active !== false
-  const download = async () => {
+  // A download already ran: what it fetched, or skipped as already in the
+  // library, isn't fetched again unless retried.
+  const tried = !queued && (m.download?.attempts?.length > 0 || !!m.download?.job_id)
+  const download = async (force = false) => {
     setBusy(true)
     try {
-      const r = await api.libraryDownloadMissing(album.key)
-      notify?.(r.already_queued ? 'Already in the download queue'
-        : `Queued ${r.queued} track${r.queued === 1 ? '' : 's'} for download`
+      const r = await api.libraryDownloadMissing(album.key, force)
+      if (r.already_queued) notify?.('Already in the download queue', 'success')
+      else if (!r.queued && r.already_tried) {
+        notify?.(`Already tried: an earlier download fetched or skipped ${r.already_tried === 1
+          ? 'that track' : `those ${r.already_tried} tracks`}. Retry download fetches them again.`,
+        'info')
+      } else {
+        notify?.(`Queued ${r.queued} track${r.queued === 1 ? '' : 's'} for download`
+          + (r.already_tried ? ` — ${r.already_tried} already tried` : '')
           + (r.not_found?.length ? ` — ${r.not_found.length} not on YouTube Music` : ''),
-      r.not_found?.length ? 'warning' : 'success')
+        r.not_found?.length ? 'warning' : 'success')
+      }
       if (r.album?.key) onDetail?.(r.album)
     } catch (e) {
       notify?.(e.message, 'error')
@@ -167,16 +177,29 @@ function MissingTracks({ album, onDetail, notify }) {
   return (
     <Alert severity={m.partial ? 'info' : 'warning'} sx={{ m: 1 }}
       action={(
-        <Button size="small" color="inherit" disabled={busy} onClick={download}
-          startIcon={busy ? <CircularProgress size={14} color="inherit" /> : <DownloadIcon fontSize="small" />}>
-          {queued ? 'Queue again' : m.partial ? 'Download the rest' : 'Download missing'}
-        </Button>
+        <Stack direction="row" spacing={0.5}>
+          <Button size="small" color="inherit" disabled={busy} onClick={() => download()}
+            startIcon={busy ? <CircularProgress size={14} color="inherit" /> : <DownloadIcon fontSize="small" />}>
+            {queued ? 'Queue again' : m.partial ? 'Download the rest' : 'Download missing'}
+          </Button>
+          {tried && (
+            <Tooltip title="Fetch again what an earlier download fetched or skipped as already in the library">
+              <span>
+                <Button size="small" color="inherit" disabled={busy} onClick={() => download(true)}
+                  startIcon={<RefreshIcon fontSize="small" />}>
+                  Retry download
+                </Button>
+              </span>
+            </Tooltip>
+          )}
+        </Stack>
       )}>
       <Typography variant="body2" sx={{ fontWeight: 500 }}>
         {m.partial
           ? `${m.have} of the album's ${m.total} tracks are in the library`
           : `${m.tracks.length} of ${m.total} tracks missing`}
         {queued && ' — download queued'}
+        {tried && ' — already tried'}
       </Typography>
       <Box sx={{ columns: m.tracks.length > 8 ? 2 : 1, mt: 0.25 }}>
         {m.tracks.map((t) => (

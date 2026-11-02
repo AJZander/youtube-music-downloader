@@ -212,7 +212,8 @@ export const api = {
     send('POST', '/api/v1/library/album/no-release', { key, no_release: noRelease }),
   libraryAlbumCandidates: (key, q) =>
     fetch('/api/v1/library/album/candidates?' + qs({ key, q })).then(json),
-  libraryDownloadMissing: (key) => send('POST', '/api/v1/library/album/download-missing', { key }),
+  libraryDownloadMissing: (key, force = false) =>
+    send('POST', '/api/v1/library/album/download-missing', { key, force }),
   libraryAlbumSeed: (key) =>
     fetch('/api/v1/library/album/seed?' + qs({ key })).then(json),
   librarySetOverride: (entity, ref, field, value) =>
