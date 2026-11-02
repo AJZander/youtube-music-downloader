@@ -120,8 +120,14 @@ async def _album_download(paths: list[str]) -> bool:
 
 
 async def refresh(release_mbid: str | None) -> None:
-    """Re-file (or close) the missing-tracks issue of one release."""
+    """Re-file (or close) the missing-tracks issue of one release. Not while
+    a download is going into one of its albums (locks.settling): the issue
+    stays as it is, and is counted again when the album is checked after."""
+    from .. import locks
+    from .units import unit_folder
     if not release_mbid:
+        return
+    if await locks.settling_into(*(unit_folder(u["key"]) for u in await _units(release_mbid))):
         return
     key = f"missing_tracks:{release_mbid}"
     info = await compute(release_mbid)

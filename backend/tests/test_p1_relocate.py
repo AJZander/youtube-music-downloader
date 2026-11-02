@@ -164,6 +164,14 @@ class RelocateTestCase(UnitTestCase):
         return [r["path"] for r in await self.db.fetchall(
             "SELECT path FROM library_index WHERE dirpath = ? ORDER BY path", (folder,))]
 
+    @staticmethod
+    def queued_after():
+        """The fixes run as if seed_refs' Download missing was queued once
+        they had begun: one queued before keeps its album as it is until it
+        ends (P1-F4, test_p1_settling), and this one's folder must follow."""
+        from app import locks
+        return mock.patch.object(locks, "settling", mock.AsyncMock(return_value={}))
+
     async def seed_refs(self, folder: str, *, keeper: bool = False) -> None:
         """Something in every path table that names this album folder or its
         files: its downloads (the first as the importer spelled it, in
@@ -262,7 +270,7 @@ class PathsResolveTestCase(RelocateTestCase):
         from app import library
         self.thriller_rip()
         await library.scan(full=True)
-        with self.services():
+        with self.services(), self.queued_after():
             await self.check_all()
             await self.seed_refs(RIP)
             move = await self.open_issue("move", RIP)
@@ -273,7 +281,7 @@ class PathsResolveTestCase(RelocateTestCase):
 
     async def test_after_a_merge_of_copies(self):
         await self.make_thriller()
-        with self.services():
+        with self.services(), self.queued_after():
             await self.check_all()
             await self.seed_refs(ORIG)
             merged = await self.merge()
@@ -312,7 +320,7 @@ class PathsResolveTestCase(RelocateTestCase):
         from app.metadata import apply
         self.thriller_rip()
         await library.scan(full=True)
-        with self.services():
+        with self.services(), self.queued_after():
             await self.check_all()
             await self.seed_refs(RIP)
             await self.apply_kinds(RIP, ("move",))

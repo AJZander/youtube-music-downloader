@@ -1069,9 +1069,11 @@ class ApplyPassesTestCase(unittest.IsolatedAsyncioTestCase):
                                        (3, "tags", "A/y"), (4, "move", "A/z")]}
 
         async def fetchall(sql, params):
+            if "FROM md_albums" in sql:
+                return []       # the albums' layout folders (runner._folders)
             return [queued[i] for i in params]
 
-        async def start(key, members):
+        async def start(key, members, queue=True):
             return 0, 0, {"key": key, "ctx": apply.Ctx(key, [], None, "A"), "old_artist": "A",
                           "files": [m for m in members if m["kind"] in apply.FILE_STAGE],
                           "plex_stage": [m for m in members if m["kind"] in apply.PLEX_STAGE]}

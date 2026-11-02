@@ -21,7 +21,7 @@ import logging
 import time
 import uuid
 
-from .. import library
+from .. import library, locks
 from ..config import settings
 from ..db import db, utcnow
 from ..events import bus
@@ -34,6 +34,9 @@ log = logging.getLogger("mdl.metadata")
 UNRESOLVED_RETRY = 30 * 86400
 PENDING_RETRY = 86400
 IMPORT_SETTLE = 150      # seconds after the last import before checking
+SETTLING_RECHECK = 3600  # an album a download is going into is checked again within this
+# the fixes that move an album's files to another folder
+MOVE_KINDS = ("move", "move_conflict", "album_copies")
 CHECK_CONCURRENCY = 3
 # Bumped when what an album *should* look like changes (naming, release
 # choice, what is flagged), so the next pass re-plans everything.
@@ -65,6 +68,8 @@ class Runner:
         # follow-up fixes queued straight after an apply, by issue: two fixes
         # that undo each other would otherwise take turns forever
         self._followed: dict[int, int] = {}
+        # Download missing fixes held back once for a move of their album
+        self._held_back: set[int] = set()
         self._imports: dict[str, float] = {}
         self._last_cycle = 0.0
         self._last_publish = 0.0
@@ -197,6 +202,23 @@ class Runner:
         self._imports[folder] = time.time()
         await db.execute("UPDATE md_albums SET next_check = 0, priority = 10 WHERE dirpath = ?",
                          (folder,))
+
+    async def job_ended(self, job_id: str) -> None:
+        """A download ended. The albums it went into were settling (nothing
+        moved, merged or re-tagged them meanwhile): each is checked again
+        first, once its files have settled in Plex, as after an import."""
+        folders = sorted(await locks.settling(job_id))
+        now = time.time()
+        for i in range(0, len(folders), 400):
+            chunk = tuple(folders[i:i + 400])
+            marks = ",".join("?" * len(chunk))
+            for r in await db.fetchall(f"SELECT DISTINCT dirpath FROM md_albums "
+                                       f"WHERE path_key(dirpath) IN ({marks})", chunk):
+                self._imports[r["dirpath"]] = now
+            await db.execute(f"UPDATE md_albums SET next_check = 0, priority = 10 "
+                             f"WHERE path_key(dirpath) IN ({marks})", chunk)
+        if folders:
+            self.wake()
 
     # ------------------------------------------------------------ status
     async def status(self) -> dict:
@@ -585,12 +607,18 @@ class Runner:
             overrides = await desired_mod.overrides_for("album", record["unit_id"])
             want = await desired_mod.build_album(rows, res, plex_album=hint_album,
                                                  plex_artist=hint_artist, overrides=overrides)
+        # A download is going into it (locks.settling): its files are left
+        # as they are, and so are the issues about them, until the download
+        # ends and it is checked again (job_ended). Plex's side goes ahead.
+        settling = await locks.settling_into(units.unit_folder(key),
+                                             (want or {}).get("folder")) is not None
         plan = await issues.plan_unit(
             key, rows, want if res.status == "resolved" else None, res, plex_info,
             plex_synced=bool(await plexsync.last_sync()), ours_locked=apply.ours_locked,
             no_release=no_release, merge_keeper=await issues.merged_into(units.unit_folder(key)),
-            unit_id=record["unit_id"])
-        await issues.save(plan, scope_kinds=issues.UNIT_KINDS, album_key=key)
+            unit_id=record["unit_id"], settling=settling)
+        await issues.save(plan, album_key=key, scope_kinds=tuple(
+            k for k in issues.UNIT_KINDS if not (settling and k in issues.SETTLING_KINDS)))
         now = time.time()
         if res.status == "resolved":
             next_check = now + settings.metadata_recheck_days * 86400
@@ -598,6 +626,9 @@ class Runner:
             next_check = now + PENDING_RETRY
         else:
             next_check = now + UNRESOLVED_RETRY
+        if settling:
+            # and soon, however the download ends (one cancelled says nothing)
+            next_check = min(next_check, now + SETTLING_RECHECK)
         await db.execute(
             "UPDATE md_albums SET release_mbid = ?, releasegroup_mbid = ?, artist_mbid = ?, "
             "confidence = ?, source = ?, status = ?, manual = ?, desired = ?, candidates = ?, "
@@ -625,9 +656,10 @@ class Runner:
         if (res.status == "resolved" or any(p["kind"] == "tags" for p in plan)) \
                 and not await apply.auto_paused(record["unit_id"]):
             rows_ = await db.fetchall(
-                "SELECT id FROM md_issues WHERE album_key = ? AND state = 'open' AND auto = 1",
-                (key,))
-            auto_ids = [r["id"] for r in rows_]
+                "SELECT id, kind FROM md_issues WHERE album_key = ? AND state = 'open' "
+                "AND auto = 1", (key,))
+            auto_ids = [r["id"] for r in rows_
+                        if not (settling and r["kind"] in issues.SETTLING_KINDS)]
         return {"status": res.status, "auto_ids": auto_ids, "issues": len(plan)}
 
     async def _check_artist(self, artist_dir: str) -> list[int]:
@@ -787,11 +819,19 @@ class Runner:
                 if i["kind"] == "album_copies":
                     keys |= set(await apply.copy_keys(i["detail"]))
             keys = sorted(keys)
+            # A Download missing asked for with a move of its album goes
+            # after the move, from the album's re-check (_apply_plex): queued
+            # first, it would go to the folder the album is leaving. Once.
+            queue_now = not any(i["kind"] in MOVE_KINDS for i in members) or any(
+                i["id"] in self._held_back for i in members if i["kind"] in apply.QUEUE_STAGE)
             try:
                 async with contextlib.AsyncExitStack() as held:
                     for k in keys:
                         await held.enter_async_context(self._lock(k))
-                    a, f, state = await self._start_album(ref, members)
+                    # and their folders, where the files are and go: an
+                    # import into them, or Trash, waits; a scan leaves them
+                    await held.enter_async_context(locks.hold(*await _folders(keys)))
+                    a, f, state = await self._start_album(ref, members, queue=queue_now)
                     if state:
                         b, g = await self._apply_simple(state["files"], state["ctx"],
                                                         apply.FILE_STAGE)
@@ -826,6 +866,7 @@ class Runner:
             self._plex_due[key] = state
             return
         held["plex_stage"] += state["plex_stage"]
+        held["later"] = (held.get("later") or []) + (state.get("later") or [])
         held["ctx"].plex_dirty |= state["ctx"].plex_dirty
         held["ctx"].touched_folders |= state["ctx"].touched_folders
         held["ctx"].new_folders |= state["ctx"].new_folders
@@ -857,6 +898,8 @@ class Runner:
             except Exception:
                 log.exception("plex changes for %s failed", state["ctx"].key)
                 continue
+            finally:
+                await self._queue_later(state)
             applied += a
             failed += f
         ghosts = [issue for (scope, _ref), members in later if scope == "ghost" for issue in members]
@@ -903,8 +946,10 @@ class Runner:
         await self.publish_issues()
         return applied, failed
 
-    async def _start_album(self, key: str, members: list[dict]) -> tuple[int, int, dict | None]:
-        """Load an album for applying, and queue its downloads."""
+    async def _start_album(self, key: str, members: list[dict], *,
+                           queue: bool = True) -> tuple[int, int, dict | None]:
+        """Load an album for applying, and queue its downloads (`queue`), or
+        keep them for after its re-check (state["later"])."""
         record = await db.fetchone("SELECT * FROM md_albums WHERE key = ?", (key,))
         rows = await units.load_unit(key)
         if not rows or record is None:
@@ -919,10 +964,29 @@ class Runner:
         ctx = apply.Ctx(key, rows, want, rows[0].get("artist_dir"), unit_id=record["unit_id"])
         state = {"key": key, "unit_id": record["unit_id"], "ctx": ctx, "old_artist": ctx.artist_dir,
                  "files": [i for i in members if i["kind"] in apply.FILE_STAGE],
-                 "plex_stage": [i for i in members if i["kind"] in apply.PLEX_STAGE]}
+                 "plex_stage": [i for i in members if i["kind"] in apply.PLEX_STAGE],
+                 "later": []}
         queue_stage = [i for i in members if i["kind"] in apply.QUEUE_STAGE]
+        if not queue:
+            state["later"] = queue_stage
+            self._held_back |= {i["id"] for i in queue_stage}
+            return 0, 0, state
+        self._held_back -= {i["id"] for i in queue_stage}
         applied, failed = await self._apply_simple(queue_stage, ctx, apply.QUEUE_STAGE)
         return applied, failed, state
+
+    async def _queue_later(self, state: dict) -> None:
+        """The downloads held back for a move (_files_pass), once the album
+        was checked again where it is now: still queued, into the next pass."""
+        ids = [i["id"] for i in state.get("later") or []]
+        if not ids:
+            return
+        still = [r["id"] for r in await db.fetchall(
+            f"SELECT id FROM md_issues WHERE id IN ({','.join('?' * len(ids))}) "
+            f"AND state = 'queued'", tuple(ids))]
+        if still:
+            self._apply_queue.append(still)
+            self._apply_wake.set()
 
     async def _mark(self, issue: dict, state: str, error: str | None = None) -> None:
         await db.execute("UPDATE md_issues SET state = ?, error = ?, updated_at = ? WHERE id = ?",
@@ -945,6 +1009,11 @@ class Runner:
             except apply.KeepOpen as note:
                 await db.execute("UPDATE md_issues SET state = 'open', updated_at = ? "
                                  "WHERE id = ? AND state = 'queued'", (utcnow(), issue["id"]))
+                if isinstance(note, apply.Settling):
+                    # it says why nothing happened (the check after the
+                    # download plans it again, which clears this)
+                    await db.execute("UPDATE md_issues SET error = ? WHERE id = ?",
+                                     (str(note)[:300], issue["id"]))
                 log.info("%s %s: %s", issue["kind"], issue["ref"], note)
                 applied += 1
             except Exception as exc:
@@ -1011,6 +1080,19 @@ class Runner:
             await self._check_artist(artist_dir)
         bus.publish("library.changed", {"album_keys": [], "artist_dirs": [artist_dir]})
         return applied, failed
+
+
+async def _folders(keys: list[str]) -> list[str]:
+    """The folders the fixes of these albums change: where their files are,
+    and where the layout puts them."""
+    out = [units.unit_folder(k) for k in keys]
+    for r in await db.fetchall(f"SELECT desired FROM md_albums WHERE key IN "
+                               f"({','.join('?' * len(keys))}) AND desired IS NOT NULL",
+                               tuple(keys)):
+        folder = (json.loads(r["desired"]) or {}).get("folder")
+        if folder:
+            out.append(folder)
+    return out
 
 
 async def _due_after_plex_changes(since: float) -> None:
@@ -1085,3 +1167,7 @@ runner = Runner()
 
 async def note_import(library_path: str) -> None:
     await runner.note_import(library_path)
+
+
+async def job_ended(job_id: str) -> None:
+    await runner.job_ended(job_id)

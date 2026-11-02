@@ -14,6 +14,7 @@ Safety rules, the same as the importer's and the library manager's:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ from pathlib import Path
 
 import httpx
 
-from .. import relocate
+from .. import locks, relocate
 from ..config import settings
 from ..db import db, utcnow
 from ..engine import tagio
@@ -34,7 +35,7 @@ from .issues import (FLIPFLOP_WINDOW, MERGE_KEEPER, OSCILLATION_WINDOW, SHARED_F
                      junk_fix_fields, match_flipflop, same_file)
 from .plexsync import jlist
 from .desired import album_tags_of, plain as plain_title, track_tags
-from .units import folder_of
+from .units import folder_of, unit_folder
 from ..paths import PathBuildError, build_track_relpath
 
 log = logging.getLogger("mdl.apply")
@@ -51,6 +52,32 @@ class ApplyError(Exception):
 class KeepOpen(Exception):
     """The action ran, but the issue stays open until the world catches up
     (a download was queued; the tracks aren't here yet)."""
+
+
+class Settling(KeepOpen):
+    """A download is going into the album (locks.settling): nothing ran,
+    and the issue stays open, saying why, until the album is checked again
+    once the download ends."""
+
+
+def settles(executor):
+    """An executor that changes an album's files, or queues its download:
+    not while a download is going into the album's folder, its layout
+    folder or (a merge of copies) a copy's, whoever asked. A plan may
+    predate the download. The checks inside the executor (the oscillation
+    breaker, a merge's destination) wait with it."""
+    @functools.wraps(executor)
+    async def run(issue: dict, ctx: Ctx) -> str:
+        folders = [unit_folder(ctx.key) if ctx.key else None,
+                   (ctx.desired or {}).get("folder")]
+        if issue.get("kind") == "album_copies":
+            folders += [unit_folder(k) for k in await copy_keys(issue.get("detail") or {})]
+        folder = await locks.settling_into(*(f for f in folders if f))
+        if folder:
+            raise Settling(f"waits for the download into {folder} to finish")
+        return await executor(issue, ctx)
+    run.settles = True
+    return run
 
 
 class Ctx:
@@ -168,6 +195,7 @@ def _write_checked(p: Path, fields: dict) -> dict:
     return result
 
 
+@settles
 async def do_tags(issue: dict, ctx: Ctx) -> str:
     _require_online()
     root = settings.library_dir
@@ -211,6 +239,7 @@ async def do_tags(issue: dict, ctx: Ctx) -> str:
 NUMBER_FIELDS = ("tracknumber", "totaltracks", "discnumber", "totaldiscs")
 
 
+@settles
 async def do_track_order_files(issue: dict, ctx: Ctx) -> str:
     """Write the release's track and disc numbers (only those) to the files."""
     _require_online()
@@ -263,6 +292,7 @@ async def do_track_order_plex(issue: dict, ctx: Ctx) -> str:
     return f"renumbered {len(fixes)} tracks in Plex"
 
 
+@settles
 async def do_download_missing(issue: dict, ctx: Ctx) -> str:
     from . import missing
     filed, videos = await _file_in_downloads(issue, ctx)
@@ -312,6 +342,15 @@ async def _file_in_downloads(issue: dict, ctx: Ctx) -> tuple[int, set[str]]:
         moves.append((src, dst, t["provider_track_id"]))
     if not moves:
         return 0, set()
+    # the folders they leave too (the album's is held by the apply): one
+    # another writer has is locks.Busy, and the issue fails saying so,
+    # nothing filed or queued
+    async with locks.hold(target, *(folder_of({"path": s}) for s, _, _ in moves)):
+        return await _file_moves(moves, target, ctx)
+
+
+async def _file_moves(moves: list[tuple], target: str, ctx: Ctx) -> tuple[int, set[str]]:
+    root = settings.library_dir
     batch = ctx.new_batch()
     done = []
     for src, dst, _ in moves:
@@ -438,6 +477,7 @@ async def refuse_oscillation(ctx: Ctx, moves: list[dict]) -> None:
                      f"automatically for {OSCILLATION_WINDOW // 86400} days")
 
 
+@settles
 async def do_move(issue: dict, ctx: Ctx) -> str:
     _require_online()
     from .issues import move_conflict, planned_moves
@@ -652,6 +692,7 @@ async def merge_plan(ctx: Ctx) -> dict:
     return plan
 
 
+@settles
 async def do_merge(issue: dict, ctx: Ctx) -> str:
     """A move blocked by another copy of this album at the destination,
     made one album: the destination gets the tracks it lacks, and where both
@@ -797,6 +838,7 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
     return plan
 
 
+@settles
 async def do_album_copies(issue: dict, ctx: Ctx) -> str:
     """One album held in several folders, made one: see copies_plan. Each
     file moving in is first tagged as the track of this album it becomes,
@@ -916,6 +958,7 @@ async def do_album_copies(issue: dict, ctx: Ctx) -> str:
     return note
 
 
+@settles
 async def do_bad_file(issue: dict, ctx: Ctx) -> str:
     """Damaged files to Trash, once it is certain they are: a file that
     reads now (a NAS hiccup at scan time) is read into the index instead."""
@@ -984,6 +1027,7 @@ def _age(stamp: str | None) -> float:
 READD_EVERY = 7 * 86400
 
 
+@settles
 async def do_scan(issue: dict, ctx: Ctx) -> str:
     folder = (issue.get("detail") or {}).get("folder") or (folder_of(ctx.rows[0]) if ctx.rows else None)
     if folder is None:
@@ -1499,6 +1543,26 @@ async def revert(batch_id: str) -> dict:
         (batch_id,))]
     if not rows:
         return {"reverted": 0, "failures": [{"ref": batch_id, "error": "nothing to undo"}]}
+    # every folder the undo changes is held while it does (locks): where
+    # tags are put back, where moved files are and go back to, and where
+    # trashed files return
+    folders: set[str] = set()
+    for change in rows:
+        if change["target"] == "file":
+            folders.add(str(Path(await current_path(change["ref"])).parent))
+        elif change["target"] == "move":
+            folders |= {str(Path(change["ref"]).parent),
+                        str(Path(json.loads(change["new_value"])).parent)}
+        elif change["target"] == "trash":
+            folders |= {r["original_path"] if r["kind"] == "dir"
+                        else str(Path(r["original_path"]).parent)
+                        for r in await db.fetchall("SELECT original_path, kind FROM library_trash "
+                                                   "WHERE batch_id = ?", (change["ref"],))}
+    async with locks.hold(*folders):
+        return await _revert(batch_id, rows)
+
+
+async def _revert(batch_id: str, rows: list[dict]) -> dict:
     root = settings.library_dir
     reverted, failures = 0, []
     touched: set[str] = set()

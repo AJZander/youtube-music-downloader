@@ -130,6 +130,12 @@ UNIT_KINDS = ("not_in_plex", "unmatched", "wrong_match", "tags", "track_order", 
               "move_conflict", "plex_shared", "plex_foreign", "bad_file",
               "genres", "moods", "poster", "review_match", "unresolved", "folder_artist",
               "extra_tracks")
+# What a check of an album a download is going into (locks.settling) leaves
+# as it was: whatever changes its files (apply.FILE_STAGE), and the files
+# the release lacks a match for, which the download is still bringing.
+# Plex's own fields are planned as ever.
+SETTLING_KINDS = ("bad_file", "tags", "track_order", "move", "move_conflict", "not_in_plex",
+                  "extra_tracks")
 ARTIST_KINDS = ("artist_unmatched", "artist_genres", "artist_moods", "artist_poster",
                 "artist_unknown")
 DUP_KINDS = ("dup_album", "dup_track", "split_artist")
@@ -164,6 +170,12 @@ def planned(kind: str, ref: str, summary: str, detail: dict | None = None, *,
             "artist_dir": artist_dir, "album_key": album_key, "refs": refs or []}
 
 
+def unchanged(key: str) -> dict:
+    """In a plan: the issue with this key, if there is one, stays as it is
+    (not planned again, and not closed)."""
+    return {"key": key, "unchanged": True}
+
+
 async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: str | None = None,
                artist_dir: str | None = None, all_scope: bool = False,
                close_others: bool = True) -> None:
@@ -172,6 +184,8 @@ async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: st
     now = utcnow()
     keys = {i["key"] for i in items}
     for item in items:
+        if item.get("unchanged"):
+            continue
         existing = await db.fetchone("SELECT id, state, detail FROM md_issues WHERE key = ?",
                                      (item["key"],))
         detail = json.dumps(item["detail"], default=str)
@@ -307,13 +321,25 @@ def junk_fix_fields(row: dict) -> dict[str, list[str]]:
 # ------------------------------------------------------------------ planning
 async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex: dict | None,
                     *, plex_synced: bool, ours_locked, no_release: bool = False,
-                    merge_keeper: bool = False, unit_id: str | None = None) -> list[dict]:
+                    merge_keeper: bool = False, unit_id: str | None = None,
+                    settling: bool = False) -> list[dict]:
     """`no_release`: the user says MusicBrainz has no release for these files,
     so nothing asks them to identify it; the files keep their own tags.
     `merge_keeper`: a merge of copies made this folder the album's lately
     (see merged_into), so its files stay in it. `unit_id`: the album's own
     id, which its issues are keyed by (`kind:unit_id`), so they stay the
-    same issues wherever it moves; the key is where it is."""
+    same issues wherever it moves; the key is where it is. `settling`: a
+    download is going into the album, so nothing of SETTLING_KINDS is
+    planned (the caller leaves those issues as they are)."""
+    out = await _plan_unit(key, rows, desired, res, plex, plex_synced=plex_synced,
+                           ours_locked=ours_locked, no_release=no_release,
+                           merge_keeper=merge_keeper, unit_id=unit_id)
+    return [p for p in out if p["kind"] not in SETTLING_KINDS] if settling else out
+
+
+async def _plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex: dict | None,
+                     *, plex_synced: bool, ours_locked, no_release: bool,
+                     merge_keeper: bool, unit_id: str | None) -> list[dict]:
     artist_dir = rows[0].get("artist_dir") if rows else None
     out: list[dict] = []
     # A file nothing can open can't be tagged, numbered or shown in Plex: it
@@ -926,9 +952,13 @@ async def plan_album_copies() -> list[dict]:
     remaster of one album; a standard and a deluxe edition). Each set is
     one issue, kept by the copy whose release holds most of what the set
     has. A new remix shares no recording with the original mix, so it is
-    another album; a box set keeps its own copies."""
+    another album; a box set keeps its own copies. A set one of whose copies
+    a download is going into (locks.settling) waits: its issue, if it has
+    one, stays as it is."""
     from collections import defaultdict
+    from .. import locks
     from . import units as units_mod
+    settling = await locks.settling()
     rows = await db.fetchall(
         "SELECT key, unit_id, artist_dir, release_mbid, releasegroup_mbid, desired FROM md_albums "
         "WHERE status = 'resolved' AND ignored = 0 AND no_release = 0 "
@@ -965,8 +995,13 @@ async def plan_album_copies() -> list[dict]:
             shared = sum(len(c["recs"] & keep["recs"]) for c in others)
             # keyed by the albums, not their folders: the same set is the
             # same issue after a move. Their keys say where they were.
+            ref = f"{group}:{min(c['unit_id'] or c['key'] for c in copies)}"
+            if any(locks.key(f) in settling for f in
+                   [*(unit_folder(c["key"]) for c in copies), keep["want"].get("folder")] if f):
+                out.append(unchanged(f"album_copies:{ref}"))
+                continue
             out.append(planned(
-                "album_copies", f"{group}:{min(c['unit_id'] or c['key'] for c in copies)}",
+                "album_copies", ref,
                 f"{album}: {len(copies)} copies — merge into {keep['want'].get('folder') or keep['key']}",
                 {"keep": keep["key"], "copies": [c["key"] for c in others],
                  "keep_unit": keep["unit_id"], "copy_units": [c["unit_id"] for c in others],

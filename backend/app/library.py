@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
-from . import identity, relocate
+from . import identity, locks, relocate
 from .config import settings
 from .db import db, utcnow
 from .engine.matcher import normalize
@@ -122,6 +122,7 @@ _COLUMNS = ("norm_artist", "norm_title", "norm_album", "path", "format",
             "genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
             "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
             "releasetype", "label", "originaldate", "junk", "tags_version", "path_key")
+_PATH = _COLUMNS.index("path")
 _EXTENDED = ("genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
              "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
              "releasetype", "label", "originaldate", "junk", "tags_version")
@@ -345,6 +346,12 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
     reopened. That matters — walking this library takes ~30s but reading tags
     off 61k files over CIFS takes far longer, so a rescan after resolving
     duplicates has to cost a stat() per file, not a parse.
+
+    It doesn't wait for writers (locks): a folder one held at any point of
+    the scan may have been read half changed (a merge's files tagged and not
+    yet moved, a move's file there and its row not yet), so its rows are
+    neither written nor pruned. The writer indexes what it did; the next
+    scan reads the rest.
     """
     if _scan_lock.locked():
         raise RuntimeError("a library scan is already running")
@@ -357,6 +364,11 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
         state.phase = "walking"
         root = settings.library_dir
         loop = asyncio.get_running_loop()
+        since = locks.tick()
+
+        def settled(rel: str) -> bool:
+            return not locks.touched_since(str(Path(rel).parent), since)
+
         try:
             found = await loop.run_in_executor(None, _walk, root)
             log.info("library scan: %d audio files on disk", len(found))
@@ -406,7 +418,7 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
                         state.done = before
                         results = await loop.run_in_executor(
                             None, _run_batches, pool, str(root), chunk, tick)
-                    rows = [r for r in results if r]
+                    rows = [r for r in results if r and settled(r[_PATH])]
                     state.unreadable += sum(1 for r in rows if r[-1])
                     for rel, _size, _mtime in chunk:
                         if rel in known:
@@ -432,7 +444,8 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
                 state.error = (f"pruning skipped: only {len(found)} of {len(known)} "
                                "indexed files were visible")
                 gone = []
-            await _follow_renamed(gone, [p for p in found if p not in known])
+            gone = [p for p in gone if settled(p)]
+            await _follow_renamed(gone, [p for p in found if p not in known and settled(p)])
             for start in range(0, len(gone), 500):
                 batch = gone[start:start + 500]
                 await db.execute(
@@ -1138,8 +1151,23 @@ async def trash_paths(relpaths: list[str], reason: str = "") -> dict:
     the audio is still byte-identical if it needs to come back. Sidecars (.lrc,
     folder art) follow their track, and an album folder emptied of audio goes
     with its leftovers rather than lingering as a stub for Plex to re-find.
+
+    The album folders are held (locks) while their files go: not during an
+    import into them, or another fix of them.
     """
     _require_online()
+    folders = await asyncio.get_running_loop().run_in_executor(None, _folders_of, relpaths)
+    async with locks.hold(*folders):
+        return await _trash(relpaths, reason)
+
+
+def _folders_of(relpaths) -> list[str]:
+    """The folders these library paths are in, or are (one trashed whole)."""
+    root = settings.library_dir
+    return [p if (root / p).is_dir() else str(Path(p).parent) for p in relpaths if p]
+
+
+async def _trash(relpaths: list[str], reason: str) -> dict:
     batch_id = uuid.uuid4().hex[:12]
     stamp = time.strftime("%Y%m%d-%H%M%S")
     batch_root = settings.trash_dir / f"{stamp}-{batch_id}"
@@ -1282,6 +1310,13 @@ async def restore_batch(batch_id: str) -> dict:
         (batch_id,))
     if not rows:
         raise LibraryError("nothing to restore in that batch")
+    # the album folders they go back into are held while they do (locks)
+    async with locks.hold(*(r["original_path"] if r["kind"] == "dir"
+                            else str(Path(r["original_path"]).parent) for r in rows)):
+        return await _restore(rows, batch_id)
+
+
+async def _restore(rows, batch_id: str) -> dict:
     loop = asyncio.get_running_loop()
     restored, failures = [], []
     # Directories first: a file's parent has to exist before the file lands.
@@ -1368,14 +1403,37 @@ async def merge_artist_folders(sources: list[str], target: str,
     file moved, each tag rewritten (with what it said before), and the copies
     the target already had, which go to Trash. Everything that names the
     moved files and folders follows them (relocate): their index rows keep
-    their video ids and albums, and nothing waits for a rescan."""
-    from .metadata.apply import journal
+    their video ids and albums, and nothing waits for a rescan. Every album
+    folder it changes is held meanwhile (locks)."""
     _require_online()
+    if not _safe_abs(target).is_dir():
+        raise LibraryError(f"target artist folder does not exist: {target!r}")
+    folders = await asyncio.get_running_loop().run_in_executor(
+        None, _artist_folders, sources, target)
+    async with locks.hold(*folders):
+        return await _merge_artists(sources, target, rewrite_tags)
+
+
+def _artist_folders(sources: list[str], target: str) -> list[str]:
+    """The folders an artist merge changes: the artists', their albums',
+    and the target's albums of the same names."""
+    root = settings.library_dir
+    out = []
+    for artist in [*sources, target]:
+        out.append(artist)
+        try:
+            names = [c.name for c in (root / artist).iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        out += [f"{artist}/{n}" for n in names] + [f"{target}/{n}" for n in names]
+    return out
+
+
+async def _merge_artists(sources: list[str], target: str, rewrite_tags: bool) -> dict:
+    from .metadata.apply import journal
     loop = asyncio.get_running_loop()
     root = settings.library_dir
     target_dir = _safe_abs(target)
-    if not target_dir.is_dir():
-        raise LibraryError(f"target artist folder does not exist: {target!r}")
 
     def rel(path: Path) -> str:
         return str(path.relative_to(root))
