@@ -22,7 +22,7 @@ import asyncio
 import logging
 import time
 import unicodedata
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
@@ -63,6 +63,33 @@ def is_matched(guid: str | None) -> bool:
 
 def tag_values(item: dict, key: str) -> list[str]:
     return [t.get("tag") for t in item.get(key) or [] if t.get("tag")]
+
+
+def _folder_entries(data) -> list[tuple[str | None, str | None]] | None:
+    """A folder view's entries: (title, parent id) for each subfolder and
+    (None, None) for each track. None when an entry is neither, or the
+    answer doesn't hold as many as it says it does (an answer that isn't
+    JSON comes back as {}): a shape not understood."""
+    if not isinstance(data, dict):
+        return None
+    entries = [*(data.get("Directory") or []), *(data.get("Metadata") or [])]
+    try:
+        if int(data["size"]) != len(entries):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    out: list[tuple[str | None, str | None]] = []
+    for entry in entries:
+        key = entry.get("key") or ""
+        parent = parse_qs(urlsplit(key).query).get("parent")
+        if "/folder" in key and parent:
+            out.append((entry.get("title"), parent[0]))
+        elif any(part.get("file") for media in entry.get("Media") or []
+                 for part in media.get("Part") or []):
+            out.append((None, None))
+        else:
+            return None
+    return out
 
 
 class PlexClient:
@@ -180,19 +207,26 @@ class PlexClient:
         data = await self.get(f"/library/sections/{settings.plex_section_id}/prefs")
         return {s["id"]: s.get("value") for s in data.get("Setting") or []}
 
-    async def count(self, type_num: int) -> int:
+    async def count(self, type_num: int) -> int | None:
+        """How many items of a type the section holds. None when the answer
+        doesn't say (an empty or non-JSON body comes back as {}): not 0."""
         data = await self.get(f"/library/sections/{settings.plex_section_id}/all",
                               type=type_num, **{"X-Plex-Container-Start": 0,
                                                 "X-Plex-Container-Size": 0})
-        return int(data.get("totalSize") or 0)
+        try:
+            return int(data["totalSize"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     async def iter_items(self, type_num: int, page: int = 2000, **filters):
-        """Every item of a type in the music section, paged."""
+        """Every item of a type in the music section, paged. Sorted by id:
+        unsorted, Plex's order shifts between pages, and a listing skips
+        some items and repeats others."""
         start = 0
         while True:
             data = await self.get(
                 f"/library/sections/{settings.plex_section_id}/all",
-                type=type_num, includeGuids=1, **filters,
+                type=type_num, includeGuids=1, **{"sort": "id", **filters},
                 **{"X-Plex-Container-Start": start, "X-Plex-Container-Size": page})
             items = data.get("Metadata") or []
             for item in items:
@@ -201,6 +235,46 @@ class PlexClient:
             total = int(data.get("totalSize") or 0)
             if not items or start >= total:
                 return
+
+    async def folder_files(self, library_relpath: str) -> dict[str, str] | None:
+        """The tracks Plex lists in one library folder right now, from the
+        section's folder view (one request per level of the path):
+        {library-relative path (NFC): rating key}. Unlike the mirror, this
+        is Plex's own answer.
+
+        None when Plex can't be asked, doesn't list the folder, or answers in
+        a shape not understood: a miss can't be told from a misreading then,
+        and a caller hiding files on the strength of a miss must not."""
+        view = f"/library/sections/{settings.plex_section_id}/folder"
+        try:
+            levels = [await self.get(view)]
+            for name in (p for p in nfc(library_relpath).split("/") if p):
+                # the share ignores case, and Plex may know a folder under an
+                # old spelling too: every spelling's listing counts
+                parents = []
+                for data in levels:
+                    entries = _folder_entries(data)
+                    if entries is None:
+                        return None
+                    parents += [parent for title, parent in entries
+                                if title is not None and nfc(title).casefold() == name.casefold()]
+                if not parents:
+                    return None
+                levels = [await self.get(view, parent=parent) for parent in parents]
+        except PlexError as exc:
+            log.debug("plex folder view failed for %s: %s", library_relpath, exc)
+            return None
+        files: dict[str, str] = {}
+        for data in levels:
+            if _folder_entries(data) is None:
+                return None
+            for item in data.get("Metadata") or []:
+                for media in item.get("Media") or []:
+                    for part in media.get("Part") or []:
+                        path = self.from_plex_path(part.get("file") or "")
+                        if path and item.get("ratingKey"):
+                            files[path] = str(item["ratingKey"])
+        return files
 
     async def metadata(self, rating_key: str) -> dict | None:
         try:

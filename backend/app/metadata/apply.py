@@ -27,7 +27,7 @@ from ..config import settings
 from ..db import db, utcnow
 from ..engine import tagio
 from ..importer import library_online
-from ..plex import ALBUM, ARTIST, TRACK, PlexError, is_matched, plex
+from ..plex import ALBUM, ARTIST, TRACK, PlexError, is_matched, nfc, plex
 from . import plexsync
 from .issues import MERGE_KEEPER, OSCILLATION_WINDOW, SHARED_FIELDS, junk_fix_fields, same_file
 from .plexsync import jlist
@@ -1001,6 +1001,24 @@ async def do_scan(issue: dict, ctx: Ctx) -> str:
         info = await plexsync.album_for_paths(readable)
         missing = [p for p in readable if p not in ((info or {}).get("tracks") or {})]
         if missing:
+            # The mirror can be behind (or a listing came up short): only a
+            # file Plex itself doesn't list now is hidden and added again.
+            listed = await _live_listing(missing)
+            if listed is None:
+                # Plex can't say (or doesn't list the folder at all, as when
+                # its scans haven't reached it): a plain scan, nothing hidden
+                ctx.touched_folders.add(folder)
+                ctx.plex_dirty = True
+                raise KeepOpen(f"Plex asked to scan {folder}; it couldn't say which files it "
+                               f"lists there, so none were re-added")
+            have = {nfc(p).casefold(): key for p, key in listed.items()}
+            keys = [have[nfc(p).casefold()] for p in missing
+                    if nfc(p).casefold() in have]
+            missing = [p for p in missing if nfc(p).casefold() not in have]
+            if keys:
+                await plexsync.refresh_items(list(dict.fromkeys(keys)))
+            if not missing:
+                return f"Plex lists all {len(keys)} files: the mirror was behind, and is read again"
             mark = f"plex_readd:{folder}"
             row = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (mark,))
             if row and time.time() - float(row["value"] or 0) < READD_EVERY:
@@ -1017,6 +1035,18 @@ async def do_scan(issue: dict, ctx: Ctx) -> str:
     return f"Plex asked to scan {folder}"
 
 
+async def _live_listing(paths: list[str]) -> dict[str, str] | None:
+    """What Plex lists right now in these files' folders: {path: rating
+    key}. None when Plex can't say, so nothing is re-added on a guess."""
+    listed: dict[str, str] = {}
+    for parent in sorted({p.rsplit("/", 1)[0] if "/" in p else "" for p in paths}):
+        files = await plex.folder_files(parent)
+        if files is None:
+            return None
+        listed.update(files)
+    return listed
+
+
 async def readd(paths: list[str]) -> int:
     """Have Plex forget files it holds but won't show and add them again.
 
@@ -1031,9 +1061,15 @@ async def readd(paths: list[str]) -> int:
     pairs = [(p, str(Path(p).with_name(f".mdl-readd-{Path(p).name}"))) for p in paths]
     folders = sorted({str(Path(p).parent) for p in paths})
     async with SCAN_HOLD:
+        # files an earlier re-add left hidden (the mount went away) go back
+        # first: their record is about to be written over
+        await restore_hidden()
+        if await db.fetchone("SELECT 1 FROM md_state WHERE key = ?", (READD_PENDING,)):
+            raise ApplyError("files an earlier re-add hid can't be put back yet; not hiding more")
         await db.execute("INSERT INTO md_state (key, value) VALUES (?, ?) ON CONFLICT(key) "
                          "DO UPDATE SET value = excluded.value", (READD_PENDING, json.dumps(pairs)))
         hidden = []
+        offline = False
         try:
             for rel, tmp in pairs:
                 try:
@@ -1045,10 +1081,20 @@ async def readd(paths: list[str]) -> int:
                 for folder in folders:
                     await plex.refresh_path(folder)
                 await plex.wait_for_scan(timeout=300)
-                await plex.empty_trash()
-                await plex.wait_for_scan(timeout=120, start=10)
+                # Emptying Plex's trash drops every item it can't see just
+                # then, not only these: never while the mount is away.
+                offline = not library_online()
+                if not offline:
+                    await plex.empty_trash()
+                    await plex.wait_for_scan(timeout=120, start=10)
         finally:
-            await restore_hidden(hidden)
+            back = await restore_hidden(hidden)
+    if offline:
+        left = len(hidden) - back
+        raise ApplyError("the library mount went offline during the re-add: Plex's trash was "
+                         "left alone, and " + (f"{left} files are still hidden; they go back at "
+                                               f"the next re-add or restart" if left
+                                               else "the files put back"))
     for folder in folders:
         await plex.refresh_path(folder)
     log.info("plex re-add of %d files in %s", len(hidden), ", ".join(folders[:3]))
@@ -1057,20 +1103,29 @@ async def readd(paths: list[str]) -> int:
 
 async def restore_hidden(pairs: list | None = None) -> int:
     """Put files hidden for a re-add back under their names (after a re-add,
-    or at startup for one a restart cut short)."""
+    or at startup for one a restart cut short). The record of them stays
+    while one can't be: on an error, or when a file is under neither name
+    and the mount is offline (an empty mount point shows neither)."""
     if pairs is None:
         row = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (READD_PENDING,))
         pairs = json.loads(row["value"]) if row and row["value"] else []
     root = settings.library_dir
-    back = 0
+    back = unseen = 0
     for rel, tmp in pairs:
         try:
-            if await _run((root / tmp).exists) and not await _run((root / rel).exists):
-                await _run(os.replace, root / tmp, root / rel)
-                back += 1
+            if await _run((root / tmp).exists):
+                if not await _run((root / rel).exists):
+                    await _run(os.replace, root / tmp, root / rel)
+                    back += 1
+            elif not await _run((root / rel).exists):
+                unseen += 1
         except OSError as exc:
             log.warning("could not put back %s (still at %s): %s", rel, tmp, exc)
             return back
+    if unseen and not library_online():
+        log.warning("the library mount is offline: %d files hidden for a Plex re-add "
+                    "go back later", unseen)
+        return back
     await db.execute("DELETE FROM md_state WHERE key = ?", (READD_PENDING,))
     return back
 
@@ -1384,6 +1439,9 @@ async def clean_ghosts(found: list[dict]) -> str:
     if "" in targets:
         await plex.refresh_all()
     await plex.wait_for_scan(timeout=min(6 * 3600, 120 * len(targets)))
+    if not library_online():
+        # an empty now would drop every item Plex can't see, not only these
+        raise ApplyError("the library mount looks offline: Plex's trash was left alone")
     await plex.empty_trash()
     await plexsync.forget_paths([p for i in found for p in (i.get("detail") or {}).get("paths") or []])
     return f"Plex rescanned {len(targets)} folders and emptied its trash"

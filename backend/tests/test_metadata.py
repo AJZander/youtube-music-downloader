@@ -994,6 +994,7 @@ class OldPlexEntriesTestCase(unittest.IsolatedAsyncioTestCase):
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "Arctic Monkeys" / "(2013) AM").mkdir(parents=True)
         (self.tmp / "Queen").mkdir()
+        (self.tmp / ".mdl-library-online").touch()      # Plex's trash is emptied only then
         self.patch = mock.patch.object(settings, "library_dir", self.tmp)
         self.patch.start()
 
