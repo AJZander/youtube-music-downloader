@@ -590,6 +590,8 @@ class MergeArtistsTestCase(unittest.TestCase):
             # what names the moved files follows them: tested in test_p1_relocate
             mock.patch.object(library.relocate, "relocate", mock.AsyncMock(return_value={})),
             mock.patch.object(library.db, "fetchall", mock.AsyncMock(return_value=[])),
+            # nothing indexed: the target's spelling is read off the disk (on_disk)
+            mock.patch.object(library.db, "fetchone", mock.AsyncMock(return_value=None)),
             mock.patch.object(library.db, "execute", mock.AsyncMock()),
             mock.patch.object(library.db, "transaction", no_transaction),
             mock.patch.object(library.db, "executemany",

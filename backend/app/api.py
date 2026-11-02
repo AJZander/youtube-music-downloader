@@ -18,6 +18,7 @@ from .engine.router import UnsupportedURL, route
 from . import catalog, discover, identity, library, ordering
 from .events import bus, sse_format
 from .importer import library_online
+from .metadata import recheck
 from .models import (ACTIVE_JOB_STATUSES, JobStatus, TrackStatus, row_to_job,
                      row_to_track)
 from .plex import plex
@@ -923,6 +924,10 @@ async def library_trash(body: TrashIn):
                 body.reason or "kept side by side")
     except library.LibraryError as exc:
         raise HTTPException(409, str(exc))
+    folders = await library.trash_folders(result["batch_id"]) if result.get("batch_id") else []
+    kept = body.keep_together if body.keep_together and len(body.keep_together) > 1 else []
+    result["recheck"] = await _recheck(folders + _exclusion_folders(body.scope, kept),
+                                       artist_dirs=_artists_of(folders))
     return result
 
 
@@ -935,7 +940,34 @@ async def library_add_exclusion(body: ExclusionIn):
         pairs = await library.add_exclusions(body.scope, body.keys, body.reason)
     except library.LibraryError as exc:
         raise HTTPException(422, str(exc))
-    return {"pairs": pairs}
+    return {"pairs": pairs,
+            "recheck": await _recheck(_exclusion_folders(body.scope, body.keys))}
+
+
+async def _recheck(folders: list[str], artist_dirs=()) -> dict | None:
+    """Needs attention brought up to date with what the action just
+    changed (metadata.recheck). The action is done by then: a re-check that
+    fails is left to the next cycle, and doesn't fail the request."""
+    try:
+        return await recheck.after_library_change(folders, artist_dirs=artist_dirs)
+    except Exception:
+        log.exception("re-check after a library change failed")
+        return None
+
+
+def _artists_of(folders) -> list[str]:
+    return sorted({f.split("/", 1)[0] for f in folders if f})
+
+
+def _exclusion_folders(scope: str, keys: list[str]) -> list[str]:
+    """The album folders a "not duplicates" decision is about: an album
+    pair's own, a track pair's folders. An artist pair's changes only the
+    duplicate findings."""
+    if scope == "album":
+        return list(keys)
+    if scope == "track":
+        return [k.rpartition("/")[0] for k in keys]
+    return []
 
 
 @router.get("/library/exclusions")
@@ -945,8 +977,13 @@ async def library_list_exclusions():
 
 @router.delete("/library/exclusions")
 async def library_delete_exclusions(body: ExclusionDeleteIn):
-    """Undo a decision, so the group can be reported again."""
-    return {"removed": await library.remove_exclusions(body.ids)}
+    """Undo a decision, so the group can be reported again: at once, as
+    "not duplicates" closed it."""
+    pairs = await library.exclusion_pairs(body.ids)
+    removed = await library.remove_exclusions(body.ids)
+    folders = {f for p in pairs for f in _exclusion_folders(p["scope"], [p["key_a"], p["key_b"]])}
+    return {"removed": removed,
+            "recheck": await _recheck(sorted(folders)) if pairs else None}
 
 
 @router.get("/library/trash")
@@ -957,9 +994,12 @@ async def library_trash_list(include_restored: bool = False):
 @router.post("/library/trash/{batch_id}/restore")
 async def library_trash_restore(batch_id: str):
     try:
-        return await library.restore_batch(batch_id)
+        result = await library.restore_batch(batch_id)
     except library.LibraryError as exc:
         raise HTTPException(409, str(exc))
+    folders = await library.trash_folders(batch_id)
+    result["recheck"] = await _recheck(folders, artist_dirs=_artists_of(folders))
+    return result
 
 
 @router.post("/library/trash/purge")
@@ -974,10 +1014,13 @@ async def library_trash_purge(body: PurgeIn):
 @router.post("/library/artists/merge")
 async def library_merge_artists(body: MergeArtistsIn):
     try:
-        return await library.merge_artist_folders(
+        result = await library.merge_artist_folders(
             body.sources, body.target, rewrite_tags=body.rewrite_tags)
     except library.LibraryError as exc:
         raise HTTPException(409, str(exc))
+    artists = sorted({*body.sources, body.target})
+    result["recheck"] = await _recheck(artists, artist_dirs=artists)
+    return result
 
 
 @router.post("/library/plex/empty-trash")

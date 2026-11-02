@@ -568,7 +568,11 @@ class Runner:
             moved = await units.follow(key)
             if moved:
                 return {"status": "gone", "moved_to": moved}
-            await db.execute("DELETE FROM md_albums WHERE key = ?", (key,))
+            # gone to Trash, the record stays for a Restore, which brings
+            # the files back to it (ignored, pinned, dismissed as they were);
+            # the cycle's registry pass drops it, as it drops any gone album
+            if not await library.in_trash(units.unit_folder(key)):
+                await db.execute("DELETE FROM md_albums WHERE key = ?", (key,))
             await issues.save([], scope_kinds=issues.UNIT_KINDS, album_key=key,
                               close_as="superseded", reason="the album is gone")
             return {"status": "gone"}

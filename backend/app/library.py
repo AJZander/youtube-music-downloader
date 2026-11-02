@@ -565,6 +565,15 @@ async def list_exclusions() -> dict:
     return {"total": len(rows), "items": items}
 
 
+async def exclusion_pairs(ids: list[int]) -> list[dict]:
+    """The decisions with these ids: each one's scope and pair of keys."""
+    if not ids:
+        return []
+    return [dict(r) for r in await db.fetchall(
+        f"SELECT scope, key_a, key_b FROM library_exclusions WHERE id IN "
+        f"({','.join('?' * len(ids))})", tuple(ids))]
+
+
 async def remove_exclusions(ids: list[int]) -> int:
     if not ids:
         return 0
@@ -1305,6 +1314,26 @@ async def list_trash(limit: int = 200, include_restored: bool = False) -> dict:
     return {"batches": batches, "entries": total["n"], "bytes": total["bytes"]}
 
 
+async def trash_folders(batch_id: str) -> list[str]:
+    """The folders a Trash batch took files from, or took whole."""
+    rows = await db.fetchall("SELECT original_path, kind FROM library_trash WHERE batch_id = ?",
+                             (batch_id,))
+    return sorted({r["original_path"] if r["kind"] == "dir"
+                   else str(Path(r["original_path"]).parent) for r in rows})
+
+
+async def in_trash(folder: str) -> bool:
+    """Whether Trash holds audio from this folder, or the folder (or one
+    above it) whole: a Restore would bring it back."""
+    parts = folder.split("/")
+    whole = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    return await db.fetchone(
+        f"SELECT 1 FROM library_trash WHERE restored_at IS NULL AND ((kind = 'dir' AND "
+        f"original_path IN ({','.join('?' * len(whole))})) OR (kind IN ('audio', 'dir') "
+        f"AND original_path >= ? AND original_path < ?)) LIMIT 1",
+        (*whole, folder + "/", folder + "0")) is not None
+
+
 async def restore_batch(batch_id: str) -> dict:
     """Put a trashed batch back exactly where it came from, and in the index."""
     _require_online()
@@ -1434,6 +1463,7 @@ def _artist_folders(sources: list[str], target: str) -> list[str]:
 
 async def _merge_artists(sources: list[str], target: str, rewrite_tags: bool) -> dict:
     from .metadata.apply import journal
+    from .metadata.issues import same_file
     loop = asyncio.get_running_loop()
     root = settings.library_dir
     target_dir = _safe_abs(target)
@@ -1457,17 +1487,28 @@ async def _merge_artists(sources: list[str], target: str, rewrite_tags: bool) ->
 
     moved, merged_into, retagged, failures = [], [], 0, []
     leftovers: list[str] = []
+    skipped = {target}
     # the album artist the target's own files carry, before the moved ones count
     name = await _album_artist_of(target) if rewrite_tags else None
     for source in sources:
-        if source == target:
+        if source in skipped:
             continue
         source_dir = _safe_abs(source)
         if not source_dir.is_dir():
             failures.append({"path": source, "error": "not a folder"})
             continue
+        if same_file(source_dir, target_dir):
+            # the target spelled another way (the share ignores case): each
+            # album would be its own destination, and go to Trash as a copy
+            skipped.add(source)
+            failures.append({"path": source, "error": "the target's own folder, in another case"})
+            continue
         for child in sorted(source_dir.iterdir()):
-            destination = target_dir / child.name
+            # an album folder the target has in another case is that folder
+            # (the share ignores case): spelled the target's way. Only the
+            # album's name: the target's is as given, never the source's
+            spelled = await relocate.on_disk(f"{rel(target_dir)}/{child.name}")
+            destination = target_dir / spelled.rpartition("/")[2]
             try:
                 if destination.exists() and child.is_dir():
                     # Same album folder name on both sides — merge file by file.
@@ -1530,7 +1571,7 @@ async def _merge_artists(sources: list[str], target: str, rewrite_tags: bool) ->
 
     # Only now can the source folders go, and only if they really are empty.
     for source in sources:
-        if source == target:
+        if source in skipped:
             continue
         try:
             _safe_abs(source).rmdir()
@@ -1706,13 +1747,17 @@ _analysis_lock = asyncio.Lock()
 
 async def _analysis_token() -> tuple:
     """Cheap fingerprint of the indexed library plus its trash. Any scan,
-    removal or restore moves it, and nothing else needs to."""
+    removal or restore moves it, and so does a move (relocate's generation:
+    an artist merge changes no count and reads no file); nothing else needs
+    to."""
     row = await db.fetchone(
         "SELECT COUNT(*) AS n, COALESCE(MAX(scanned_at), '') AS last FROM library_index")
     trash = await db.fetchone("SELECT COUNT(*) AS n FROM library_trash")
     excl = await db.fetchone(
         "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS last FROM library_exclusions")
-    return (row["n"], row["last"], trash["n"], excl["n"], excl["last"])
+    moved = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (relocate.GENERATION,))
+    return (row["n"], row["last"], trash["n"], excl["n"], excl["last"],
+            moved["value"] if moved else "")
 
 
 async def _analyse() -> dict:
