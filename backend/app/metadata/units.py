@@ -15,7 +15,7 @@ import re
 from collections import defaultdict
 
 from ..db import db
-from ..library import album_key, strict_key, unit_dir
+from ..identity import split_key, strict_key, unit_dir  # noqa: F401
 
 UNIT_COLUMNS = (
     "path, title, artist, album, album_artist, track_number, disc_number, year, format, "
@@ -30,24 +30,11 @@ def folder_of(row: dict) -> str:
                     or (row["path"].rsplit("/", 1)[0] if "/" in row["path"] else ""))
 
 
-# What a folder's files may disagree on and still be one album: an edition
-# or disc suffix ("Against All Oddz" / "Against All Oddz (Collector's
-# Edition)", "Album (Disc 2)").
-_SUFFIX = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*$|\s*[-–—:,]?\s*\b(?:disc|cd|disk)\s*\d+\s*$", re.I)
-
-
-def split_key(album: str | None, hint: str | None) -> str:
-    name = album or ""
-    for _ in range(3):
-        stripped = _SUFFIX.sub("", name).strip()
-        if stripped == name or not stripped:
-            break
-        name = stripped
-    return album_key(name, hint)
-
-
 def split_folder(rows: list[dict]) -> dict[str, list[dict]]:
-    """unit key -> rows, for the rows of one folder."""
+    """unit key -> rows, for the rows of one folder. Files whose album tags
+    differ only by an edition or disc suffix are one album (identity.split_key);
+    a live album, an instrumental edition, the remixes or a re-recording
+    beside its original are two."""
     if not rows:
         return {}
     folder = folder_of(rows[0])

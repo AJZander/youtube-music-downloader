@@ -91,23 +91,31 @@ class SkipReasonTestCase(DbTestCase):
         return await self.track(track["id"])
 
     async def test_a_gate_skip_records_its_reason(self):
-        # Same artist, title and album, but 45 s longer: the gate still says
-        # "have" (P1-B3 changes that). Now it at least says so.
+        # The very same video, but 45 s longer: still the identical audio,
+        # and the reason says the length differs. (The same artist, title and
+        # album 45 s longer is another recording since P1-F1: it downloads.)
         track = await self.add_track("t1", artist="Paul Kelly", title="Rita Wrote A Letter",
-                                     album="Seventy", video_id="vid9", duration=300)
+                                     album="Seventy", video_id="vid1", duration=300)
         track = await self.gate(track)
         self.assertEqual(track["status"], TrackStatus.SKIPPED_DUPLICATE)
         self.assertEqual(track["library_path"], "PK/Seventy/03.m4a")
         self.assertEqual(track["error_code"], "held_same_album")
         message = track["error_message"] or ""
         self.assertIn("PK/Seventy/03.m4a", message)
-        self.assertIn("exact title", message)
+        self.assertIn("matched by video", message)
         self.assertIn("version or length differs", message)
+        exact = await self.gate(await self.add_track(
+            "t2", artist="Paul Kelly", title="Rita Wrote A Letter", album="Seventy",
+            video_id="vid9", duration=256))
+        self.assertEqual((exact["status"], exact["error_message"]),
+                         (TrackStatus.SKIPPED_DUPLICATE,
+                          "Already in the library: PK/Seventy/03.m4a (matched by exact title)"))
 
         listed = await self.api.list_skipped(limit=100, offset=0, only_different_album=False)
-        self.assertEqual([(t["id"], t["error_code"], t["error_message"])
-                          for t in listed["items"]],
-                         [("t1", "held_same_album", message)])
+        self.assertEqual(sorted((t["id"], t["error_code"], t["error_message"])
+                                for t in listed["items"]),
+                         [("t1", "held_same_album", message),
+                          ("t2", "held_same_album", exact["error_message"])])
 
     async def test_the_match_type_is_named(self):
         video = await self.gate(await self.add_track(

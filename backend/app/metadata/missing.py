@@ -21,11 +21,11 @@ import json
 import logging
 import re
 
+from .. import identity
 from ..db import db, utcnow
 from ..engine.matcher import normalize
-from ..library import album_identity, strict_key
+from ..identity import album_identity, strict_key
 from ..models import ACTIVE_JOB_STATUSES, TrackStatus
-from ..ownership import title_keys, version_markers
 from . import musicbrainz as mb
 from .issues import planned, save
 
@@ -44,7 +44,6 @@ def _asking_failed(exc, what: str) -> RuntimeError:
     if isinstance(exc, catalog.CatalogError) and exc.status == 503:
         return Busy(str(exc))
     return RuntimeError(f"{what}: {exc}")
-TOLERANCE = 5.0
 
 
 async def _units(release_mbid: str) -> list[dict]:
@@ -80,11 +79,16 @@ async def compute(release_mbid: str) -> dict | None:
     tracks = [t for t in mb.release_tracks(rel) if t["disc"] in audio_discs]
     for position, t in enumerate(tracks, start=1):
         t["position"] = position     # running number across discs, as YouTube Music counts
+    # what a track is without saying so: on a live release, or its "Live at
+    # the Crocodile Cafe" disc, YouTube Music's "Song (Live)" is the track
+    types = (rel.get("release-group") or {}).get("secondary-types") or []
     missing = [{"disc": t["disc"], "number": t["number"], "position": t["position"],
                 "title": t["title"],
                 "length": t["length"], "recording_mbid": t["recording_id"],
                 "releasetrack_mbid": t["track_id"],
-                "artist": mb.credit_string(t["credits"]) or None}
+                "artist": mb.credit_string(t["credits"]) or None,
+                "context": sorted(identity.release_context(rel.get("title"), types,
+                                                           t.get("medium_title")))}
                for t in tracks if t["track_id"] not in have]
     held = len(tracks) - len(missing)
     return {"release_mbid": release_mbid, "album": (desired or {}).get("album") or rel.get("title"),
@@ -203,52 +207,26 @@ async def _browse_from_history(release_mbid: str) -> str | None:
     return None
 
 
-def _similar(a: str, b: str) -> float:
-    from difflib import SequenceMatcher
-    return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
-
-
 def _match(missing: list[dict], ytm_tracks: list[dict]) -> tuple[list[str], list[dict]]:
-    """Video ids on the YouTube Music album for the missing tracks.
-
-    Same title (and version) within 5 seconds first; failing that, the same
-    place on the album and the same length ("All Bout U" is "All About U"),
-    or a near-identical title and the same length."""
-    found, not_found, used = [], [], set()
-    playable = [t for t in ytm_tracks if t.get("video_id") and t.get("available")]
-    for want in missing:
-        keys = title_keys(want["title"])
-        marks = version_markers(want["title"])
-        best = None
-
-        def gap_of(t):
-            if t.get("duration_sec") and want.get("length"):
-                return abs(t["duration_sec"] - want["length"])
-            return None
-
-        for t in playable:
-            if t["video_id"] in used:
-                continue
-            gap = gap_of(t)
-            if gap is not None and gap > TOLERANCE:
-                continue
-            if keys & title_keys(t.get("title")) and version_markers(t.get("title")) == marks:
-                rank = 0
-            elif gap is not None and want.get("position") and t.get("track_number") == want["position"]:
-                rank = 1
-            elif gap is not None and _similar(want["title"], t.get("title") or "") >= 0.75:
-                rank = 2
-            else:
-                continue
-            score = (rank, gap or 0.0)
-            if best is None or score < best[0]:
-                best = (score, t)
-        if best:
-            used.add(best[1]["video_id"])
-            found.append(best[1]["video_id"])
-        else:
-            not_found.append(want)
-    return found, not_found
+    """Video ids on the YouTube Music album for the missing tracks, in their
+    order, through the resolver's matcher (identity.assign): the same title
+    and version within 5 seconds first; failing that, the same place on the
+    album and length ("All Bout U" is "All About U"), or a near-identical
+    title and length. The version agrees at every rank, so "Black Friday
+    (Live)" in the studio song's place is not the studio song."""
+    playable, seen = [], set()
+    for t in ytm_tracks:
+        if t.get("video_id") and t.get("available") and t["video_id"] not in seen:
+            seen.add(t["video_id"])
+            playable.append(t)
+    wanted = [identity.side(w["title"], w.get("length"), number=w.get("position"),
+                            context=w.get("context") or ())
+              for w in missing]
+    held = [identity.side(t.get("title"), t.get("duration_sec"), number=t.get("track_number"))
+            for t in playable]
+    picked = {j: playable[i]["video_id"] for j, i in identity.assign(wanted, held)}
+    found = [picked[j] for j in range(len(missing)) if j in picked]
+    return found, [w for j, w in enumerate(missing) if j not in picked]
 
 
 async def find_on_youtube(info: dict) -> tuple[str | None, dict | None]:

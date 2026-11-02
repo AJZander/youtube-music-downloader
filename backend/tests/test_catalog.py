@@ -672,7 +672,10 @@ class CatalogDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
         for t, length in zip(album["tracks"], (295, 231, 200)):
             t["duration_sec"] = length
         out, chem, esc = await self.annotate(album, "ep", names=("The Devil Wears Prada",))
-        self.assertEqual((out["library"], out["library_mismatch"]), ("have", True))
+        # 30 s off on its own album: another recording, so the album's one
+        # downloads (review 2026-11, P1-F1; the gate used to keep it)
+        self.assertEqual((out["library"], out["library_mismatch"]), ("elsewhere", True))
+        self.assertTrue(out["library_same_album"])
         self.assertEqual((chem["library"], chem["library_mismatch"]), ("have", False))
         self.assertEqual(esc["library"], "elsewhere")
 

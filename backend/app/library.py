@@ -32,16 +32,24 @@ import os
 import re
 import shutil
 import time
-import unicodedata
 import uuid
 from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
+from . import identity
 from .config import settings
 from .db import db, utcnow
 from .engine.matcher import normalize
+# What is the same recording, album, artist or path, and which copy is
+# better, is app.identity's to say; these names stay for the callers that
+# have always asked here.
+from .identity import (  # noqa: F401
+    _DIR_NOISE, _YOUTUBE_JUNK, DURATION_TOLERANCE, LOSSLESS_FORMATS, UPLOAD_TOLERANCE,
+    album_identity, album_key, edition_words, fold, format_quality, keys_for, row_album_id,
+    row_album_identity, row_album_keys, row_edition, same_album, strict_key, tag_quality,
+    title_keys, title_looks_like_junk, unit_dir, version_markers)
 
 log = logging.getLogger("mdl.library")
 
@@ -51,15 +59,6 @@ AUDIO_SUFFIXES = {".mp3", ".flac", ".opus", ".m4a", ".ogg", ".wav", ".aac", ".wm
 # audio into the trash when a whole folder goes, and never hold a folder open.
 SIDECAR_SUFFIXES = {".lrc", ".jpg", ".jpeg", ".png", ".webp", ".nfo", ".txt",
                     ".cue", ".log", ".m3u", ".m3u8", ".sfv", ".md5", ".db", ".ini"}
-LOSSLESS_FORMATS = {"flac", "wav", "alac", "aiff", "aif", "ape", "wv"}
-
-# Duration difference that still counts as "the same recording". Wider than
-# the matcher's ±3s: these are two rips of the same track from different
-# sources, not a match against a known reference duration.
-DURATION_TOLERANCE = 5.0
-# Old YouTube uploads run long — a few seconds of silence, a video's intro —
-# so a copy with a YouTube-style title gets this much slack instead.
-UPLOAD_TOLERANCE = 30.0
 
 # Fraction of the smaller album's tracks that must appear in the larger one
 # before the two folders are called the same album.
@@ -73,204 +72,6 @@ MAX_BUCKET = 250
 # waiting on a chunk boundary; a partial scan still keeps everything committed
 # before the last boundary it crossed.
 COMMIT_CHUNK = 2000
-
-
-# ------------------------------------------------------------------ text keys
-_YOUTUBE_JUNK = re.compile(
-    r"\b(official\s*(music\s*)?(video|audio|visuali[sz]er)|lyric[s]?\s*video"
-    r"|full\s*album|audio\s*only|hd|hq|4k|m/v|mv)\b", re.I)
-
-_DIR_NOISE = [
-    re.compile(r"^\s*[\(\[\{]?\s*(19|20)\d{2}\s*[\)\]\}]?\s*[-–—.]+\s*"),  # (2013) - / 2013 -
-    re.compile(r"[\[\{][^\]\}]*[\]\}]"),                                    # [FLAC 24bit]
-    re.compile(r"\((?:19|20)\d{2}\)"),                                      # (2017)
-    re.compile(r"\b(flac|mp3|m4a|aac|opus|wav|web|webrip|cd\d?|cdrip|vinyl|"
-               r"\d{2,3}\s?kbps|\d{3}k|v0|v2|\d{2}\s?bit|\d{2}(\.\d)?\s?khz|"
-               r"hi\s?res|lossless|obey|scene)\b", re.I),
-]
-
-
-def strict_key(s: str) -> str:
-    """Punctuation- and space-insensitive identity key. `AC_DC`, `AC/DC` and
-    `ACDC` are one artist; `3 Doors Down` and `3doorsdown` are one artist."""
-    s = unicodedata.normalize("NFKD", s or "").casefold()
-    return re.sub(r"[^a-z0-9]+", "", s)
-
-
-def fold(text: str | None) -> str:
-    """Case- and accent-blind text to search in: "Måneskin" -> "maneskin"."""
-    decomposed = unicodedata.normalize("NFKD", text or "")
-    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
-
-
-_FEAT_TAG = re.compile(r"\s*[\(\[]\s*(?:feat|ft|featuring)\b\.?[^\)\]]*[\)\]]", re.I)
-
-
-def title_keys(title: str | None, artist_hint: str | None = None,
-               artists=()) -> frozenset[str]:
-    """Comparison keys for one track title.
-
-    v1 wrote whole YouTube video titles into the title tag — `Ariana Grande -
-    Baby I (Official Video)` sits next to a clean `Baby I`. Rather than guess
-    which side of a dash is the title, emit both readings and call two tracks
-    the same when *any* key matches. Matching on a set intersection instead of
-    string equality is what lets a junk-tagged folder group with a clean one.
-    """
-    if not title:
-        return frozenset()
-    # a bracketed credit goes first: normalize() cuts everything after
-    # "feat.", which would take "(Wideboys Remix)" after it along too
-    raw = _FEAT_TAG.sub("", _YOUTUBE_JUNK.sub(" ", title))
-    keys = {normalize(raw)}
-    if artist_hint:
-        prefix = re.compile(r"^\s*" + re.escape(artist_hint) + r"\s*[-–—]\s*", re.I)
-        keys.add(normalize(prefix.sub("", raw)))
-    if " - " in raw or " – " in raw:
-        left, right = re.split(r"\s+[-–—]\s+", raw, maxsplit=1)
-        # "Artist - Title" from a video, never "Title - Live" or "Kapitel 2 -
-        # Chronicles, Vol. 1": what follows the dash there is shared by
-        # every track of the album
-        left_key = strict_key(left)
-        names = {strict_key(a) for a in (artist_hint, *artists) if a}
-        if title_looks_like_junk(title) or any(
-                n == left_key or (len(n) >= 4 and n in left_key) for n in names if n):
-            keys.add(normalize(right))
-            if re.search(r"\b(?:feat|ft)\b", left, re.I):
-                # "SALMO FEAT. ENIGMA - MUNCHIES": normalize() cuts at the
-                # credit, leaving only the artist as the whole title's key
-                keys.discard(normalize(raw))
-                if artist_hint:
-                    keys.discard(normalize(prefix.sub("", raw)))
-    return frozenset(k for k in keys if k)
-
-
-def keys_for(row: dict) -> frozenset[str]:
-    """title_keys for a scanned row, memoized on the row itself.
-
-    Album grouping compares every pair of folders an artist owns, so an
-    un-memoized call recomputes the same regex work thousands of times for a
-    prolific artist. The cache lives on the dict, which is per-analysis."""
-    cached = row.get("_keys")
-    if cached is None:
-        cached = row["_keys"] = title_keys(
-            row.get("title"), row.get("album_artist") or row.get("artist_dir"),
-            (row.get("artist"), row.get("album_artist"), row.get("artist_dir")))
-    return cached
-
-
-def album_key(folder_or_album: str | None, artist_hint: str | None = None) -> str:
-    """Normalized album identity from a folder name or an album tag, with the
-    release-year prefixes, scene tags and repeated artist name stripped."""
-    if not folder_or_album:
-        return ""
-    name = folder_or_album
-    if artist_hint:
-        name = re.sub(r"^\s*" + re.escape(artist_hint) + r"\s*[-–—]\s*", " ", name, flags=re.I)
-    for pattern in _DIR_NOISE:
-        name = pattern.sub(" ", name)
-    if artist_hint:  # the year prefix may have been hiding the artist name
-        name = re.sub(r"^\s*" + re.escape(artist_hint) + r"\s*[-–—]\s*", " ", name, flags=re.I)
-    return strict_key(name)
-
-
-# A remaster is the same album; a deluxe or anniversary edition is not.
-_ALBUM_REMASTER = re.compile(
-    r"\s*[\(\[][^\)\]]*\bremaster(?:ed)?\b[^\)\]]*[\)\]]"
-    r"|\s*[-–—:]\s*(?:\d{4}\s+)?(?:digital(?:ly)?\s+)?remaster(?:ed)?\b.*$", re.I)
-
-
-def album_identity(name: str | None, artist_hints=()) -> frozenset[str]:
-    """Keys an album name is known by — two names are the same album when
-    any key is shared.
-
-    One key per artist hint, since a folder may or may not repeat the artist
-    (`(2013) - Ariana Grande - Yours Truly`). YouTube junk (`Full Album`) and
-    remaster tags go first; edition words stay, because `Seventy (Deluxe
-    Edition)` is a different album from `Seventy`."""
-    if not name:
-        return frozenset()
-    base = _ALBUM_REMASTER.sub("", _YOUTUBE_JUNK.sub(" ", name))
-    keys = {album_key(base)} | {album_key(base, h) for h in artist_hints if h}
-    keys.discard("")
-    return frozenset(keys)
-
-
-def row_album_identity(row: dict) -> frozenset[str]:
-    """What album a library file is on: its album tag and, unless it sits
-    loose in the artist folder, the folder it is in. Memoized on the row."""
-    cached = row.get("_albums")
-    if cached is None:
-        path = row.get("path") or ""
-        top = path.split("/", 1)[0]
-        hints = {row.get("artist_dir"), row.get("album_artist"), top}
-        folder = row.get("dirpath") or path.rsplit("/", 1)[0]
-        cached = album_identity(row.get("album"), hints) | album_identity(
-            row.get("norm_album"), hints)
-        if folder and folder != top:   # a loose file's folder is the artist
-            cached |= album_identity(folder.rsplit("/", 1)[-1], hints)
-        row["_albums"] = cached
-    return cached
-
-
-_DISC_DIR = re.compile(r"^(?:cd|disc|disk)\s*\d+\b", re.I)
-
-
-def unit_dir(dirpath: str) -> str:
-    """The album folder a file folder belongs to: a disc subfolder's parent
-    (never an artist folder: `Artist/CD1` stays its own)."""
-    parent, _, leaf = (dirpath or "").rpartition("/")
-    return parent if "/" in parent and _DISC_DIR.match(leaf) else dirpath
-
-
-# Words in a name's brackets or dash suffix that make it another edition of
-# the album. Remasters and reissues are the same album, so they are not here.
-_EDITION_WORDS = re.compile(
-    r"\b(deluxe|expanded|special|complete|anniversary|collector|super|platinum|bonus"
-    r"|international|instrumental|acoustic|remix(?:es)?|uncut|live|japan(?:ese)?"
-    r"|extended|tour|clean|edited|censored|mono|limited)\b", re.I)
-_QUALIFIERS = re.compile(r"[\(\[]([^\)\]]*)[\)\]]|\s[-–—]\s+([^-–—]*)$")
-# "Wild Ones (feat. Sia)": a featured credit names a single, not its album
-_CREDIT = re.compile(r"^\s*(?:feat|ft|featuring)\b", re.I)
-
-
-def edition_words(*names: str | None, hints=()) -> frozenset[str]:
-    """What edition a name says it is: `Album (Deluxe Edition)` and `(2017)
-    Album [Deluxe]` say deluxe, `Album [2011 Remaster]` says nothing. Only
-    qualifiers count, so a title's own words (`Live Through This`, `1988 -
-    Live at Wembley`) never do."""
-    found = set()
-    for name in names:
-        name = _DIR_NOISE[0].sub("", fold(name))
-        for hint in hints:
-            if hint:
-                name = re.sub(r"^\s*" + re.escape(fold(hint)) + r"\s*[-–—]\s*", "", name)
-        for m in _QUALIFIERS.finditer(name):
-            if _CREDIT.match(m.group(1) or ""):
-                found.add("single")
-            for word in _EDITION_WORDS.findall(m.group(1) or m.group(2) or ""):
-                word = word.lower()
-                found.add("remix" if word.startswith("remix")
-                          else "japan" if word.startswith("japan") else word)
-    return frozenset(found)
-
-
-def row_edition(row: dict) -> frozenset[str]:
-    """The edition a file's album is, by its tag and its album folder."""
-    cached = row.get("_edition")
-    if cached is None:
-        folder = unit_dir(row.get("dirpath") or "")
-        leaf = folder.rsplit("/", 1)[-1] if folder and folder != row.get("artist_dir") else ""
-        cached = row["_edition"] = edition_words(
-            row.get("album"), leaf, hints=(row.get("artist_dir"), row.get("album_artist")))
-    return cached
-
-
-def title_looks_like_junk(title: str | None) -> bool:
-    """True for a title tag that is really a YouTube video title."""
-    if not title:
-        return True
-    return bool(_YOUTUBE_JUNK.search(title)) or bool(
-        re.search(r"\b(ft\.?|feat\.?)\b", title, re.I) and " - " in title)
 
 
 # ------------------------------------------------------------------ scanning
@@ -651,75 +452,10 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
 
 
 # ------------------------------------------------------------------ scoring
-def format_quality(row: dict) -> int:
-    fmt = (row.get("format") or "").lower()
-    if fmt in LOSSLESS_FORMATS:
-        score = 1000
-        if (row.get("bit_depth") or 16) > 16:
-            score += 60
-        if (row.get("sample_rate") or 44100) > 48000:
-            score += 30
-        return score
-    return min(row.get("bitrate_kbps") or 0, 400)
-
-
-def tag_quality(row: dict) -> int:
-    score = 0
-    if row.get("album_artist"):
-        score += 40
-    if row.get("album"):
-        score += 40
-    if row.get("track_number"):
-        score += 30
-    if row.get("year"):
-        score += 10
-    if not title_looks_like_junk(row.get("title")):
-        score += 40
-    return score
-
-
 def score_file(row: dict, reference_duration: float | None = None) -> tuple[int, list[str]]:
-    """Rank one copy of a track. Returns (score, human-readable reasons).
-
-    The reasons are the point: the UI has to be able to say *why* it wants to
-    delete the file you spent bandwidth on, or it will not be trusted.
-    """
-    reasons: list[str] = []
-    fmt = (row.get("format") or "?").lower()
-    quality = format_quality(row)
-    if fmt in LOSSLESS_FORMATS:
-        detail = f"lossless {fmt}"
-        if (row.get("bit_depth") or 0) > 16:
-            detail += f" {row['bit_depth']}-bit"
-        if (row.get("sample_rate") or 0) > 48000:
-            detail += f" {row['sample_rate'] // 1000}kHz"
-        reasons.append(detail)
-    elif row.get("bitrate_kbps"):
-        reasons.append(f"{row['bitrate_kbps']} kbps {fmt}")
-    else:
-        reasons.append(fmt)
-
-    score = quality
-    duration = row.get("duration_sec")
-    if reference_duration and duration:
-        delta = duration - reference_duration
-        if delta < -DURATION_TOLERANCE * 2:
-            score -= 900
-            reasons.append(f"{abs(round(delta))}s shorter than the other copies "
-                           "— likely truncated")
-        elif delta > 20:
-            reasons.append(f"{round(delta)}s longer (extended version or trailing silence)")
-
-    tags = tag_quality(row)
-    score += tags
-    missing = [name for name, key in
-               (("album artist", "album_artist"), ("album", "album"),
-                ("track number", "track_number")) if not row.get(key)]
-    if missing:
-        reasons.append("missing " + ", ".join(missing))
-    if title_looks_like_junk(row.get("title")):
-        reasons.append("title is a YouTube video title")
-    return score, reasons
+    """Rank one copy of a track: identity.file_quality, tags counted.
+    Returns (score, human-readable reasons)."""
+    return identity.file_quality(row, reference_duration, tags=True)
 
 
 # ------------------------------------------------------------------ grouping
@@ -880,22 +616,13 @@ class AlbumInstance:
         return index
 
 
-def same_recording(a: dict, b: dict) -> bool:
-    """Whether two same-titled files are one recording by their lengths: an
-    edited vinyl cut, a cover in the artist's folder or another mix runs
-    longer or shorter. A YouTube upload gets slack for its intro."""
-    da, dbn = a.get("duration_sec"), b.get("duration_sec")
-    if not da or not dbn:
-        return True
-    upload = title_looks_like_junk(a.get("title")) or title_looks_like_junk(b.get("title"))
-    return abs(da - dbn) <= (UPLOAD_TOLERANCE if upload else DURATION_TOLERANCE)
-
-
 def match_in(row: dict, index: dict[str, list[dict]]) -> dict | None:
-    """The file in `index` (title key -> files) holding this file's recording."""
+    """The file in `index` (title key -> files) holding this file's
+    recording: the lengths agree, and nothing tells the two apart (another
+    version, two recording IDs, two tracks of one release)."""
     for key in keys_for(row):
         for other in index.get(key, ()):
-            if same_recording(row, other):
+            if identity.same_length(row, other) and identity.same_recording(row, other):
                 return other
     return None
 
@@ -925,10 +652,10 @@ def _album_overlap(a: AlbumInstance, b: AlbumInstance) -> tuple[float, int]:
 
 def _instance_identity(inst: AlbumInstance) -> frozenset[str]:
     """Every name an album folder answers to: its files' album tags and the
-    folder's own name, each through album_identity."""
+    folder's own name, each through album_keys."""
     keys: set[str] = set()
     for f in inst.files:
-        keys |= row_album_identity(f)
+        keys |= row_album_keys(f)
     return frozenset(keys)
 
 
@@ -937,11 +664,11 @@ def _most(values) -> object:
     return counts.most_common(1)[0][0] if counts else None
 
 
-def _instance_kind(inst: AlbumInstance) -> tuple:
-    """Which album a folder is beyond its name: the MusicBrainz release group
-    its files are tagged with (None when untagged), and its edition."""
-    return (_most(f.get("mb_releasegroupid") for f in inst.files),
-            _most(row_edition(f) for f in inst.files) or frozenset())
+def _instance_kind(inst: AlbumInstance, names: frozenset[str]) -> identity.AlbumId:
+    """Which album a folder is: its names, the MusicBrainz release group its
+    files are tagged with (None when untagged), and its edition."""
+    return identity.AlbumId(names, _most(row_edition(f) for f in inst.files) or frozenset(),
+                            _most(f.get("mb_releasegroupid") for f in inst.files))
 
 
 _YEAR_NAME = re.compile(r"^\s*[\(\[]?(?:19|20)\d{2}[\)\]]?\s*[-–—.]?\s+\S")
@@ -968,13 +695,6 @@ def _box_set_members(instances: dict[str, AlbumInstance]) -> set[str]:
         if len({k for k in members.values() if k}) > 1:
             out |= set(members)
     return out
-
-
-def _same_kind(a: tuple, b: tuple) -> bool:
-    """A single named like its album, or a deluxe edition beside the
-    standard one, is another release: the same album needs the same release
-    group (when both are known) and the same edition."""
-    return (not a[0] or not b[0] or a[0] == b[0]) and a[1] == b[1]
 
 
 def find_album_duplicates(rows: list[dict],
@@ -1004,7 +724,7 @@ def find_album_duplicates(rows: list[dict],
             buckets[key].append(inst)
 
     names = {d: _instance_identity(inst) for d, inst in instances.items()}
-    kinds = {d: _instance_kind(inst) for d, inst in instances.items()}
+    kinds = {d: _instance_kind(inst, names[d]) for d, inst in instances.items()}
     union = _Union()
     exact_pairs: set[tuple[str, str]] = set()
     for key, members in buckets.items():
@@ -1021,8 +741,9 @@ def find_album_duplicates(rows: list[dict],
                     continue   # the user has said these two are different albums
                 if not (names[a.dirpath] & names[b.dirpath]):
                     continue   # different albums, whatever they share
-                if not _same_kind(kinds[a.dirpath], kinds[b.dirpath]):
-                    continue   # another release or edition of it
+                if not same_album(kinds[a.dirpath], kinds[b.dirpath]) \
+                        or kinds[a.dirpath].edition != kinds[b.dirpath].edition:
+                    continue   # another release or edition of it, a single named like it
                 overlap, hits = _album_overlap(a, b)
                 if overlap < ALBUM_OVERLAP_THRESHOLD:
                     continue
@@ -1180,7 +901,7 @@ def _file_view(row: dict, keeper_index: dict,
 def _same_album(a: dict, b: dict) -> bool:
     """Two files on the same album — or, with no album to go on, two loose
     copies sitting side by side in one folder."""
-    ia, ib = row_album_identity(a), row_album_identity(b)
+    ia, ib = row_album_keys(a), row_album_keys(b)
     if ia or ib:
         return bool(ia & ib)
     return bool(a.get("dirpath")) and a.get("dirpath") == b.get("dirpath")
@@ -1197,19 +918,6 @@ def _track_scope(a: dict, b: dict) -> bool:
     return (a.get("dirpath") == a.get("artist_dir")) != (b.get("dirpath") == b.get("artist_dir"))
 
 
-def _two_tracks(a: dict, b: dict) -> bool:
-    """Two tracks of one release, however alike their titles: the release
-    lists both (a clean and an explicit take, "ON" and "ON" feat. Sia)."""
-    if a.get("mb_albumid") and a.get("mb_albumid") == b.get("mb_albumid") \
-            and a.get("mb_releasetrackid") and b.get("mb_releasetrackid"):
-        return a["mb_releasetrackid"] != b["mb_releasetrackid"]
-    if unit_dir(a.get("dirpath") or "") == unit_dir(b.get("dirpath") or "") \
-            and a.get("track_number") and b.get("track_number"):
-        return ((a.get("disc_number") or 1, a["track_number"])
-                != (b.get("disc_number") or 1, b["track_number"]))
-    return False
-
-
 def find_track_duplicates(rows: list[dict], covered_dirs: set[str] | None = None,
                           excluded: set[tuple[str, str]] = frozenset()) -> list[dict]:
     """The same track on the same album, more than once: one track in two
@@ -1222,7 +930,6 @@ def find_track_duplicates(rows: list[dict], covered_dirs: set[str] | None = None
     durations agree: `Bob Marley — Keep On Moving` exists at 4:20 and 6:25,
     and those are two different mixes, not a duplicate.
     """
-    from .ownership import version_markers    # ownership builds on this module
     buckets: dict[str, list[dict]] = collections.defaultdict(list)
     for row in rows:
         for key in _artist_buckets(row):
@@ -1245,15 +952,15 @@ def find_track_duplicates(rows: list[dict], covered_dirs: set[str] | None = None
                     da, dbn = a.get("duration_sec"), b.get("duration_sec")
                     if da and dbn and abs(da - dbn) > DURATION_TOLERANCE:
                         continue
-                    if not _track_scope(a, b) or _two_tracks(a, b):
+                    if not _track_scope(a, b):
                         continue
-                    if not _same_album(a, b) or row_edition(a) != row_edition(b):
-                        continue
-                    ga, gb = a.get("mb_releasegroupid"), b.get("mb_releasegroupid")
-                    if ga and gb and ga != gb:
-                        continue   # a single named like its album
+                    if not _same_album(a, b) or row_edition(a) != row_edition(b) \
+                            or same_album(row_album_id(a), row_album_id(b)).same is False:
+                        continue   # another edition, a single named like its album
                     if version_markers(a.get("title")) != version_markers(b.get("title")):
-                        continue   # "Song" and "Song feat. X - Remix"
+                        continue   # "Song" and "Song feat. X - Remix", whatever the tags' IDs
+                    if not identity.same_recording(a, b):
+                        continue   # two tracks of one release, the disc 2 live take, two IDs
                     if pair_key(a["path"], b["path"]) in excluded:
                         continue
                     union.union(a["path"], b["path"])

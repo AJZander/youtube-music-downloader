@@ -10,7 +10,8 @@ from .engine.matcher import normalize
 
 async def find_duplicate_match(provider_track_id: str | None, artist: str | None,
                                title: str | None, album: str | None = None,
-                               duration: float | None = None) -> dict | None:
+                               duration: float | None = None,
+                               kind: str | None = None) -> dict | None:
     """The library's copy of this track on this album, if it is already
     there: the whole ownership lookup, so a skip can say what it matched and
     how (`library_via`, `library_mismatch`).
@@ -18,11 +19,12 @@ async def find_duplicate_match(provider_track_id: str | None, artist: str | None
     Same album only (ownership.LibraryIndex.lookup): the song on a
     compilation or a single is not a reason to skip it on the album being
     downloaded. With no album known — a bare video link — only a file
-    downloaded from the very same video counts."""
+    downloaded from the very same video counts. `kind`: the release's type
+    when the job knows it (a YouTube Music release), else None."""
     primary = (artist or "").split(",")[0].strip()
     index = await ownership.load_index({artist or ""}, [primary], [provider_track_id])
     found = index.lookup(title=title, credit=artist, album=album,
-                         video_id=provider_track_id, length=duration)
+                         video_id=provider_track_id, length=duration, kind=kind)
     return found if found["library"] == "have" else None
 
 

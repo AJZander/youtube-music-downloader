@@ -361,9 +361,12 @@ class Worker:
 
             # -------- pre-download dedup
             if not force_guards:
+                # a YouTube Music release's type: its album isn't its single
+                kind = await catalog.release_type(job["source_url"])
                 dup = await find_duplicate_match(track["provider_track_id"],
                                                  track["artist"], track["title"],
-                                                 track["album"], track["expected_duration_sec"])
+                                                 track["album"], track["expected_duration_sec"],
+                                                 kind=kind)
                 if dup:
                     # The reason replaces whatever an earlier attempt left.
                     await self._update_track(

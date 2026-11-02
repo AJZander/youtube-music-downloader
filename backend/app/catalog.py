@@ -517,7 +517,7 @@ def _annotate_album(album: dict, index: ownership.LibraryIndex,
     tracks = [{**t, **index.lookup(
         title=t.get("title"), credit=track_artist(t, album_artist),
         album=album.get("title"), video_id=t.get("video_id"),
-        length=t.get("duration_sec"), live_album=category == "live")}
+        length=t.get("duration_sec"), live_album=category == "live", kind=category)}
         for t in album.get("tracks") or []]
     owned = [t for t in tracks if t["library"] == "have"]
     folders = collections.Counter(t["library_folder"] for t in owned)
@@ -666,6 +666,18 @@ async def album(browse_id: str, *, priority: str = INTERACTIVE,
     await index_tracks([view])
     _failed.pop(browse_id, None)
     return view
+
+
+async def release_type(source_url: str | None) -> str | None:
+    """The type of the YouTube Music release a job's link names ("album",
+    "single", "ep"), from the tracklist the job was expanded from. None when
+    nothing says: any other link (a Spotify one, a video), or a release whose
+    tracklist is no longer cached (an old job re-queued)."""
+    m = _ALBUM_RE.search(source_url or "")
+    if not m:
+        return None
+    cached = await _cache_get(f"album:{m.group(1)}", ALBUM_TTL)
+    return (cached or {}).get("type") or None
 
 
 # ------------------------------------------------------------------ track index

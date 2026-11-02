@@ -15,7 +15,7 @@ from .db import db, utcnow
 from .engine import spotify, ytdlp_engine
 from .engine.governor import governor
 from .engine.router import UnsupportedURL, route
-from . import catalog, discover, library, ordering
+from . import catalog, discover, identity, library, ordering
 from .events import bus, sse_format
 from .importer import library_online
 from .models import (ACTIVE_JOB_STATUSES, JobStatus, TrackStatus, row_to_job,
@@ -306,9 +306,10 @@ def _different_album(row, ctx: dict | None = None) -> str | None:
                      release group: a sibling edition has the track
       release group  the match is on another release group (a single, a
                      compilation, another album)
-      album          by name: the year stripped, edition words kept, so
-                     `(2019) Rare Ass Shit` is `Rare Ass Shit` and `Seventy
-                     (Deluxe Edition)` is not `Seventy`
+      album          by name (identity.same_album): the year stripped,
+                     edition words and `[Single]` kept, so `(2019) Rare Ass
+                     Shit` is `Rare Ass Shit` and `Seventy (Deluxe Edition)`
+                     is not `Seventy`
 
     A Download missing whose match is in the album's own folder (its disc
     subfolders counted in, in any case) is the same album, whatever YouTube
@@ -334,12 +335,18 @@ def _different_album(row, ctx: dict | None = None) -> str | None:
                 else groups.get(folder.casefold(), set()))
         if wanted and held:
             return "edition" if wanted & held else "release group"
-    wanted, held = library.album_identity(row["album"]), library.row_album_identity(file)
+    held = identity.row_album_id(file)
     if not indexed:
-        hints = {file["artist_dir"]}
-        held = held.union(*(library.album_identity(tag, hints)
-                            for tag in (ctx.get("tags") or {}).get(folder.casefold(), ())))
-    return "album" if wanted and held and not wanted & held else None
+        hints = (file["artist_dir"],)
+        tags = sorted((ctx.get("tags") or {}).get(folder.casefold(), ()))
+        named = [identity.album_id(tag, hints) for tag in tags]
+        held = identity.AlbumId(held.keys.union(*(a.keys for a in named)),
+                                held.edition.union(*(a.edition for a in named)),
+                                types=held.types.union(*(a.types for a in named)),
+                                names=held.names.union(*(a.names for a in named)))
+    # by name, in any edition, as the gate judges it
+    verdict = identity.same_album(identity.album_id(row["album"]), held, "release_group")
+    return "album" if verdict.same is False else None
 
 
 @router.get("/tracks/skipped")

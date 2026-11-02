@@ -18,17 +18,18 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 
+from .. import identity
 from ..config import settings
 from ..engine.matcher import normalize
-from ..library import album_identity, strict_key, title_looks_like_junk
-from ..ownership import album_markers, library_keys, title_keys, version_markers
+from ..identity import (DURATION_TOLERANCE as TRACK_TOLERANCE, UPLOAD_TOLERANCE,  # noqa: F401
+                        album_identity, album_markers, library_keys, split_credit, strict_key,
+                        title_looks_like_junk, version_markers)
+from ..identity import release_title_keys as title_keys
 from . import musicbrainz as mb
 from .units import folder_of
 
 log = logging.getLogger("mdl.resolver")
 
-UPLOAD_TOLERANCE = 30.0
-TRACK_TOLERANCE = 5.0
 MAX_FETCH = 5
 # Releases scoring within this of each other are told apart by _preference.
 TIE = 0.01
@@ -51,8 +52,6 @@ class Resolution:
 # ------------------------------------------------------------------ search terms
 _FEAT = re.compile(r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s[^\)\]]*[\)\]]"
                    r"|\s+(?:feat\.?|ft\.?|featuring)\s.*$", re.I)
-_SPLIT_CREDIT = re.compile(r"\s*(?:,|;|&|\+|/|\bx\b|\band\b|\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*",
-                           re.I)
 
 
 def clean_title(name: str) -> str:
@@ -70,8 +69,8 @@ def clean_title(name: str) -> str:
 def primary_artist(credit: str | None) -> str | None:
     if not credit:
         return None
-    first = _SPLIT_CREDIT.split(credit, maxsplit=1)[0].strip()
-    return first or credit
+    named = split_credit(credit)
+    return named[0] if named else credit
 
 
 def search_terms(rows: list[dict]) -> tuple[str, str | None]:
@@ -97,14 +96,16 @@ def _track_side(track: dict) -> dict:
 
 
 def _with_context(rel: dict, tracks: list[dict]) -> list[dict]:
-    """What a track is without saying so: MusicBrainz titles a live album's
-    songs plainly, so "Song (Live)" from a live album, or from its "Live at
-    the Crocodile Cafe" disc, is still that track."""
-    group = rel.get("release-group") or {}
-    live = "Live" in (group.get("secondary-types") or [])
-    whole = album_markers(rel.get("title"), live=live)
+    """What a track is without saying so (identity.release_context):
+    MusicBrainz titles a live album's songs plainly, so "Song (Live)" from a
+    live album, or from its "Live at the Crocodile Cafe" disc, is still that
+    track. A Remix type is not taken: a folder of the original mixes would
+    then fit its remix EP as well, and resolution feeds auto-apply."""
+    types = [t for t in (rel.get("release-group") or {}).get("secondary-types") or []
+             if t == "Live"]
     for track in tracks:
-        track["_context"] = whole | album_markers(track.get("medium_title"))
+        track["_context"] = identity.release_context(rel.get("title"), types,
+                                                     track.get("medium_title"))
     return tracks
 
 
@@ -120,42 +121,23 @@ def _file_keys(row: dict) -> set[str]:
 
 
 def match_tracks(rows: list[dict], tracks: list[dict]) -> dict[str, dict]:
-    """path -> release track, one file per track, best evidence first."""
-    pairs = []
-    for i, row in enumerate(rows):
-        keys = _file_keys(row)
-        marks = version_markers(row.get("title"))
-        duration = row.get("duration_sec")
-        tolerance = UPLOAD_TOLERANCE if title_looks_like_junk(row.get("title")) else TRACK_TOLERANCE
-        number = row.get("track_number")
-        disc = row.get("disc_number") or 1
-        for j, track in enumerate(tracks):
-            _track_side(track)
-            gap = (abs(duration - track["length"])
-                   if duration and track.get("length") else None)
-            same_number = number is not None and number == track["number"] and disc == track["disc"]
-            # the file's version (live, remix…) is the track's, or the release's
-            allowed = track["_marks"] | track.get("_context", frozenset())
-            if keys & track["_keys"] and track["_marks"] <= marks <= allowed and (
-                    gap is None or gap <= tolerance):
-                quality = 3.0 + (1.0 if same_number else 0.0) - (gap or 0) / 10
-            elif same_number and marks <= allowed and gap is not None and gap <= 2.5:
-                # mistitled, but in its place and its length; a title that
-                # says "Remix" is not a mistitled original
-                quality = 1.5 - gap / 10
-            else:
-                continue
-            pairs.append((quality, i, j))
-    pairs.sort(reverse=True)
-    used_rows, used_tracks = set(), set()
-    out: dict[str, dict] = {}
-    for _quality, i, j in pairs:
-        if i in used_rows or j in used_tracks:
-            continue
-        used_rows.add(i)
-        used_tracks.add(j)
-        out[rows[i]["path"]] = tracks[j]
-    return out
+    """path -> release track, one file per track, best evidence first
+    (identity.assign: the same title and length, or mistitled but in its
+    place, or a near-identical title; the file's version is the track's, or
+    the release's)."""
+    held = [identity.side(row.get("title"), row.get("duration_sec"),
+                          number=row.get("track_number"), disc=row.get("disc_number") or 1,
+                          keys=_file_keys(row),
+                          upload=title_looks_like_junk(row.get("title")))
+            for row in rows]
+    wanted = []
+    for track in tracks:
+        _track_side(track)
+        wanted.append(identity.side(track["title"], track.get("length"), number=track["number"],
+                                    disc=track["disc"], keys=track["_keys"],
+                                    marks=track["_marks"],
+                                    context=track.get("_context", frozenset())))
+    return {rows[i]["path"]: tracks[j] for j, i in identity.assign(wanted, held)}
 
 
 def _title_similarity(rows: list[dict], release_title: str, hints: set[str]) -> float:

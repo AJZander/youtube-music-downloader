@@ -431,8 +431,7 @@ def foreign_files(info: dict | None, key: str | None) -> list[dict]:
     album folder, and the split key its album tag gives it there."""
     if key is None:
         return []
-    from ..library import unit_dir
-    from .units import split_key
+    from ..identity import split_key, unit_dir
     folder, _, split = key.partition("|")
     out: list[dict] = []
     for other in (info or {}).get("others") or []:
@@ -459,10 +458,11 @@ def album_share(info: dict | None, rows: list[dict], releasegroup: str | None = 
                if t.get("parent_key") == album.get("rating_key")) or len(rows)
     if not others:
         return {"ours": mine, "foreign": 0, "owner_tagged": False}
-    from ..library import album_key
+    from ..identity import album_id, album_key, same_album
     groups = ({releasegroup} if releasegroup
               else {r.get("mb_releasegroupid") for r in rows if r.get("mb_releasegroupid")})
-    names = {album_key(r.get("album")) for r in rows if r.get("album")}
+    # by album tag: one album, in any edition (a [Single] is not its album)
+    names = [album_id(t) for t in sorted({r.get("album") for r in rows if r.get("album")})]
     foreign: Counter = Counter()
     same = 0
     for other in others:
@@ -471,7 +471,8 @@ def album_share(info: dict | None, rows: list[dict], releasegroup: str | None = 
             if rg in groups:
                 same += 1
                 continue
-        elif other.get("album") and album_key(other["album"]) in names:
+        elif other.get("album") and any(
+                same_album(album_id(other["album"]), mine_, "release_group") for mine_ in names):
             same += 1
             continue
         foreign[f"rg:{rg}" if rg else f"name:{album_key(other.get('album') or '')}"] += 1

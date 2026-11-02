@@ -20,6 +20,7 @@ from pathlib import Path
 from ..config import settings
 from ..db import db, utcnow
 from ..engine import tagio
+from ..identity import matched_recordings, plain_recordings  # noqa: F401
 from ..library import strict_key
 from ..plex import is_matched
 from . import musicbrainz as mb
@@ -880,31 +881,6 @@ async def plan_artist(artist_dir: str, desired: dict | None, plex_artist: dict |
     if not plex_artist.get("thumb") and thumb_url:
         add("artist_poster", "Plex has no image for this artist",
             {"rating_key": rk, "url": thumb_url}, auto=True)
-    return out
-
-
-def plain_recordings(rel: dict | None) -> set[str]:
-    """The recordings of a release that MusicBrainz knows in one version
-    only. One it tells apart from others ("original mono studio mix", "2017
-    stereo mix", "live") may be any of them in our files: when the release
-    was picked among pressings the files can't tell apart (mono or stereo,
-    the same tracklist), the recording is a guess, and no guess is a reason
-    to call two files one."""
-    out = set()
-    for medium in (rel or {}).get("media") or []:
-        for t in medium.get("tracks") or []:
-            rec = t.get("recording") or {}
-            if rec.get("id") and not (rec.get("disambiguation") or "").strip():
-                out.add(rec["id"])
-    return out
-
-
-def matched_recordings(desired: dict) -> dict[str, list[str]]:
-    """recording MBID -> the files of an identified album holding it."""
-    out: dict[str, list[str]] = {}
-    for path, t in (desired.get("tracks") or {}).items():
-        if t.get("matched") and t.get("recording_mbid"):
-            out.setdefault(t["recording_mbid"], []).append(path)
     return out
 
 

@@ -585,12 +585,8 @@ async def _tidy_folders(folders, target_dir: str, batch: str, ctx: Ctx) -> None:
 def _audio_quality(row: dict, reference: float | None) -> int:
     """How good a copy is as audio: lossless over lossy, bitrate, and a cut-off
     copy last. Tags don't count: the copy kept gets the album's tags anyway."""
-    from .. import library
-    score = library.format_quality(row)
-    duration = row.get("duration_sec")
-    if reference and duration and duration < reference - 2 * library.DURATION_TOLERANCE:
-        score -= 900
-    return score
+    from .. import identity
+    return identity.file_quality(row, reference, tags=False)[0]
 
 
 async def merge_plan(ctx: Ctx) -> dict:
@@ -598,7 +594,7 @@ async def merge_plan(ctx: Ctx) -> dict:
     doing it: {"moves", "trash", "kept_there", "left"} — files moved in, worse
     copies trashed, the destination's copies kept, and files left where they
     are (nothing to pair them with safely). None of it touches a file."""
-    from .. import library
+    from .. import identity, library
     from .issues import conflict_of, other_album, planned_moves
     from .units import in_box_set
     if ctx.desired is None:
@@ -654,7 +650,7 @@ async def merge_plan(ctx: Ctx) -> dict:
         other = None
         if matched(row):
             other = by_track.get(want.get("releasetrack_mbid") or "")
-            if other is not None and not library.same_recording(row, other):
+            if other is not None and not identity.same_length(row, other):
                 plan["left"].append(row["path"])    # one track, two lengths: not proven a copy
                 continue
             other = other or library.match_in(row, index)
@@ -731,7 +727,7 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
     recording the best file stays (ties keep this album's own). Each move
     carries the track of this release the file becomes, its index row, and
     the file it replaces here (if any)."""
-    from .. import library
+    from .. import identity
     from . import musicbrainz as mb
     from .issues import matched_recordings, plain_recordings
     from .units import in_box_set, load_unit
@@ -774,7 +770,7 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
                 plan["left"].append(row["path"])    # not this album's recording: stays
                 continue
             there = held.get(rec)
-            if there is not None and not library.same_recording(row, there):
+            if there is not None and not identity.same_length(row, there):
                 plan["left"].append(row["path"])    # lengths disagree: not proven one
                 continue
             track = on_release[rec]
