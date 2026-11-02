@@ -108,9 +108,12 @@ export default function SkippedList({ onChanged }) {
             <Typography variant="body1" sx={{ flexGrow: 1 }}>
               {[t.artist, t.title].filter(Boolean).join(' — ') || t.source_url}
             </Typography>
-            {t.different_album && (
+            {t.different_album && (t.different_reason === 'edition' ? (
+              <Chip size="small" color="info" label="other edition"
+                title="Another edition of this album, in another folder, has the track" />
+            ) : (
               <Chip size="small" color="warning" label="different album" />
-            )}
+            ))}
           </Box>
           <Typography variant="caption" color="text.secondary" display="block">
             Wanted from: {t.album || '(no album)'}
