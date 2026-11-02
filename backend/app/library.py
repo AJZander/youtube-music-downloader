@@ -432,6 +432,7 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
                 state.error = (f"pruning skipped: only {len(found)} of {len(known)} "
                                "indexed files were visible")
                 gone = []
+            await _follow_renamed(gone, [p for p in found if p not in known])
             for start in range(0, len(gone), 500):
                 batch = gone[start:start + 500]
                 await db.execute(
@@ -449,6 +450,46 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
             state.phase = "idle"
             state.finished_at = utcnow()
         return state.snapshot()
+
+
+# What a file's index row says about its content: the same on both sides of
+# a rename or a move, and next to never the same for two different files.
+_SAME_FILE = ("filesize_bytes", "duration_sec", "format", "title", "artist", "album",
+              "album_artist", "track_number", "disc_number", "mb_trackid")
+
+
+async def _follow_renamed(gone: list[str], added: list[str]) -> int:
+    """Files that left one path and turned up, unchanged, at another in the
+    same scan (a folder renamed or moved outside the app, which the walk
+    sees as a delete and an add) carry the unit they were last seen in, so
+    the album's identity and decisions follow them (units.sync_registry).
+    Only a file with exactly one match on each side is taken for the same
+    one: files that can't be told apart start afresh. Returns how many."""
+    if not gone or not added:
+        return 0
+    columns = ", ".join(_SAME_FILE)
+
+    async def by_content(paths: list[str]) -> dict[tuple, dict]:
+        seen: dict[tuple, list[dict]] = collections.defaultdict(list)
+        for start in range(0, len(paths), 500):
+            batch = paths[start:start + 500]
+            for r in await db.fetchall(
+                    f"SELECT path, unit_id, {columns} FROM library_index "
+                    f"WHERE path IN ({','.join('?' * len(batch))})", tuple(batch)):
+                if r["filesize_bytes"] and r["duration_sec"]:
+                    seen[tuple(r[c] for c in _SAME_FILE)].append(dict(r))
+        return {k: v[0] for k, v in seen.items() if len(v) == 1}
+
+    before = {k: r for k, r in (await by_content(gone)).items() if r["unit_id"]}
+    if not before:
+        return 0
+    after = await by_content(added)
+    pairs = [(before[k]["unit_id"], after[k]["path"]) for k in before.keys() & after.keys()
+             if not after[k]["unit_id"]]
+    if pairs:
+        await db.executemany("UPDATE library_index SET unit_id = ? WHERE path = ?", pairs)
+        log.info("library scan: %d files found at new paths keep their album", len(pairs))
+    return len(pairs)
 
 
 # ------------------------------------------------------------------ scoring
@@ -1332,6 +1373,8 @@ async def merge_artist_folders(sources: list[str], target: str,
 
     moved, merged_into, retagged, failures = [], [], 0, []
     leftovers: list[str] = []
+    # the album artist the target's own files carry, before the moved ones count
+    name = await _album_artist_of(target) if rewrite_tags else None
     for source in sources:
         if source == target:
             continue
@@ -1339,6 +1382,7 @@ async def merge_artist_folders(sources: list[str], target: str,
         if not source_dir.is_dir():
             failures.append({"path": source, "error": "not a folder"})
             continue
+        files, folders = [], []         # (old, new) of what moved
         for child in sorted(source_dir.iterdir()):
             destination = target_dir / child.name
             try:
@@ -1352,6 +1396,7 @@ async def merge_artist_folders(sources: list[str], target: str,
                             continue   # a copy is already there; deal with it below
                         await loop.run_in_executor(None, _relocate, inner, final)
                         moved.append(str(final.relative_to(settings.library_dir)))
+                        files.append((str(inner.relative_to(settings.library_dir)), moved[-1]))
                     merged_into.append(child.name)
                     # Whatever could not move is a file the target already has.
                     # It still goes through the trash — this module does not
@@ -1368,14 +1413,24 @@ async def merge_artist_folders(sources: list[str], target: str,
                 else:
                     await loop.run_in_executor(None, os.replace, child, destination)
                     moved.append(str(destination.relative_to(settings.library_dir)))
+                    (folders if destination.is_dir() else files).append(
+                        (str(child.relative_to(settings.library_dir)), moved[-1]))
             except OSError as exc:
                 failures.append({"path": child.name, "error": str(exc)[:200]})
-        await db.execute("DELETE FROM library_index WHERE artist_dir = ?", (source,))
+        # The moved files' index rows follow them, with what they carry (the
+        # album they were seen in, their video id), rather than being read
+        # again as new files by the next scan.
+        await _follow_index(files, folders)
 
     trashed = {}
     if leftovers:
         trashed = await trash_paths(
             leftovers, f"already present in {target} after an artist merge")
+        if trashed.get("trashed"):
+            for folder in leftovers:
+                if not _safe_abs(folder).exists():
+                    await db.execute("DELETE FROM library_index WHERE path >= ? AND path < ?",
+                                     (folder + "/", folder + "0"))
 
     # Only now can the source folders go, and only if they really are empty.
     for source in sources:
@@ -1389,7 +1444,7 @@ async def merge_artist_folders(sources: list[str], target: str,
                                  "error": f"folder not empty, left in place ({exc})"})
 
     if rewrite_tags:
-        retagged = await _retag_album_artist(target, sources)
+        retagged = await _retag_album_artist(target, sources, name)
     await _refresh_plex({target})
     log.info("merged %s into %s: %d items moved, %d retagged",
              sources, target, len(moved), retagged)
@@ -1398,7 +1453,35 @@ async def merge_artist_folders(sources: list[str], target: str,
             "failures": failures, "rescan_needed": True}
 
 
-async def _retag_album_artist(target: str, old_names: list[str]) -> int:
+async def _follow_index(files: list[tuple[str, str]], folders: list[tuple[str, str]]) -> None:
+    """Point the index rows of moved files and folders (relative paths,
+    old -> new) at where they are now. A row already at a new path is for a
+    file that wasn't there (the move found the name free): it gives way."""
+    def parent(path: str) -> tuple[str, str]:
+        parts = Path(path).parts
+        return (str(Path(path).parent), parts[0]) if len(parts) > 1 else ("", "")
+
+    if files:
+        await db.executemany("UPDATE OR REPLACE library_index SET path = ?, dirpath = ?, "
+                             "artist_dir = ? WHERE path = ?",
+                             [(new, *parent(new), old) for old, new in files])
+    if folders:
+        # everything under the folder ("/" sorts just before "0")
+        await db.executemany(
+            "UPDATE OR REPLACE library_index SET path = ? || substr(path, ?), "
+            "dirpath = ? || substr(dirpath, ?), artist_dir = ? WHERE path >= ? AND path < ?",
+            [(new, len(old) + 1, new, len(old) + 1, Path(new).parts[0], old + "/", old + "0")
+             for old, new in folders])
+
+
+async def _album_artist_of(artist_dir: str) -> str:
+    row = await db.fetchone(
+        "SELECT album_artist FROM library_index WHERE artist_dir = ? AND album_artist != '' "
+        "GROUP BY album_artist ORDER BY COUNT(*) DESC LIMIT 1", (artist_dir,))
+    return row["album_artist"] if row else artist_dir
+
+
+async def _retag_album_artist(target: str, old_names: list[str], name: str | None = None) -> int:
     """Set albumartist to the target's own name across the merged folder.
 
     That name is the album artist the target's files already carry, not the
@@ -1408,10 +1491,7 @@ async def _retag_album_artist(target: str, old_names: list[str]) -> int:
     import mutagen
 
     loop = asyncio.get_running_loop()
-    row = await db.fetchone(
-        "SELECT album_artist FROM library_index WHERE artist_dir = ? AND album_artist != '' "
-        "GROUP BY album_artist ORDER BY COUNT(*) DESC LIMIT 1", (target,))
-    name = row["album_artist"] if row else target
+    name = name or await _album_artist_of(target)
     old_keys = {strict_key(n) for n in old_names}
     target_dir = _safe_abs(target)
 

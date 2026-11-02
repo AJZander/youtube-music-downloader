@@ -157,10 +157,11 @@ class PlexAlbumTestCase(DbTestCase):
             yield
 
     async def wants(self, key, **fields):
+        unit = await units.unit_id_of(key)      # an album's overrides follow its unit
         for field, value in fields.items():
             await self.db.execute(
                 "INSERT INTO md_overrides (entity, ref, field, value, created_at) "
-                "VALUES ('album', ?, ?, ?, ?)", (key, field, json.dumps(value), stamp(0)))
+                "VALUES ('album', ?, ?, ?, ?)", (unit, field, json.dumps(value), stamp(0)))
 
     async def open_issues(self, key) -> dict[str, dict]:
         return {i["kind"]: i for i in (issues.issue_out(r) for r in await self.db.fetchall(

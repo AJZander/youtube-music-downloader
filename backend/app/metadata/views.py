@@ -156,7 +156,24 @@ async def issues_for(*, artist_dir: str | None = None, album_keys: list[str] | N
         f"SELECT DISTINCT i.* FROM md_issues i {joins} WHERE {sql_where} "
         "ORDER BY CASE i.severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, "
         "i.updated_at DESC LIMIT ? OFFSET ?", (*params, limit, offset))
-    return total["n"], [issues_mod.issue_out(r) for r in rows]
+    items = [issues_mod.issue_out(r) for r in rows]
+    # the album each is about, by the id its page is opened with
+    ids = await _unit_ids([i["album_key"] for i in items if i.get("album_key")])
+    for item in items:
+        item["unit_id"] = ids.get(item.get("album_key"))
+    return total["n"], items
+
+
+async def _unit_ids(keys: list[str]) -> dict[str, str]:
+    keys = list(dict.fromkeys(keys))
+    out: dict[str, str] = {}
+    for i in range(0, len(keys), 400):
+        chunk = keys[i:i + 400]
+        for r in await db.fetchall(
+                f"SELECT key, unit_id FROM md_albums WHERE key IN ({','.join('?' * len(chunk))})",
+                tuple(chunk)):
+            out[r["key"]] = r["unit_id"]
+    return out
 
 
 async def attention(artist_dir: str | None = None) -> dict:
@@ -278,10 +295,11 @@ async def _album_summary(key: str, rows: list[dict], record: dict | None,
     target = None
     if want and want.get("folder") and want["folder"] != folder:
         target = want["folder"]
+    unit_id = (record or {}).get("unit_id")
     return {
-        **summary, "key": key,
+        **summary, "key": key, "unit_id": unit_id,
         "album": summary["album"] if "|" not in key or summary["album"] else key.split("|", 1)[1],
-        "art_url": _art_url(key=key),
+        "art_url": _art_url(key=unit_id or key),
         "status": (record or {}).get("status") or "pending",
         "ignored": bool((record or {}).get("ignored")),
         "no_release": bool((record or {}).get("no_release")),
@@ -347,6 +365,12 @@ async def _issue_album_targets(issue: dict) -> list[str]:
     d = issue.get("detail") or {}
     targets += d.get("dirpaths") or []
     targets += d.get("units") or []
+    for uid in d.get("unit_ids") or []:
+        # the albums it names, where they are now
+        found = await units.resolve(uid)
+        key = (found or {}).get("key") or ((found or {}).get("redirect") or {}).get("key")
+        if key:
+            targets.append(key)
     if issue["kind"] == "dup_track":
         targets += sorted({p.rsplit("/", 1)[0] for p in d.get("paths") or []})
     return list(dict.fromkeys(targets))
@@ -367,6 +391,12 @@ def _norm(value) -> list[str]:
 
 
 async def album(key: str) -> dict | None:
+    """One album, named by its unit id or its key (an old link's). One
+    merged into another answers {"redirect": that one}."""
+    found = await units.resolve(key)
+    if found and found.get("redirect"):
+        return {"redirect": found["redirect"]}
+    key = found["key"] if found else key
     rows = await units.load_unit(key)
     if not rows:
         return None
@@ -379,7 +409,7 @@ async def album(key: str) -> dict | None:
     _, album_issues = await issues_for(album_keys=list(dict.fromkeys([key, folder])), limit=500)
     summary = await _album_summary(key, rows, record, album_issues)
     from .desired import overrides_for
-    overrides = await overrides_for("album", key)
+    overrides = await overrides_for("album", record["unit_id"]) if record else {}
 
     file_genres = sorted({g for r in rows for g in (r.get("genre") or "").split("; ") if g})
     plex_title_artist = None

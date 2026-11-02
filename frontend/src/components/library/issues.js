@@ -148,7 +148,21 @@ export function when(value) {
   return Number.isNaN(d.getTime()) ? value : d.toLocaleString()
 }
 
-/** #/library/<artist>/<album key> — both parts URL-encoded. */
+/**
+ * An album's reference in URLs, selections and API calls: its unit id, which
+ * stays the same when it moves (its key is its folder). A key still works,
+ * as old links have it.
+ */
+export function albumRef(album) {
+  return album ? (album.unit_id || album.key) : null
+}
+
+/** Whether `album` is the one `ref` (a unit id, or a key) names. */
+export function isAlbum(album, ref) {
+  return !!album && !!ref && (album.unit_id === ref || album.key === ref)
+}
+
+/** #/library/<artist>/<album unit id> — both parts URL-encoded. */
 export function parseHash(hash = window.location.hash) {
   const m = /^#\/library(?:\/([^/]*))?(?:\/([^/]*))?/.exec(hash || '')
   if (!m) return null

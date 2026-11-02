@@ -145,6 +145,18 @@ async def artist(artist_dir: str):
     return out
 
 
+async def _album_key(ref: str) -> str:
+    """The key of the album `ref` names (its unit id, or a key as old links
+    have it). Nothing is done to an album merged into another on a link to
+    the one it was: its page follows the redirect instead."""
+    found = await units.resolve(ref)
+    if found is None:
+        return ref
+    if found.get("redirect"):
+        raise HTTPException(409, f"this album was merged into {found['redirect']['key']}")
+    return found["key"]
+
+
 @router.get("/album")
 async def album(key: str):
     out = await views.album(key)
@@ -155,8 +167,9 @@ async def album(key: str):
 
 @router.post("/album/recheck")
 async def album_recheck(body: KeyIn):
-    await runner.check_unit(body.key)
-    out = await views.album(body.key)
+    key = await _album_key(body.key)
+    await runner.check_unit(key)
+    out = await views.album(key)
     if out is None:
         raise HTTPException(404, "the album is gone")
     return out
@@ -166,33 +179,36 @@ async def album_recheck(body: KeyIn):
 async def album_match(body: MatchIn):
     if not mb.enabled():
         raise HTTPException(409, "MusicBrainz lookups are off (set MUSICBRAINZ_CONTACT)")
+    key = await _album_key(body.key)
     await db.execute("UPDATE md_albums SET manual = 1, release_mbid = ? WHERE key = ?",
-                     (body.release_mbid, body.key))
-    await runner.check_unit(body.key, manual_release=body.release_mbid)
-    return await views.album(body.key)
+                     (body.release_mbid, key))
+    await runner.check_unit(key, manual_release=body.release_mbid)
+    return await views.album(key)
 
 
 @router.post("/album/no-release")
 async def album_no_release(body: NoReleaseIn):
     """"MusicBrainz has no release for this" (or, undone, look it up again)."""
+    key = await _album_key(body.key)
     await db.execute("UPDATE md_albums SET no_release = ?, manual = CASE WHEN ? THEN 0 "
                      "ELSE manual END, next_check = 0 WHERE key = ?",
-                     (int(body.no_release), int(body.no_release), body.key))
-    await runner.check_unit(body.key)
-    return await views.album(body.key)
+                     (int(body.no_release), int(body.no_release), key))
+    await runner.check_unit(key)
+    return await views.album(key)
 
 
 @router.post("/album/ignore")
 async def album_ignore(body: IgnoreIn):
+    key = await _album_key(body.key)
     await db.execute("UPDATE md_albums SET ignored = ?, next_check = 0 WHERE key = ?",
-                     (int(body.ignored), body.key))
-    await runner.check_unit(body.key)
-    return await views.album(body.key)
+                     (int(body.ignored), key))
+    await runner.check_unit(key)
+    return await views.album(key)
 
 
 @router.get("/album/candidates")
 async def album_candidates(key: str, q: str | None = None):
-    rows = await units.load_unit(key)
+    rows = await units.load_unit(await _album_key(key))
     if not rows:
         raise HTTPException(404, "no such album")
     if not mb.enabled():
@@ -207,8 +223,9 @@ async def album_candidates(key: str, q: str | None = None):
 async def album_download_missing(body: DownloadIn):
     """Queue the album's missing tracks (found on YouTube Music) as one job."""
     from . import missing
+    key = await _album_key(body.key)
     record = await db.fetchone("SELECT release_mbid, status FROM md_albums WHERE key = ?",
-                               (body.key,))
+                               (key,))
     if not record or record["status"] != "resolved" or not record["release_mbid"]:
         raise HTTPException(409, "the album isn't identified yet")
     try:
@@ -216,12 +233,12 @@ async def album_download_missing(body: DownloadIn):
     except RuntimeError as exc:
         raise HTTPException(404, str(exc))
     await runner.publish_issues()
-    return {**result, "album": await views.album(body.key)}
+    return {**result, "album": await views.album(key)}
 
 
 @router.get("/album/seed")
 async def album_seed(key: str):
-    rows = await units.load_unit(key)
+    rows = await units.load_unit(await _album_key(key))
     if not rows:
         raise HTTPException(404, "no such album")
     return seed.seed_fields(rows)
@@ -362,19 +379,34 @@ async def revert_batch(batch_id: str):
     rows = await db.fetchall("SELECT DISTINCT album_key, artist_dir FROM md_changes "
                              "WHERE batch_id = ?", (batch_id,))
     result = await revert(batch_id)
+    unit_ids = []
     for r in rows:
         if r["album_key"]:
             try:
                 await runner.check_unit(r["album_key"])
             except Exception:
                 log.info("re-check after undo failed for %s", r["album_key"])
+            unit_ids.append(await units.unit_id_of(r["album_key"]))
     from ..events import bus
     bus.publish("library.changed", {"album_keys": [r["album_key"] for r in rows if r["album_key"]],
+                                    "unit_ids": [u for u in unit_ids if u],
                                     "artist_dirs": [r["artist_dir"] for r in rows if r["artist_dir"]]})
     return result
 
 
 # ------------------------------------------------------------------ overrides
+async def _override_ref(entity: str, ref: str) -> tuple[str, str]:
+    """(what an override is stored under, the album key or artist folder to
+    check again). An album's is its unit id, so it follows the album."""
+    if entity != "album":
+        return ref, ref
+    key = await _album_key(ref)
+    uid = await units.unit_id_of(key)
+    if uid is None:
+        raise HTTPException(404, f"no album {ref!r}")
+    return uid, key
+
+
 async def _override_target(entity: str, ref: str):
     if entity == "album":
         await runner.check_unit(ref)
@@ -387,6 +419,7 @@ async def _override_target(entity: str, ref: str):
 async def put_override(body: OverrideIn):
     if body.field not in OVERRIDE_FIELDS.get(body.entity, set()):
         raise HTTPException(422, f"{body.entity} field {body.field!r} can't be pinned")
+    ref, target = await _override_ref(body.entity, body.ref)
     value = body.value
     if body.field in ("genres", "moods"):
         if not isinstance(value, list):
@@ -397,15 +430,16 @@ async def put_override(body: OverrideIn):
     await db.execute(
         "INSERT INTO md_overrides (entity, ref, field, value, created_at) VALUES (?,?,?,?,?) "
         "ON CONFLICT(entity, ref, field) DO UPDATE SET value = excluded.value",
-        (body.entity, body.ref, body.field, json.dumps(value), utcnow()))
-    return await _override_target(body.entity, body.ref)
+        (body.entity, ref, body.field, json.dumps(value), utcnow()))
+    return await _override_target(body.entity, target)
 
 
 @router.delete("/overrides")
 async def delete_override(body: OverrideIn):
+    ref, target = await _override_ref(body.entity, body.ref)
     await db.execute("DELETE FROM md_overrides WHERE entity = ? AND ref = ? AND field = ?",
-                     (body.entity, body.ref, body.field))
-    return await _override_target(body.entity, body.ref)
+                     (body.entity, ref, body.field))
+    return await _override_target(body.entity, target)
 
 
 # ------------------------------------------------------------------ vocab / art
@@ -432,7 +466,10 @@ async def moods(q: str | None = None, limit: int = 50):
 @router.get("/art")
 async def get_art(key: str | None = None, artist_dir: str | None = None):
     if key:
-        found = await art.album_art(key)
+        # a unit id (or a key); a merged-away album shows the one it joined
+        where = await units.resolve(key) or {}
+        found = await art.album_art(where.get("key") or (where.get("redirect") or {}).get("key")
+                                    or key)
     elif artist_dir:
         found = await art.artist_art(artist_dir)
     else:

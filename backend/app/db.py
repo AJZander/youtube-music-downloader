@@ -457,6 +457,56 @@ MIGRATIONS: list[str] = [
     ALTER TABLE md_albums ADD COLUMN no_release INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE jobs ADD COLUMN target_dir TEXT;
     """,
+    # v12 — albums that keep who they are. An album's key is its folder, which
+    # a move or a merge changes, and every decision keyed by it (an accepted
+    # match, a dismissal, a pinned genre) was lost with it. unit_id is the
+    # album's own: issues, overrides and pauses are keyed by it, and the key
+    # stays its location. library_index.unit_id says which album each file
+    # was last seen in (an app move updates the row, so the file carries it);
+    # the registry follows a vanished album to where its files went. An
+    # album merged into another leaves an alias, so its page can follow.
+    #
+    # Unit issues of live albums are re-keyed `kind:unit_id` here; history
+    # rows of albums already gone stay as they are. missing_tracks (keyed by
+    # release) and album_copies (planned again each pass) are left alone.
+    """
+    ALTER TABLE md_albums ADD COLUMN unit_id TEXT;
+    UPDATE md_albums SET unit_id = lower(hex(randomblob(8))) WHERE unit_id IS NULL;
+    CREATE UNIQUE INDEX idx_md_albums_unit ON md_albums(unit_id);
+    -- whatever inserts a row without one (a test's, an old code path's)
+    CREATE TRIGGER md_albums_unit_id AFTER INSERT ON md_albums
+      FOR EACH ROW WHEN NEW.unit_id IS NULL
+    BEGIN
+      UPDATE md_albums SET unit_id = lower(hex(randomblob(8))) WHERE rowid = NEW.rowid;
+    END;
+    ALTER TABLE library_index ADD COLUMN unit_id TEXT;
+    CREATE INDEX idx_li_unit ON library_index(unit_id);
+    CREATE TABLE md_unit_aliases (
+      unit_id TEXT PRIMARY KEY,
+      successor TEXT NOT NULL,
+      old_key TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_unit_aliases_key ON md_unit_aliases(old_key);
+    CREATE INDEX idx_unit_aliases_successor ON md_unit_aliases(successor);
+
+    UPDATE md_issues SET
+      ref = (SELECT m.unit_id FROM md_albums m WHERE m.key = md_issues.album_key),
+      key = kind || ':' || (SELECT m.unit_id FROM md_albums m WHERE m.key = md_issues.album_key)
+    WHERE kind IN ('not_in_plex', 'unmatched', 'wrong_match', 'tags', 'track_order', 'move',
+                   'move_conflict', 'plex_shared', 'plex_foreign', 'bad_file', 'genres',
+                   'moods', 'poster', 'review_match', 'unresolved', 'folder_artist',
+                   'extra_tracks')
+      AND key = kind || ':' || album_key
+      AND album_key IN (SELECT key FROM md_albums);
+    UPDATE md_overrides SET ref = (SELECT m.unit_id FROM md_albums m WHERE m.key = md_overrides.ref)
+    WHERE entity = 'album' AND ref IN (SELECT key FROM md_albums);
+    UPDATE md_state SET
+      key = 'auto_paused:' || (SELECT m.unit_id FROM md_albums m
+                               WHERE m.key = substr(md_state.key, 13))
+    WHERE substr(key, 1, 12) = 'auto_paused:' AND substr(key, 13) IN (SELECT key FROM md_albums);
+    """,
 ]
 
 
@@ -484,19 +534,37 @@ class Database:
             self._conn = None
 
     async def _migrate(self) -> None:
+        """Each pending migration and its version row in one transaction: one
+        that fails, or is cut off, leaves nothing behind and runs again at the
+        next start. A migration is SQL, or an `async def step(conn)` that
+        runs its statements on the connection (no commits of its own)."""
         await self._conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT)"
         )
+        await self._conn.commit()
         cur = await self._conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
         current = (await cur.fetchone())[0]
-        for version, sql in enumerate(MIGRATIONS, start=1):
-            if version > current:
-                await self._conn.executescript(sql)
-                await self._conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    (version, utcnow()),
-                )
-        await self._conn.commit()
+        for version, step in enumerate(MIGRATIONS, start=1):
+            if version <= current:
+                continue
+            try:
+                if callable(step):
+                    await self._conn.execute("BEGIN")
+                    await step(self._conn)
+                    await self._conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                        (version, utcnow()))
+                    await self._conn.commit()
+                else:
+                    # executescript commits whatever is pending before it runs,
+                    # so the transaction is the script's own
+                    await self._conn.executescript(
+                        f"BEGIN;\n{step}\n;\nINSERT INTO schema_migrations (version, applied_at) "
+                        f"VALUES ({int(version)}, '{utcnow()}');\nCOMMIT;")
+            except BaseException:
+                if self._conn.in_transaction:
+                    await self._conn.rollback()
+                raise
 
     async def execute(self, sql: str, params: tuple = ()) -> None:
         async with self._lock:

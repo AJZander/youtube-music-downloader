@@ -307,11 +307,13 @@ def junk_fix_fields(row: dict) -> dict[str, list[str]]:
 # ------------------------------------------------------------------ planning
 async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex: dict | None,
                     *, plex_synced: bool, ours_locked, no_release: bool = False,
-                    merge_keeper: bool = False) -> list[dict]:
+                    merge_keeper: bool = False, unit_id: str | None = None) -> list[dict]:
     """`no_release`: the user says MusicBrainz has no release for these files,
     so nothing asks them to identify it; the files keep their own tags.
     `merge_keeper`: a merge of copies made this folder the album's lately
-    (see merged_into), so its files stay in it."""
+    (see merged_into), so its files stay in it. `unit_id`: the album's own
+    id, which its issues are keyed by (`kind:unit_id`), so they stay the
+    same issues wherever it moves; the key is where it is."""
     artist_dir = rows[0].get("artist_dir") if rows else None
     out: list[dict] = []
     # A file nothing can open can't be tagged, numbered or shown in Plex: it
@@ -320,8 +322,8 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
     rows = [r for r in rows if not r.get("unreadable")]
 
     def add(kind, summary, detail=None, *, ref=None, auto=False, severity=None):
-        out.append(planned(kind, ref or key, summary, detail, auto=auto, severity=severity,
-                           artist_dir=artist_dir, album_key=key))
+        out.append(planned(kind, ref or unit_id or key, summary, detail, auto=auto,
+                           severity=severity, artist_dir=artist_dir, album_key=key))
 
     plex_tracks = (plex or {}).get("tracks") or {}
     plex_album = (plex or {}).get("album")
@@ -527,7 +529,8 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
                 f"{FLIPFLOP_WINDOW // 86400} days, by {' and '.join(units_) or 'us'}: "
                 f"not matched again",
                 {"rating_key": rk, "title": plex_album.get("title"), "reason": "flip_flop",
-                 "units": units_, "folders": list(dict.fromkeys(unit_folder(k) for k in units_)),
+                 "units": units_, "unit_ids": await _unit_ids(units_),
+                 "folders": list(dict.fromkeys(unit_folder(k) for k in units_)),
                  "guids": list(dict.fromkeys(m["guid"] for m in flips))})
         elif match:
             add(match[0], match[1], match[2], auto=match[3])
@@ -562,9 +565,22 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
     return out
 
 
+async def _unit_ids(keys: list[str]) -> list[str]:
+    """The unit ids of the albums at these keys (those the registry knows)."""
+    ids: dict[str, str] = {}
+    for i in range(0, len(keys), 400):
+        chunk = keys[i:i + 400]
+        for r in await db.fetchall(
+                f"SELECT key, unit_id FROM md_albums WHERE key IN ({','.join('?' * len(chunk))})",
+                tuple(chunk)):
+            ids[r["key"]] = r["unit_id"]
+    return list(dict.fromkeys(ids[k] for k in keys if ids.get(k)))
+
+
 async def foreign_detail(plex_album: dict, foreign: list[dict]) -> dict:
     """plex_foreign's detail for an album holding other units' files: the
-    folders, and the units (album keys) they are, where the registry says."""
+    folders, and the units they are (album keys, and their ids), where the
+    registry says."""
     folders = list(dict.fromkeys(f["folder"] for f in foreign))
     known: dict[str, list[str]] = {}
     for i in range(0, len(folders), 400):
@@ -579,9 +595,10 @@ async def foreign_detail(plex_album: dict, foreign: list[dict]) -> dict:
         keys = known.get(f["folder"]) or []
         split = f"{f['folder']}|{f['split']}"
         units_.append(split if split in keys else keys[0] if len(keys) == 1 else f["folder"])
+    units_ = list(dict.fromkeys(units_))
     return {"rating_key": plex_album["rating_key"], "title": plex_album.get("title"),
-            "reason": "shared", "folders": folders, "units": list(dict.fromkeys(units_)),
-            "tracks": len(foreign)}
+            "reason": "shared", "folders": folders, "units": units_,
+            "unit_ids": await _unit_ids(units_), "tracks": len(foreign)}
 
 
 # Matches of one Plex item to different releases within this long mean two
@@ -913,7 +930,7 @@ async def plan_album_copies() -> list[dict]:
     from collections import defaultdict
     from . import units as units_mod
     rows = await db.fetchall(
-        "SELECT key, artist_dir, release_mbid, releasegroup_mbid, desired FROM md_albums "
+        "SELECT key, unit_id, artist_dir, release_mbid, releasegroup_mbid, desired FROM md_albums "
         "WHERE status = 'resolved' AND ignored = 0 AND no_release = 0 "
         "AND releasegroup_mbid IS NOT NULL AND desired IS NOT NULL")
     by_group: dict[str, list] = defaultdict(list)
@@ -936,7 +953,7 @@ async def plan_album_copies() -> list[dict]:
             unit_rows = await units_mod.load_unit(m["key"])
             if not unit_rows or await in_box_set(m["key"], unit_rows):
                 continue
-            held.append({"key": m["key"], "artist_dir": m["artist_dir"],
+            held.append({"key": m["key"], "unit_id": m["unit_id"], "artist_dir": m["artist_dir"],
                          "release": m["release_mbid"], "recs": set(recs), "want": want,
                          "rows": unit_rows})
         for copies in _sharing(held):
@@ -946,10 +963,13 @@ async def plan_album_copies() -> list[dict]:
             others = [c for c in copies if c is not keep]
             album = keep["want"].get("album") or keep["key"]
             shared = sum(len(c["recs"] & keep["recs"]) for c in others)
+            # keyed by the albums, not their folders: the same set is the
+            # same issue after a move. Their keys say where they were.
             out.append(planned(
-                "album_copies", f"{group}:{min(c['key'] for c in copies)}",
+                "album_copies", f"{group}:{min(c['unit_id'] or c['key'] for c in copies)}",
                 f"{album}: {len(copies)} copies — merge into {keep['want'].get('folder') or keep['key']}",
                 {"keep": keep["key"], "copies": [c["key"] for c in others],
+                 "keep_unit": keep["unit_id"], "copy_units": [c["unit_id"] for c in others],
                  "folders": [c["key"] for c in copies], "album": album,
                  "release_mbid": keep["release"], "releasegroup_mbid": group,
                  "shared": shared, "to": keep["want"].get("folder")},

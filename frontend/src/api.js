@@ -184,8 +184,10 @@ export const api = {
   // --- unified library workspace (browse, issues, metadata)
   libraryArtist: (artistDir) =>
     fetch('/api/v1/library/artist?' + qs({ artist_dir: artistDir })).then(json),
-  libraryAlbum: (key) =>
-    fetch('/api/v1/library/album?' + qs({ key })).then(json),
+  // an album is named by its unit id (or its key, as old links have it); one
+  // merged into another answers { redirect: { unit_id, key, artist_dir } }
+  libraryAlbum: (ref) =>
+    fetch('/api/v1/library/album?' + qs({ key: ref })).then(json),
   libraryAttention: (artistDir) =>
     fetch('/api/v1/library/attention?' + qs({ artist_dir: artistDir })).then(json),
   libraryIssues: (params = {}) =>

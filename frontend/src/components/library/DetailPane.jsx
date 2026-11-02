@@ -22,7 +22,7 @@ import BottomPane from '../BottomPane.jsx'
 import { AlbumDupeGroup } from './AlbumDupes.jsx'
 import { ArtImage } from './ArtistView.jsx'
 import { ChangeList, IssueRow } from './IssueList.jsx'
-import { STATUS, asText, severityColor } from './issues.js'
+import { STATUS, albumRef, asText, severityColor } from './issues.js'
 import { TrackGroupCard } from './TrackDupes.jsx'
 import { HealthChips, QualityChip, duration } from './shared.jsx'
 
@@ -155,7 +155,7 @@ function MissingTracks({ album, onDetail, notify }) {
   const download = async (force = false) => {
     setBusy(true)
     try {
-      const r = await api.libraryDownloadMissing(album.key, force)
+      const r = await api.libraryDownloadMissing(albumRef(album), force)
       if (r.already_queued) notify?.('Already in the download queue', 'success')
       else if (!r.queued && r.already_tried) {
         notify?.(`Already tried: an earlier download fetched or skipped ${r.already_tried === 1
@@ -330,7 +330,7 @@ function MatchTab({ album, onDetail, notify }) {
   const [q, setQ] = useState('')
   const [results, setResults] = useState(null)
   const [busy, setBusy] = useState(false)
-  useEffect(() => { setResults(null); setQ('') }, [album.key])
+  useEffect(() => { setResults(null); setQ('') }, [album.unit_id, album.key])
 
   const run = async (fn, message) => {
     setBusy(true)
@@ -343,11 +343,11 @@ function MatchTab({ album, onDetail, notify }) {
     return null
   }
   const search = async () => {
-    const r = await run(() => api.libraryAlbumCandidates(album.key, q.trim() || undefined))
+    const r = await run(() => api.libraryAlbumCandidates(albumRef(album), q.trim() || undefined))
     if (r) setResults(r.items || [])
   }
   const seed = async () => {
-    const s = await run(() => api.libraryAlbumSeed(album.key))
+    const s = await run(() => api.libraryAlbumSeed(albumRef(album)))
     if (s?.action) submitSeed(s)
   }
 
@@ -366,11 +366,11 @@ function MatchTab({ album, onDetail, notify }) {
         )}
         <Box sx={{ flexGrow: 1 }} />
         <Button size="small" startIcon={<RefreshIcon />} disabled={busy}
-          onClick={() => run(() => api.libraryAlbumRecheck(album.key), 'Re-checked')}>
+          onClick={() => run(() => api.libraryAlbumRecheck(albumRef(album)), 'Re-checked')}>
           Re-check
         </Button>
         <Button size="small" startIcon={<VisibilityOffIcon />} disabled={busy}
-          onClick={() => run(() => api.libraryAlbumIgnore(album.key, !ignored),
+          onClick={() => run(() => api.libraryAlbumIgnore(albumRef(album), !ignored),
             ignored ? 'Album will be checked again' : 'Album ignored')}>
           {ignored ? 'Stop ignoring' : 'Ignore album'}
         </Button>
@@ -380,7 +380,7 @@ function MatchTab({ album, onDetail, notify }) {
             : 'MusicBrainz has no release for these files (a YouTube single, say): keep their own tags and stop asking'}>
             <span>
               <Button size="small" disabled={busy}
-                onClick={() => run(() => api.libraryAlbumNoRelease(album.key, !album.no_release),
+                onClick={() => run(() => api.libraryAlbumNoRelease(albumRef(album), !album.no_release),
                   album.no_release ? 'Looking it up again' : 'Marked not on MusicBrainz')}>
                 {album.no_release ? 'Look up again' : 'Not on MusicBrainz'}
               </Button>
@@ -466,7 +466,7 @@ function MatchTab({ album, onDetail, notify }) {
                       ? <Chip size="small" color="success" icon={<CheckIcon />} label="selected" />
                       : (
                         <Button size="small" variant="outlined" disabled={busy}
-                          onClick={() => run(() => api.libraryAlbumMatch(album.key, c.release_mbid),
+                          onClick={() => run(() => api.libraryAlbumMatch(albumRef(album), c.release_mbid),
                             'Release chosen — the album was re-planned')}>
                           Use this
                         </Button>
@@ -672,7 +672,7 @@ export default function DetailPane({
 
   const clearOverride = async (row) => {
     try {
-      onAlbumDetail(await api.libraryClearOverride('album', album.key, row.field))
+      onAlbumDetail(await api.libraryClearOverride('album', albumRef(album), row.field))
       notify?.(`${row.label} unpinned`)
     } catch (e) { notify?.(e.message, 'error') }
   }
@@ -742,7 +742,7 @@ export default function DetailPane({
               <CompareTab album={album} notify={notify} onChanged={onChanged}
                 onClear={clearOverride}
                 onEdit={(r) => onEdit({
-                  entity: 'album', refKey: album.key, field: r.field, label: r.label,
+                  entity: 'album', refKey: albumRef(album), field: r.field, label: r.label,
                   value: r.desired ?? r.file, overridden: r.overridden,
                 })} />
             )}

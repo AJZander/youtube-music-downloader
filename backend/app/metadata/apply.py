@@ -56,8 +56,9 @@ class Ctx:
     """What one album's apply knows and has done so far."""
 
     def __init__(self, key: str, rows: list[dict], desired: dict | None,
-                 artist_dir: str | None) -> None:
+                 artist_dir: str | None, unit_id: str | None = None) -> None:
         self.key = key
+        self.unit_id = unit_id      # the album's own id (units): its key is where it is
         self.rows = rows
         self.desired = desired
         self.artist_dir = artist_dir
@@ -149,27 +150,29 @@ async def _rekey_exclusions(scope: str, old: str, new: str) -> None:
                          (scope, old))
 
 
-async def rekey_unit(old_key: str, new_key: str, new_folder: str, artist_dir: str) -> None:
-    if old_key == new_key:
-        return
-    exists = await db.fetchone("SELECT 1 FROM md_albums WHERE key = ?", (new_key,))
-    if exists:
-        await db.execute("DELETE FROM md_albums WHERE key = ?", (old_key,))
-    else:
-        await db.execute(
-            "UPDATE md_albums SET key = ?, dirpath = ?, artist_dir = ?, next_check = 0 "
-            "WHERE key = ?", (new_key, new_folder, artist_dir, old_key))
-    await db.execute("UPDATE md_changes SET album_key = ?, artist_dir = ? WHERE album_key = ?",
-                     (new_key, artist_dir, old_key))
-    # The old unit's open issues are moot; the re-check files new ones. Queued
-    # ones are left alone: they are part of this apply, which re-plans them
-    # under the new key (marking them "applied" here would claim a fix that
-    # never ran).
-    await db.execute(
-        "UPDATE md_issues SET state = 'applied', updated_at = ? WHERE album_key = ? "
-        "AND state IN ('open', 'failed')", (utcnow(), old_key))
-    await db.execute("UPDATE md_issue_refs SET album_key = ? WHERE album_key = ?",
-                     (new_key, old_key))
+async def rekey_unit(old_key: str, new_key: str, artist_dir: str, paths=()) -> str | None:
+    """The album moved from old_key to new_key, with these files (their new
+    paths): its record and its issues follow it, or, where an album is
+    already at new_key (another disc of it, the copy it merged into), it
+    becomes that one, decisions and all (units.merge_into). Its issues keep
+    their ids: the re-check updates them in place. Returns the unit id the
+    album has now."""
+    from . import units
+    uid = await units.unit_id_of(old_key)
+    if old_key != new_key:
+        there = await units.unit_id_of(new_key)
+        if there:
+            # the moved files are the mover's until the merge makes them
+            # that album's (so they don't count as what it already was)
+            await units.stamp(uid, paths)
+            await units.merge_into(uid, there, reason=f"moved into {new_key}")
+            uid = there
+        elif uid:
+            await units.rekey(old_key, new_key, artist_dir=artist_dir)
+        # what still names the old key (an album with no record of its own)
+        await units.repoint(old_key, new_key, artist_dir)
+    await units.stamp(uid, paths)
+    return uid
 
 
 # ------------------------------------------------------------------ file stage
@@ -386,13 +389,16 @@ def _move_file(src: Path, dst: Path) -> None:
     os.replace(src, dst)
 
 
-# md_state key, + an album key: {"until", "reason"}. Until then none of the
-# album's fixes is applied automatically (an Apply the user asks for runs).
+# md_state key, + an album's unit id: {"until", "reason"}. Until then none of
+# the album's fixes is applied automatically (an Apply the user asks for
+# runs). The pause follows the album wherever it moves.
 AUTO_PAUSED = "auto_paused:"
 
 
-async def auto_paused(key: str) -> bool:
-    row = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (AUTO_PAUSED + key,))
+async def auto_paused(unit_id: str | None) -> bool:
+    if not unit_id:
+        return False
+    row = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (AUTO_PAUSED + unit_id,))
     try:
         until = float(json.loads(row["value"])["until"]) if row and row["value"] else 0.0
     except (ValueError, KeyError, TypeError):
@@ -453,10 +459,12 @@ async def refuse_oscillation(ctx: Ctx, moves: list[dict]) -> None:
     found = await oscillation(moves)
     if found is None:
         return
+    from .units import unit_id_of
     reason = f"oscillating between {found[0]} and {found[1]}"
+    unit_id = ctx.unit_id or await unit_id_of(ctx.key) or ctx.key
     await db.execute("INSERT INTO md_state (key, value) VALUES (?, ?) ON CONFLICT(key) "
                      "DO UPDATE SET value = excluded.value",
-                     (AUTO_PAUSED + ctx.key,
+                     (AUTO_PAUSED + unit_id,
                       json.dumps({"until": time.time() + OSCILLATION_WINDOW, "reason": reason})))
     log.warning("%s: %s; nothing moved, and its fixes wait for the user", ctx.key, reason)
     raise ApplyError(f"{reason}: nothing was moved, and this album's fixes are not applied "
@@ -518,7 +526,8 @@ async def _relocate(ctx: Ctx, moves: list[dict], batch: str, summary: str | None
         await rekey_folder(folder, target_dir)
     new_artist = Path(target_dir).parts[0]
     new_key = target_dir
-    await rekey_unit(ctx.key, new_key, target_dir, new_artist)
+    ctx.unit_id = await rekey_unit(ctx.key, new_key, new_artist,
+                                   [new for _, new in done]) or ctx.unit_id
     await db.execute("UPDATE md_changes SET summary = ?, album_key = ?, artist_dir = ? "
                      "WHERE batch_id = ?",
                      (summary or f"Moved {len(done)} files to {target_dir}", new_key, new_artist,
@@ -720,6 +729,25 @@ async def do_merge(issue: dict, ctx: Ctx) -> str:
     return note
 
 
+async def copy_keys(detail: dict) -> list[str]:
+    """Where the copies an album_copies fix names are now: it names their
+    units (and their keys when it was planned). A copy merged into another
+    album since is no copy to merge."""
+    from .units import resolve
+    keys = list(detail.get("copies") or [])
+    uids = detail.get("copy_units") or []
+    if len(uids) != len(keys):
+        return keys
+    out = []
+    for uid, key in zip(uids, keys):
+        found = await resolve(uid)
+        if found is None:
+            out.append(key)
+        elif found.get("key"):
+            out.append(found["key"])
+    return list(dict.fromkeys(out))
+
+
 async def copies_plan(issue: dict, ctx: Ctx) -> dict:
     """What merging an album's other copies into this one does, without
     doing it: {"moves", "trash", "left"}. Only a file identified as a
@@ -756,7 +784,7 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
     plan = {"moves": [], "trash": [], "left": [], "pin": ctx.desired["release_mbid"],
             "release": rel}
     taken = {r["path"].casefold() for r in ctx.rows}
-    for key in issue["detail"].get("copies") or []:
+    for key in await copy_keys(issue["detail"]):
         rows = await load_unit(key)
         record = await db.fetchone("SELECT desired, status FROM md_albums WHERE key = ?", (key,))
         if not rows or not record or record["status"] != "resolved" or not record["desired"] \
@@ -908,7 +936,7 @@ async def do_album_copies(issue: dict, ctx: Ctx) -> str:
                      "DO UPDATE SET value = excluded.value",
                      (MERGE_KEEPER + folder.casefold(),
                       json.dumps({"at": time.time(), "release": plan["pin"], "batch": batch})))
-    keys = issue["detail"].get("copies") or []
+    keys = await copy_keys(issue["detail"])
     if keys:
         await db.execute(f"UPDATE md_albums SET next_check = 0 WHERE key IN "
                          f"({','.join('?' * len(keys))})", tuple(keys))

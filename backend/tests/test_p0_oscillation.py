@@ -344,12 +344,13 @@ class BreakerTestCase(LibraryTestCase):
             self.assertIn("oscillating between", after["error"])
             self.assertTrue((self.lib / self.a).exists())
             self.assertFalse((self.lib / self.b).exists())
+            unit = await units.unit_id_of(self.OLD)
             paused = await self.db.fetchone("SELECT value FROM md_state WHERE key = ?",
-                                            (f"auto_paused:{self.OLD}",))
+                                            (f"auto_paused:{unit}",))
             self.assertIsNotNone(paused)
             self.assertEqual((await self.runner._check_unit(self.OLD))["auto_ids"], [])
             # it is the pause that holds the album's other fixes back
-            await self.db.execute("DELETE FROM md_state WHERE key = ?", (f"auto_paused:{self.OLD}",))
+            await self.db.execute("DELETE FROM md_state WHERE key = ?", (f"auto_paused:{unit}",))
             self.assertNotEqual((await self.runner._check_unit(self.OLD))["auto_ids"], [])
 
     async def test_moves_older_than_the_window_are_allowed(self):
@@ -395,7 +396,7 @@ class BreakerTestCase(LibraryTestCase):
                 self.assertEqual(self.tags(path), tags)
         written = await self.db.fetchone("SELECT COUNT(*) AS n FROM md_changes WHERE target = 'file'")
         self.assertEqual(written["n"], 0)
-        self.assertIsNotNone(await apply.auto_paused(KEEP))
+        self.assertIsNotNone(await apply.auto_paused(await units.unit_id_of(KEEP)))
 
 
 # ------------------------------------------------------------------ the layout guard

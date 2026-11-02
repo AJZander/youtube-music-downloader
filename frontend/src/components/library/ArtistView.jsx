@@ -15,7 +15,7 @@ import PersonIcon from '@mui/icons-material/Person'
 import ViewListIcon from '@mui/icons-material/ViewList'
 
 import { IssueRow } from './IssueList.jsx'
-import { STATUS, severityColor } from './issues.js'
+import { STATUS, albumRef, isAlbum, severityColor } from './issues.js'
 import { QualityChip, bytes, duration } from './shared.jsx'
 
 const CARD = 168
@@ -85,7 +85,7 @@ function MoveIcon({ album }) {
 
 function AlbumCard({ album, selected, onClick }) {
   return (
-    <Paper variant="outlined" onClick={onClick} data-album-key={album.key} sx={{
+    <Paper variant="outlined" onClick={onClick} data-album-key={albumRef(album)} sx={{
       p: 1, cursor: 'pointer', position: 'relative', minWidth: 0,
       borderColor: selected ? 'primary.main' : 'divider',
       borderWidth: selected ? 2 : 1, m: selected ? 0 : '1px',
@@ -123,7 +123,7 @@ function AlbumCard({ album, selected, onClick }) {
 
 function AlbumListRow({ album, selected, onClick }) {
   return (
-    <Box onClick={onClick} data-album-key={album.key} sx={{
+    <Box onClick={onClick} data-album-key={albumRef(album)} sx={{
       display: 'flex', alignItems: 'center', gap: 1.25, px: 1, py: 0.75, cursor: 'pointer',
       borderBottom: 1, borderColor: 'divider',
       bgcolor: selected ? 'action.selected' : 'transparent',
@@ -160,7 +160,7 @@ function AlbumListRow({ album, selected, onClick }) {
 
 /** The selected album's tracks, shown right under its card. */
 function TrackPanel({ detail, album, onOpenPane }) {
-  const loading = !detail || detail.key !== album.key
+  const loading = !detail || albumRef(detail) !== albumRef(album)
   return (
     <Paper variant="outlined" sx={{ gridColumn: '1 / -1', p: 1, bgcolor: 'action.hover' }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 0.5, mb: 0.5 }}>
@@ -292,7 +292,7 @@ export default function ArtistView({
 
   // In the grid the track panel takes a full row, right after the row of the
   // selected card.
-  const selectedIndex = albums.findIndex((a) => a.key === selectedKey)
+  const selectedIndex = albums.findIndex((a) => isAlbum(a, selectedKey))
   const panelAfter = selectedIndex < 0 ? -1
     : Math.min(albums.length - 1, Math.ceil((selectedIndex + 1) / columns) * columns - 1)
   const selectedAlbum = selectedIndex >= 0 ? albums[selectedIndex] : null
@@ -394,11 +394,11 @@ export default function ArtistView({
         }}>
           {albums.map((album, i) => (
             <Box key={album.key} sx={{ display: 'contents' }}>
-              <AlbumCard album={album} selected={album.key === selectedKey}
-                onClick={() => selectAlbum(album.key)} />
+              <AlbumCard album={album} selected={isAlbum(album, selectedKey)}
+                onClick={() => selectAlbum(albumRef(album))} />
               {i === panelAfter && selectedAlbum && (
                 <TrackPanel detail={albumDetail} album={selectedAlbum}
-                  onOpenPane={() => onSelectAlbum(selectedAlbum.key, { pane: true })} />
+                  onOpenPane={() => onSelectAlbum(albumRef(selectedAlbum), { pane: true })} />
               )}
             </Box>
           ))}
@@ -409,12 +409,12 @@ export default function ArtistView({
         <Paper variant="outlined" ref={grid}>
           {albums.map((album) => (
             <Box key={album.key}>
-              <AlbumListRow album={album} selected={album.key === selectedKey}
-                onClick={() => selectAlbum(album.key)} />
-              {album.key === selectedKey && (
+              <AlbumListRow album={album} selected={isAlbum(album, selectedKey)}
+                onClick={() => selectAlbum(albumRef(album))} />
+              {isAlbum(album, selectedKey) && (
                 <Box sx={{ p: 1 }}>
                   <TrackPanel detail={albumDetail} album={album}
-                    onOpenPane={() => onSelectAlbum(album.key, { pane: true })} />
+                    onOpenPane={() => onSelectAlbum(albumRef(album), { pane: true })} />
                 </Box>
               )}
             </Box>

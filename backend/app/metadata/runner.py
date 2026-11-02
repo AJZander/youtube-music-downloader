@@ -544,6 +544,11 @@ class Runner:
     async def _check_unit(self, key: str, *, manual_release: str | None = None) -> dict:
         rows = await units.load_unit(key)
         if not rows:
+            # its files went elsewhere (a move, a merge): the album, and what
+            # was decided about it, goes with them; else it is gone
+            moved = await units.follow(key)
+            if moved:
+                return {"status": "gone", "moved_to": moved}
             await db.execute("DELETE FROM md_albums WHERE key = ?", (key,))
             await issues.save([], scope_kinds=issues.UNIT_KINDS, album_key=key)
             return {"status": "gone"}
@@ -551,8 +556,9 @@ class Runner:
         record = await db.fetchone("SELECT * FROM md_albums WHERE key = ?", (key,))
         if record is None:
             await db.execute(
-                "INSERT INTO md_albums (key, dirpath, artist_dir, next_check) VALUES (?,?,?,0)",
-                (key, units.unit_folder(key), artist_dir))
+                "INSERT INTO md_albums (key, unit_id, dirpath, artist_dir, next_check) "
+                "VALUES (?,?,?,?,0)",
+                (key, units.new_unit_id(), units.unit_folder(key), artist_dir))
             record = await db.fetchone("SELECT * FROM md_albums WHERE key = ?", (key,))
         if record["ignored"]:
             await issues.save([], scope_kinds=issues.UNIT_KINDS, album_key=key)
@@ -576,13 +582,14 @@ class Runner:
                 res = Resolution(status="pending", error=str(exc))
         want = None
         if res.release is not None and res.status in ("resolved", "review"):
-            overrides = await desired_mod.overrides_for("album", key)
+            overrides = await desired_mod.overrides_for("album", record["unit_id"])
             want = await desired_mod.build_album(rows, res, plex_album=hint_album,
                                                  plex_artist=hint_artist, overrides=overrides)
         plan = await issues.plan_unit(
             key, rows, want if res.status == "resolved" else None, res, plex_info,
             plex_synced=bool(await plexsync.last_sync()), ours_locked=apply.ours_locked,
-            no_release=no_release, merge_keeper=await issues.merged_into(units.unit_folder(key)))
+            no_release=no_release, merge_keeper=await issues.merged_into(units.unit_folder(key)),
+            unit_id=record["unit_id"])
         await issues.save(plan, scope_kinds=issues.UNIT_KINDS, album_key=key)
         now = time.time()
         if res.status == "resolved":
@@ -616,7 +623,7 @@ class Runner:
         # an album whose files were caught going back and forth waits for the
         # user (apply.refuse_oscillation), with all of its fixes
         if (res.status == "resolved" or any(p["kind"] == "tags" for p in plan)) \
-                and not await apply.auto_paused(key):
+                and not await apply.auto_paused(record["unit_id"]):
             rows_ = await db.fetchall(
                 "SELECT id FROM md_issues WHERE album_key = ? AND state = 'open' AND auto = 1",
                 (key,))
@@ -735,7 +742,9 @@ class Runner:
             await db.execute("UPDATE md_albums SET no_release = 1, manual = 0 WHERE key = ?",
                              (key,))
             result = await self.check_unit(key)
-        bus.publish("library.changed", {"album_keys": [key], "artist_dirs": [issue["artist_dir"]]
+        uid = await units.unit_id_of(key)
+        bus.publish("library.changed", {"album_keys": [key], "unit_ids": [uid] if uid else [],
+                                        "artist_dirs": [issue["artist_dir"]]
                                         if issue["artist_dir"] else []})
         return result.get("auto_ids") or []
 
@@ -773,8 +782,11 @@ class Runner:
             self.apply_note = (f"changing files ({len(self._plex_due):,} albums done): {ref}")
             await self.publish()
             # merging copies changes their folders too: hold them all
-            keys = sorted({ref} | {k for i in members if i["kind"] == "album_copies"
-                                   for k in (i["detail"].get("copies") or [])})
+            keys = {ref}
+            for i in members:
+                if i["kind"] == "album_copies":
+                    keys |= set(await apply.copy_keys(i["detail"]))
+            keys = sorted(keys)
             try:
                 async with contextlib.AsyncExitStack() as held:
                     for k in keys:
@@ -904,8 +916,8 @@ class Runner:
             return 0, 0, None
         want = (json.loads(record["desired"])
                 if record["desired"] and record["status"] == "resolved" else None)
-        ctx = apply.Ctx(key, rows, want, rows[0].get("artist_dir"))
-        state = {"key": key, "ctx": ctx, "old_artist": ctx.artist_dir,
+        ctx = apply.Ctx(key, rows, want, rows[0].get("artist_dir"), unit_id=record["unit_id"])
+        state = {"key": key, "unit_id": record["unit_id"], "ctx": ctx, "old_artist": ctx.artist_dir,
                  "files": [i for i in members if i["kind"] in apply.FILE_STAGE],
                  "plex_stage": [i for i in members if i["kind"] in apply.PLEX_STAGE]}
         queue_stage = [i for i in members if i["kind"] in apply.QUEUE_STAGE]
@@ -954,12 +966,17 @@ class Runner:
                 f"SELECT * FROM md_issues WHERE album_key = ? AND state IN ('open', 'queued', 'failed') "
                 f"AND kind IN ({','.join('?' * len(kinds))})", (ctx.key, *kinds))]
             fresh_kinds = {i["kind"] for i in fresh}
+            # A fix planned again is the same issue (it is keyed by the
+            # album, not its folder), and is applied as one of `fresh`; only
+            # one left behind under the old key is closed here.
+            fresh_ids = {i["id"] for i in fresh}
             for issue in plex_stage:
-                if issue["kind"] not in fresh_kinds and issue["album_key"] != ctx.key:
+                if issue["id"] not in fresh_ids and issue["kind"] not in fresh_kinds \
+                        and issue["album_key"] != ctx.key:
                     await self._mark(issue, "applied")
             applied, failed = await self._apply_simple(fresh, ctx, apply.PLEX_STAGE)
             for issue in plex_stage:
-                if issue["album_key"] != ctx.key:
+                if issue["id"] not in fresh_ids and issue["album_key"] != ctx.key:
                     await self._mark(issue, "applied")    # planned again, and applied, under the new key
         result = await self._check_unit(ctx.key)
         # What the files' changes made due (a moved album's genres, tags of
@@ -973,12 +990,18 @@ class Runner:
             for i in follow:
                 self._followed[i] = self._followed.get(i, 0) + 1
             await self.request_apply(follow)
+        uid = await units.unit_id_of(ctx.key) or ctx.unit_id
+        renamed = {}
+        if ctx.key != key or uid != state["unit_id"]:
+            # a move gives the album a new key (merged into another, a new
+            # unit too): a page showing it, by either, follows
+            to = {"key": ctx.key, "unit_id": uid, "artist_dir": ctx.artist_dir}
+            renamed = {ref: to for ref in (key, state["unit_id"]) if ref}
         bus.publish("library.changed", {
             "album_keys": sorted({key, ctx.key}),
+            "unit_ids": sorted({u for u in (state["unit_id"], uid) if u}),
             "artist_dirs": sorted({d for d in (state["old_artist"], ctx.artist_dir) if d}),
-            # a move gives the album a new key; a page showing it follows
-            "renamed": {key: {"key": ctx.key, "artist_dir": ctx.artist_dir}}
-            if ctx.key != key else {}})
+            "renamed": renamed})
         return applied, failed
 
     async def _apply_artist(self, artist_dir: str, members: list[dict]) -> tuple[int, int]:
