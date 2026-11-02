@@ -24,6 +24,8 @@ export const KINDS = {
     help: 'Files that can\'t be read — a zeroed or cut-off download. Nothing can tag them or show them in Plex. Applying re-reads each one and moves it to Trash only if it is still unreadable; "Download missing" then fetches a good copy.' },
   plex_shared: { label: 'Plex album shared', severity: 'warning', applyable: true,
     help: 'Plex files these tracks in one album with other albums\' tracks, and an earlier fix matched or tagged that album as this one. Applying puts back what Plex had.' },
+  plex_foreign: { label: 'Plex album mixes folders', severity: 'warning', applyable: false,
+    help: 'Plex shows these tracks in one album with another album folder\'s tracks — two editions tagged alike, or a track Plex first saw elsewhere — or the album was matched to different releases in turn. Until it holds this album\'s tracks only, nothing album-level is changed in Plex (no match, genres, moods or cover); the tracks still get their genres. Don\'t delete tracks in Plex to fix it: they are real files of the other album.' },
   genres: { label: 'Genres', severity: 'info', applyable: true,
     help: 'Plex shows different genres from ours. Applying sets and locks ours.' },
   moods: { label: 'Moods', severity: 'info', applyable: true,

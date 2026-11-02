@@ -139,6 +139,8 @@ class PlanTestCase(unittest.TestCase):
                                               mock.AsyncMock(return_value=box)),
                             mock.patch.object(issues, "other_album",
                                               mock.AsyncMock(return_value=False)),
+                            mock.patch.object(issues, "match_flipflop",
+                                              mock.AsyncMock(return_value=[])),
                             as_spelled()):
             want = asyncio.run(desired.build_album(rows, res, plex_album=None, plex_artist=None,
                                                    overrides={}))

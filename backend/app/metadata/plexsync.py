@@ -411,9 +411,38 @@ async def album_others(album_key: str, paths: list[str]) -> list[dict]:
     for i in range(0, len(other_paths), 400):
         chunk = other_paths[i:i + 400]
         others += [dict(r) for r in await db.fetchall(
-            "SELECT path, album, mb_releasegroupid FROM library_index WHERE path IN "
-            f"({','.join('?' * len(chunk))})", tuple(chunk))]
+            "SELECT path, dirpath, artist_dir, album, album_artist, mb_releasegroupid "
+            f"FROM library_index WHERE path IN ({','.join('?' * len(chunk))})", tuple(chunk))]
     return others
+
+
+def foreign_files(info: dict | None, key: str | None) -> list[dict]:
+    """The tracks of the Plex album these files map to that belong to
+    another unit: a file of another album folder (disc subfolders count as
+    their album's), or, for a unit split out of a folder by album tag, of
+    one of the folder's other albums. Plex lumps two editions tagged alike
+    into one album, and keeps a track in the album it first saw it in. Such
+    an album is no unit's to match, tag, mood or give a cover: each unit in
+    it would overwrite the last (until the reconciler, P1-C4, sorts it out).
+
+    Only indexed files count (`others`), so a ghost entry doesn't; a file
+    of ours the index has no folder for yet (an import) is placed by its
+    path, so it doesn't either. [{"path", "folder", "split"}]: the file's
+    album folder, and the split key its album tag gives it there."""
+    if key is None:
+        return []
+    from ..library import unit_dir
+    from .units import split_key
+    folder, _, split = key.partition("|")
+    out: list[dict] = []
+    for other in (info or {}).get("others") or []:
+        path = other.get("path") or ""
+        theirs = unit_dir(other.get("dirpath") or (path.rsplit("/", 1)[0] if "/" in path else ""))
+        k = split_key(other.get("album"), other.get("album_artist") or other.get("artist_dir"))
+        # (in a split folder an untagged file joins its largest album: not foreign)
+        if nfc(theirs).casefold() != nfc(folder).casefold() or (split and k and k != split):
+            out.append({"path": path, "folder": theirs, "split": k})
+    return out
 
 
 def album_share(info: dict | None, rows: list[dict], releasegroup: str | None = None) -> dict:

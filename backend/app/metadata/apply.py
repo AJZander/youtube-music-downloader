@@ -29,7 +29,8 @@ from ..engine import tagio
 from ..importer import library_online
 from ..plex import ALBUM, ARTIST, TRACK, PlexError, is_matched, nfc, plex
 from . import plexsync
-from .issues import MERGE_KEEPER, OSCILLATION_WINDOW, SHARED_FIELDS, junk_fix_fields, same_file
+from .issues import (FLIPFLOP_WINDOW, MERGE_KEEPER, OSCILLATION_WINDOW, SHARED_FIELDS,
+                     junk_fix_fields, match_flipflop, same_file)
 from .plexsync import jlist
 from .desired import album_tags_of, plain as plain_title, track_tags
 from .units import folder_of
@@ -1213,14 +1214,16 @@ SHARED_NOTE = "left alone: Plex files other albums' tracks in this album"
 
 
 async def _shared(ctx: Ctx, rating_key: str) -> bool:
-    """Whether Plex files other albums' tracks in this album, so that it is
-    not this one's to match or tag (a fix planned before that was known)."""
+    """Whether Plex files other albums' tracks, or another folder's, in this
+    album, so that it is not this one's to match or tag (a fix planned
+    before that was known)."""
     if not ctx.rows:
         return False
     info = await plexsync.album_for_paths([ctx.moved.get(r["path"], r["path"]) for r in ctx.rows])
     if ((info or {}).get("album") or {}).get("rating_key") != rating_key:
         return True      # the tracks have left that album: it is not theirs now
-    return plexsync.shares_album(info, ctx.rows, (ctx.desired or {}).get("releasegroup_mbid"))
+    return plexsync.shares_album(info, ctx.rows, (ctx.desired or {}).get("releasegroup_mbid")) \
+        or bool(plexsync.foreign_files(info, ctx.key))
 
 
 async def do_genres(issue: dict, ctx: Ctx) -> str:
@@ -1309,6 +1312,15 @@ async def do_artist_genres(issue: dict, ctx: Ctx) -> str:
 
 async def _match(rating_key: str, mbid: str, name: str, ctx: Ctx, *, parent: str | None = None,
                  year: str | None = None, kind: str) -> str:
+    # Matched to different releases lately: two units each take the item
+    # for theirs, and a match may merge Plex albums (§2). Not again.
+    flips = await match_flipflop(rating_key)
+    if flips:
+        units = list(dict.fromkeys(m["album_key"] for m in flips if m["album_key"]))
+        raise ApplyError(f"Plex item {rating_key} was matched to "
+                         f"{len({m['guid'] for m in flips})} different releases within "
+                         f"{FLIPFLOP_WINDOW // 86400} days, by {' and '.join(units) or 'us'}: "
+                         f"not matched again")
     before = await plex.metadata(rating_key)
     if before is None:
         raise ApplyError("the item is gone from Plex")

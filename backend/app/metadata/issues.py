@@ -23,7 +23,7 @@ from ..engine import tagio
 from ..library import strict_key
 from ..plex import is_matched
 from . import musicbrainz as mb
-from .plexsync import album_share, jlist, shares_album
+from .plexsync import album_share, foreign_files, jlist, shares_album
 from .units import folder_of, in_box_set, unit_folder
 
 log = logging.getLogger("mdl.issues")
@@ -77,6 +77,14 @@ KINDS: dict[str, dict] = {
                     "description": "Plex files these tracks in one album with other albums' tracks, "
                                    "and an earlier fix matched or tagged that album as this one. "
                                    "Applying puts back what Plex had."},
+    "plex_foreign": {"label": "Plex album mixes folders", "severity": "warning",
+                     "applyable": False, "action": None,
+                     "description": "Plex shows these tracks in one album with another album "
+                                    "folder's tracks (two editions tagged alike, or a track Plex "
+                                    "first saw elsewhere), or the album was matched to different "
+                                    "releases in turn. Until it holds this album's tracks only, "
+                                    "nothing album-level is changed in Plex: no match, genres, "
+                                    "moods or cover. Don't delete tracks in Plex to fix it."},
     "genres": {"label": "Genres", "severity": "info", "applyable": True,
                "action": "Set genres",
                "description": "Plex's genres differ from the desired genres."},
@@ -118,7 +126,7 @@ KINDS: dict[str, dict] = {
                        "description": "MusicBrainz has no such artist. Adding it lets Plex match it too."},
 }
 UNIT_KINDS = ("not_in_plex", "unmatched", "wrong_match", "tags", "track_order", "move",
-              "move_conflict", "plex_shared", "bad_file",
+              "move_conflict", "plex_shared", "plex_foreign", "bad_file",
               "genres", "moods", "poster", "review_match", "unresolved", "folder_artist",
               "extra_tracks")
 ARTIST_KINDS = ("artist_unmatched", "artist_genres", "artist_moods", "artist_poster",
@@ -449,17 +457,28 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
                              else f"Move to {desired['folder']}"), detail, auto=auto)
 
     # -- Plex
-    if plex_album and settings.metadata_write_plex \
-            and shares_album(plex, rows, desired.get("releasegroup_mbid")):
+    shared = foreign = None
+    if plex_album and settings.metadata_write_plex:
+        shared = shares_album(plex, rows, desired.get("releasegroup_mbid"))
+        foreign = foreign_files(plex, key)
+    if shared or foreign:
         # Plex files these tracks with other albums' (an untitled album it
-        # made before their tags were fixed, and never regroups): the album
-        # is not ours to match, tag or give a cover, or every album in it
-        # would overwrite the last. Our tracks still get their genres, and
-        # what we did to the album before we knew is put back.
+        # made before their tags were fixed, and never regroups) or with
+        # another folder's (two editions tagged alike): the album is not
+        # ours to match, tag or give a cover, or every album in it would
+        # overwrite the last. Our tracks still get their genres, and what
+        # we did to an untitled album before we knew is put back.
         rk = plex_album["rating_key"]
+        if foreign:
+            detail = await foreign_detail(plex_album, foreign)
+            folders = detail["folders"]
+            add("plex_foreign", f"Plex shows {plex_album.get('title') or 'an untitled album'} "
+                f"mixed with {len(foreign)} tracks of {folders[0]}"
+                + (f" and {len(folders) - 1} more folders" if len(folders) > 1 else "")
+                + ": no album edits in Plex until it is one album", detail)
         # put back only an album no identified album holds most of: one
         # that does puts the album right itself on its own next check
-        if await changed_by_us(rk) and \
+        if shared and await changed_by_us(rk) and \
                 not album_share(plex, rows, desired.get("releasegroup_mbid"))["owner_tagged"]:
             add("plex_shared", f"Plex files these tracks in {plex_album.get('title') or 'an untitled album'}"
                 f" with other albums': restore it", {"rating_key": rk, "title": plex_album.get("title")},
@@ -475,13 +494,14 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
         guid = plex_album.get("guid") or ""
         plex_mbid = plex_album.get("mbid")
         rk = plex_album["rating_key"]
+        match = None        # (kind, summary, detail, auto) of a match to plan
         # mbid://<our release>: Plex took our match but has no catalogue
         # entry for it to become plex://, and asking again changes nothing
         if not is_matched(guid) and plex_mbid != desired["release_mbid"] \
                 and guid != f"mbid://{desired['release_mbid']}":
-            add("unmatched", f"Plex has no match for {plex_album.get('title')}",
-                {"rating_key": rk, "guid": guid, "release_mbid": desired["release_mbid"],
-                 "title": desired["album"]}, auto=auto)
+            match = ("unmatched", f"Plex has no match for {plex_album.get('title')}",
+                     {"rating_key": rk, "guid": guid, "release_mbid": desired["release_mbid"],
+                      "title": desired["album"]}, auto)
         elif is_matched(guid) and plex_mbid and plex_mbid != desired["release_mbid"]:
             other_rg = None
             try:
@@ -490,12 +510,26 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
             except mb.MusicBrainzError:
                 other = None
             if other is not None and other_rg != desired.get("releasegroup_mbid"):
-                add("wrong_match",
-                    f"Plex matched it to {other.get('title')} ({(other.get('date') or '')[:4]})",
-                    {"rating_key": rk, "guid": guid, "plex_mbid": plex_mbid,
-                     "plex_title": other.get("title"), "release_mbid": desired["release_mbid"],
-                     "title": desired["album"]},
-                    auto=auto and (res.score >= 0.9))
+                match = ("wrong_match",
+                         f"Plex matched it to {other.get('title')} ({(other.get('date') or '')[:4]})",
+                         {"rating_key": rk, "guid": guid, "plex_mbid": plex_mbid,
+                          "plex_title": other.get("title"), "release_mbid": desired["release_mbid"],
+                          "title": desired["album"]},
+                         auto and (res.score >= 0.9))
+        flips = await match_flipflop(rk) if match else []
+        if flips:
+            # matched as one release and then another lately: each unit
+            # that takes the album for its own undoes the last one's match
+            units_ = list(dict.fromkeys(m["album_key"] for m in flips if m["album_key"]))
+            add("plex_foreign", f"Plex album {plex_album.get('title') or rk} was matched to "
+                f"{len({m['guid'] for m in flips})} different releases within "
+                f"{FLIPFLOP_WINDOW // 86400} days, by {' and '.join(units_) or 'us'}: "
+                f"not matched again",
+                {"rating_key": rk, "title": plex_album.get("title"), "reason": "flip_flop",
+                 "units": units_, "folders": list(dict.fromkeys(unit_folder(k) for k in units_)),
+                 "guids": list(dict.fromkeys(m["guid"] for m in flips))})
+        elif match:
+            add(match[0], match[1], match[2], auto=match[3])
         locked = set(jlist(plex_album.get("locked")))
         want_genres = desired.get("genres") or []
         if want_genres and not ("genre" in locked and not await ours_locked(rk, "genre")):
@@ -525,6 +559,52 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
         add("extra_tracks", f"{len(extras)} files are not on {desired['album']}",
             {"paths": extras[:50]})
     return out
+
+
+async def foreign_detail(plex_album: dict, foreign: list[dict]) -> dict:
+    """plex_foreign's detail for an album holding other units' files: the
+    folders, and the units (album keys) they are, where the registry says."""
+    folders = list(dict.fromkeys(f["folder"] for f in foreign))
+    known: dict[str, list[str]] = {}
+    for i in range(0, len(folders), 400):
+        chunk = folders[i:i + 400]
+        for r in await db.fetchall(
+                f"SELECT key, dirpath FROM md_albums WHERE dirpath IN ({','.join('?' * len(chunk))})",
+                tuple(chunk)):
+            known.setdefault(r["dirpath"], []).append(r["key"])
+    units_: list[str] = []
+    for f in foreign:
+        # a folder split by album tag: the unit the file's album tag puts it in
+        keys = known.get(f["folder"]) or []
+        split = f"{f['folder']}|{f['split']}"
+        units_.append(split if split in keys else keys[0] if len(keys) == 1 else f["folder"])
+    return {"rating_key": plex_album["rating_key"], "title": plex_album.get("title"),
+            "reason": "shared", "folders": folders, "units": list(dict.fromkeys(units_)),
+            "tracks": len(foreign)}
+
+
+# Matches of one Plex item to different releases within this long mean two
+# units take it for theirs, each undoing the other's match.
+FLIPFLOP_WINDOW = 14 * 86400
+
+
+async def match_flipflop(rating_key: str) -> list[dict]:
+    """The matches journalled on this Plex item within the window
+    ([{"guid", "album_key", "at"}]) when they name two or more releases;
+    otherwise none."""
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - FLIPFLOP_WINDOW))
+    matches = []
+    for r in await db.fetchall(
+            "SELECT album_key, new_value, applied_at FROM md_changes WHERE target = 'plex' "
+            "AND field = 'match' AND ref = ? AND reverted_at IS NULL AND applied_at >= ? "
+            "ORDER BY id", (rating_key, since)):
+        try:
+            guid = (json.loads(r["new_value"]) or {}).get("guid")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if guid:
+            matches.append({"guid": guid, "album_key": r["album_key"], "at": r["applied_at"]})
+    return matches if len({m["guid"] for m in matches}) > 1 else []
 
 
 SHARED_FIELDS = ("match", "genre", "mood")

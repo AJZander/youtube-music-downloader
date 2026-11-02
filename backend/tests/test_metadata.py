@@ -586,7 +586,10 @@ class SharedPlexAlbumTestCase(unittest.TestCase):
                 mock.patch.object(desired.mb, "artist", mock.AsyncMock(return_value={})), \
                 mock.patch.object(issues, "conflict_of", mock.AsyncMock(return_value=None)), \
                 mock.patch.object(issues, "changed_by_us", mock.AsyncMock(return_value=changed)), \
+                mock.patch.object(issues, "match_flipflop", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(issues.db, "fetchall", mock.AsyncMock(return_value=[])), \
                 as_spelled():
+            # (no registry: another unit is named by its folder)
             want = asyncio.run(desired.build_album(rows, res, plex_album=None, plex_artist=None,
                                                    overrides={}))
             want["genres"] = ["Pop"]
@@ -617,10 +620,14 @@ class SharedPlexAlbumTestCase(unittest.TestCase):
         self.assertEqual(plan["plex_shared"]["detail"]["rating_key"], "50")
 
     def test_the_same_albums_tracks_from_another_folder_are_not_another_album(self):
+        # nothing of another album's to put back, but an album holding another
+        # folder's tracks is no one folder's to match or tag until it is one
         plan = self.plan(self.rows, self.plex([{"path": "A/B (bonus)/2.flac", "album": "Celebrity",
-                                                "mb_releasegroupid": None}]))
-        self.assertIn("unmatched", plan)
-        self.assertNotIn("album", plan["genres"]["detail"])
+                                                "mb_releasegroupid": None}]), changed=True)
+        self.assertNotIn("plex_shared", plan)
+        self.assertNotIn("unmatched", plan)
+        self.assertEqual(plan["plex_foreign"]["detail"]["folders"], ["A/B (bonus)"])
+        self.assertIs(plan["genres"]["detail"]["album"], False)
 
     def test_a_stray_track_does_not_take_the_album_from_its_owner(self):
         from app.metadata.plexsync import shares_album
