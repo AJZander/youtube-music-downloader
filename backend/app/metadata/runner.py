@@ -572,7 +572,8 @@ class Runner:
             if moved:
                 return {"status": "gone", "moved_to": moved}
             await db.execute("DELETE FROM md_albums WHERE key = ?", (key,))
-            await issues.save([], scope_kinds=issues.UNIT_KINDS, album_key=key)
+            await issues.save([], scope_kinds=issues.UNIT_KINDS, album_key=key,
+                              close_as="superseded", reason="the album is gone")
             return {"status": "gone"}
         artist_dir = rows[0].get("artist_dir")
         record = await db.fetchone("SELECT * FROM md_albums WHERE key = ?", (key,))
@@ -583,7 +584,8 @@ class Runner:
                 (key, units.new_unit_id(), units.unit_folder(key), artist_dir))
             record = await db.fetchone("SELECT * FROM md_albums WHERE key = ?", (key,))
         if record["ignored"]:
-            await issues.save([], scope_kinds=issues.UNIT_KINDS, album_key=key)
+            await issues.save([], scope_kinds=issues.UNIT_KINDS, album_key=key,
+                              reason="the album is ignored")
             return {"status": "ignored"}
         plex_info = await plexsync.album_for_paths([r["path"] for r in rows])
         plex_album = (plex_info or {}).get("album")
@@ -660,7 +662,8 @@ class Runner:
                 "AND auto = 1", (key,))
             auto_ids = [r["id"] for r in rows_
                         if not (settling and r["kind"] in issues.SETTLING_KINDS)]
-        return {"status": res.status, "auto_ids": auto_ids, "issues": len(plan)}
+        return {"status": res.status, "auto_ids": auto_ids, "issues": len(plan),
+                "planned": [p["key"] for p in plan]}
 
     async def _check_artist(self, artist_dir: str) -> list[int]:
         albums = [json.loads(r["desired"]) for r in await db.fetchall(
@@ -748,11 +751,15 @@ class Runner:
             self.apply_note = f"{'accepting matches' if decision == 'accept_match' else 'marking not on MusicBrainz'} ({n:,} of {len(todo):,})"
             await self.publish()
             try:
-                follow += await self._decide_one(issue, decision)
-                await self._mark(issue, "applied")
+                ids, again = await self._decide_one(issue, decision)
+                follow += ids
+                # the album's check planned the same call again: it didn't settle it
+                state, error = ("failed", "still there after the decision") if again \
+                    else ("applied", None)
+                await self._mark(issue, state, error, ran=True)
             except Exception as exc:
                 log.info("%s for %s failed: %s", decision, issue["key"], exc)
-                await self._mark(issue, "failed", str(exc)[:300])
+                await self._mark(issue, "failed", str(exc)[:300], ran=True)
             if auto and len(follow) >= 200:
                 await self.request_apply(follow)
                 follow = []
@@ -760,7 +767,9 @@ class Runner:
             await self.request_apply(follow)
         await self.publish_issues()
 
-    async def _decide_one(self, issue: dict, decision: str) -> list[int]:
+    async def _decide_one(self, issue: dict, decision: str) -> tuple[list[int], bool]:
+        """(the album's fixes its check planned, whether it planned this
+        issue again)."""
         key = issue["album_key"]
         if decision == "accept_match":
             best = next((c for c in issue["detail"].get("candidates") or [] if c.get("selected")),
@@ -778,7 +787,7 @@ class Runner:
         bus.publish("library.changed", {"album_keys": [key], "unit_ids": [uid] if uid else [],
                                         "artist_dirs": [issue["artist_dir"]]
                                         if issue["artist_dir"] else []})
-        return result.get("auto_ids") or []
+        return result.get("auto_ids") or [], issue["key"] in (result.get("planned") or ())
 
     def _count(self, applied: int, failed: int) -> None:
         if self.run is not None:
@@ -934,12 +943,12 @@ class Runner:
                     await self.publish(force=True)
                     await apply.clean_ghosts(left)
                 for issue in ghosts:
-                    await self._mark(issue, "applied")
+                    await self._mark(issue, "applied", ran=True)
                 applied += len(ghosts)
             except Exception as exc:
                 log.info("clearing old Plex entries failed: %s", exc)
                 for issue in ghosts:
-                    await self._mark(issue, "failed", str(exc)[:300])
+                    await self._mark(issue, "failed", str(exc)[:300], ran=True)
                 failed += len(ghosts)
             await issues.save(await issues.plan_ghosts(), scope_kinds=("plex_ghost",),
                               all_scope=True)
@@ -954,9 +963,10 @@ class Runner:
         rows = await units.load_unit(key)
         if not rows or record is None:
             # moved or merged away (a singles-folder track filed into its
-            # album): nothing left to fix, so the fix closes, not fails
+            # album): nothing left to fix here, so the fix is superseded, not
+            # failed (the album where its files went plans its own)
             for issue in members:
-                await self._mark(issue, "applied", None)
+                await self._mark(issue, "superseded", "the album is no longer there")
             log.info("%s: the album is no longer there; closed %d fixes", key, len(members))
             return 0, 0, None
         want = (json.loads(record["desired"])
@@ -988,9 +998,19 @@ class Runner:
             self._apply_queue.append(still)
             self._apply_wake.set()
 
-    async def _mark(self, issue: dict, state: str, error: str | None = None) -> None:
+    async def _mark(self, issue: dict, state: str, error: str | None = None, *,
+                    ran: bool = False) -> None:
+        """`ran`: a fix of ours (or the user's decision) ran on it, whatever
+        came of it. It is counted and timed: found again by the check right
+        after, the issue is failed rather than open (issues._save)."""
+        now = utcnow()
+        if ran:
+            await db.execute("UPDATE md_issues SET state = ?, error = ?, updated_at = ?, "
+                             "applied_at = ?, attempts = attempts + 1 WHERE id = ?",
+                             (state, error, now, now, issue["id"]))
+            return
         await db.execute("UPDATE md_issues SET state = ?, error = ?, updated_at = ? WHERE id = ?",
-                         (state, error, utcnow(), issue["id"]))
+                         (state, error, now, issue["id"]))
 
     async def _apply_simple(self, members: list[dict], ctx: apply.Ctx,
                             executors: dict | None = None) -> tuple[int, int]:
@@ -1004,7 +1024,7 @@ class Runner:
                 continue
             try:
                 await executor(issue, ctx)
-                await self._mark(issue, "applied")
+                await self._mark(issue, "applied", ran=True)
                 applied += 1
             except apply.KeepOpen as note:
                 await db.execute("UPDATE md_issues SET state = 'open', updated_at = ? "
@@ -1018,7 +1038,7 @@ class Runner:
                 applied += 1
             except Exception as exc:
                 log.info("apply %s %s failed: %s", issue["kind"], issue["ref"], exc)
-                await self._mark(issue, "failed", str(exc)[:300])
+                await self._mark(issue, "failed", str(exc)[:300], ran=True)
                 failed += 1
         return applied, failed
 
@@ -1042,11 +1062,14 @@ class Runner:
             for issue in plex_stage:
                 if issue["id"] not in fresh_ids and issue["kind"] not in fresh_kinds \
                         and issue["album_key"] != ctx.key:
-                    await self._mark(issue, "applied")
+                    await self._mark(issue, "superseded",
+                                     f"not planned again after the album moved to {ctx.key}")
             applied, failed = await self._apply_simple(fresh, ctx, apply.PLEX_STAGE)
             for issue in plex_stage:
-                if issue["id"] not in fresh_ids and issue["album_key"] != ctx.key:
-                    await self._mark(issue, "applied")    # planned again, and applied, under the new key
+                if issue["id"] not in fresh_ids and issue["kind"] in fresh_kinds \
+                        and issue["album_key"] != ctx.key:
+                    # planned again, and applied, under the new key
+                    await self._mark(issue, "superseded", "planned again under the album's new key")
         result = await self._check_unit(ctx.key)
         # What the files' changes made due (a moved album's genres, tags of
         # tracks just filed in) follows now rather than at the next check —

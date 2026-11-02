@@ -111,6 +111,10 @@ class QueueOnceTestCase(DbTestCase):
         download, error = await self._download()
         self.assertEqual([a["job_id"] for a in download["attempts"]], [j1])
         self.assertTrue(error.startswith("already tried"))
+        # and it is in the Tried bucket (P1-A1)
+        state = (await self.db.fetchone("SELECT state FROM md_issues "
+                                        "WHERE key = 'missing_tracks:rel-1'"))["state"]
+        self.assertEqual(state, "tried")
 
     async def test_force_queues_them_again(self):
         j1 = await self._first_job({3: "skipped_duplicate", 4: "completed"})

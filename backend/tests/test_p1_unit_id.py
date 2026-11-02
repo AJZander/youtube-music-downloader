@@ -391,6 +391,7 @@ class DecisionsTestCase(UnitTestCase):
         with self.services():
             await self.check_all()
             keeper_unit = (await self.record(KEEP))["unit_id"]
+            orig_unit = (await self.record(ORIG))["unit_id"]
             merged = await self.merge()
             self.assertEqual(merged["state"], "applied", merged["error"])
             await self.rescan()
@@ -402,7 +403,8 @@ class DecisionsTestCase(UnitTestCase):
             self.assertTrue(await units.load_unit(ORIG))
             page = await views.album(ORIG)
             self.assertNotIn("redirect", page)
-            self.assertEqual((page["key"], page["unit_id"]), (ORIG, None))
+            # the undo made it its own album again, as it was (P1-A1)
+            self.assertEqual((page["key"], page["unit_id"]), (ORIG, orig_unit))
             checked = await routes.album_recheck(routes.KeyIn(key=ORIG))
         record = await self.record(ORIG)
         self.assertIsNotNone(record)

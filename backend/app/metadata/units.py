@@ -223,21 +223,29 @@ def _until(value: str | None) -> float:
         return 0.0
 
 
-async def merge_into(v_uid: str, k_uid: str, *, reason: str) -> None:
+async def merge_into(v_uid: str, k_uid: str, *, reason: str, batch: str | None = None) -> None:
     """Album v is album k now (its files went there): one record, holding
     the decisions of both that don't conflict. Every rule keeps files: what
     either side ignored or dismissed stays so, a pinned release goes with
     its files only to an album of its release group (or one not known to be
     any), and k's own overrides win. v leaves an alias, so a link to it
-    finds k. One transaction."""
+    finds k. What it folds is journalled (target 'unit'), in `batch` (the
+    moves that took v's files there, undone with them: unmerge), else in a
+    batch of its own. One transaction."""
     if not v_uid or not k_uid or v_uid == k_uid:
         return
     async with db.transaction():
-        await _merge_into(v_uid, k_uid, reason)
+        await _merge_into(v_uid, k_uid, reason, batch)
 
 
-async def _merge_into(v_uid: str, k_uid: str, reason: str) -> None:
-    from .apply import AUTO_PAUSED
+# what a merge decides of the album it keeps, and an undone merge puts back
+KEEPER_FIELDS = ("ignored", "manual", "release_mbid", "no_release")
+RECORD_FIELDS = ("key", "unit_id", "dirpath", "artist_dir", "album_tag", "release_mbid",
+                 "releasegroup_mbid", "manual", "no_release", "ignored")
+
+
+async def _merge_into(v_uid: str, k_uid: str, reason: str, batch: str | None) -> None:
+    from .apply import AUTO_PAUSED, journal
     from .issues import UNIT_KINDS
     v = await db.fetchone("SELECT * FROM md_albums WHERE unit_id = ?", (v_uid,))
     k = await db.fetchone("SELECT * FROM md_albums WHERE unit_id = ?", (k_uid,))
@@ -254,10 +262,17 @@ async def _merge_into(v_uid: str, k_uid: str, reason: str) -> None:
             manual, release, no_release = 1, v["release_mbid"], 0
     if not manual and v["no_release"]:
         no_release = 1
+    after = {"ignored": int(bool(k["ignored"] or v["ignored"])), "manual": manual,
+             "release_mbid": release, "no_release": no_release}
     await db.execute("UPDATE md_albums SET ignored = ?, manual = ?, release_mbid = ?, "
                      "no_release = ?, next_check = 0 WHERE unit_id = ?",
-                     (int(bool(k["ignored"] or v["ignored"])), manual, release, no_release, k_uid))
+                     (*(after[f] for f in KEEPER_FIELDS), k_uid))
     # overrides: k's field where both have one
+    overrides = [dict(r) for r in await db.fetchall(
+        "SELECT field, value, created_at FROM md_overrides WHERE entity = 'album' AND ref = ?",
+        (v_uid,))]
+    k_fields = {r["field"] for r in await db.fetchall(
+        "SELECT field FROM md_overrides WHERE entity = 'album' AND ref = ?", (k_uid,))}
     await db.execute("UPDATE OR IGNORE md_overrides SET ref = ? WHERE entity = 'album' AND ref = ?",
                      (k_uid, v_uid))
     await db.execute("DELETE FROM md_overrides WHERE entity = 'album' AND ref = ?", (v_uid,))
@@ -265,30 +280,40 @@ async def _merge_into(v_uid: str, k_uid: str, reason: str) -> None:
     paused = {r["key"]: r["value"] for r in await db.fetchall(
         "SELECT key, value FROM md_state WHERE key IN (?, ?)",
         (AUTO_PAUSED + v_uid, AUTO_PAUSED + k_uid))}
+    k_pause = paused.get(AUTO_PAUSED + k_uid)
+    k_pause_after = k_pause
     if AUTO_PAUSED + v_uid in paused:
         if _until(paused[AUTO_PAUSED + v_uid]) > _until(paused.get(AUTO_PAUSED + k_uid)):
+            k_pause_after = paused[AUTO_PAUSED + v_uid]
             await db.execute("INSERT INTO md_state (key, value) VALUES (?, ?) ON CONFLICT(key) "
                              "DO UPDATE SET value = excluded.value",
-                             (AUTO_PAUSED + k_uid, paused[AUTO_PAUSED + v_uid]))
+                             (AUTO_PAUSED + k_uid, k_pause_after))
         await db.execute("DELETE FROM md_state WHERE key = ?", (AUTO_PAUSED + v_uid,))
     # issues: v's become k's; where k has its own, a dismissal on either
-    # side stands and v's is closed
+    # side stands and v's is superseded
     await repoint(v["key"], k["key"], k["artist_dir"])
     now = utcnow()
-    of_unit = f"SELECT id, kind, state FROM md_issues WHERE key IN ({','.join('?' * len(UNIT_KINDS))})"
+    of_unit = (f"SELECT id, kind, key, state, error FROM md_issues "
+               f"WHERE key IN ({','.join('?' * len(UNIT_KINDS))})")
     mine = {r["kind"]: dict(r) for r in await db.fetchall(
         of_unit, tuple(f"{kind}:{k_uid}" for kind in UNIT_KINDS))}
+    v_issues, k_issues = [], []
     for r in await db.fetchall(of_unit, tuple(f"{kind}:{v_uid}" for kind in UNIT_KINDS)):
         theirs = mine.get(r["kind"])
+        v_issues.append({**dict(r), "fate": "rekeyed" if theirs is None else "superseded"})
         if theirs is None:
             await db.execute("UPDATE md_issues SET key = ?, ref = ? WHERE id = ?",
                              (f"{r['kind']}:{k_uid}", k_uid, r["id"]))
             continue
         if r["state"] == "dismissed" and theirs["state"] != "dismissed":
+            k_issues.append({"id": theirs["id"], "before": theirs["state"],
+                             "error": theirs["error"]})
             await db.execute("UPDATE md_issues SET state = 'dismissed', updated_at = ? "
                              "WHERE id = ?", (now, theirs["id"]))
-        await db.execute("UPDATE md_issues SET state = 'applied', error = ?, updated_at = ? "
+        await db.execute("UPDATE md_issues SET state = 'superseded', error = ?, updated_at = ? "
                          "WHERE id = ?", (f"merged into {k['key']}", now, r["id"]))
+    aliased = [r["unit_id"] for r in await db.fetchall(
+        "SELECT unit_id FROM md_unit_aliases WHERE successor = ?", (v_uid,))]
     await db.execute(
         "INSERT INTO md_unit_aliases (unit_id, successor, old_key, reason, created_at) "
         "VALUES (?,?,?,?,?) ON CONFLICT(unit_id) DO UPDATE SET successor = excluded.successor, "
@@ -297,6 +322,117 @@ async def _merge_into(v_uid: str, k_uid: str, reason: str) -> None:
     await db.execute("UPDATE md_unit_aliases SET successor = ? WHERE successor = ?", (k_uid, v_uid))
     await db.execute("UPDATE library_index SET unit_id = ? WHERE unit_id = ?", (k_uid, v_uid))
     await db.execute("DELETE FROM md_albums WHERE unit_id = ?", (v_uid,))
+    # what it took, for an undo of the moves that made it (unmerge). The
+    # batch's moves may rename its album keys and summary afterwards: all
+    # of it is in the values.
+    before = {f: k[f] for f in KEEPER_FIELDS}
+    old = {"record": {f: v[f] for f in RECORD_FIELDS}, "overrides": overrides,
+           "pause": paused.get(AUTO_PAUSED + v_uid), "issues": v_issues, "aliases": aliased,
+           "reason": reason,
+           "keeper": {"before": before, "after": after,
+                      "overrides": [o["field"] for o in overrides if o["field"] not in k_fields],
+                      "pause": {"before": k_pause, "after": k_pause_after},
+                      "issues": k_issues}}
+    await journal(batch or new_unit_id()[:12], "unit", v_uid, "merge", old,
+                  {"into": k_uid, "key": k["key"]},
+                  None if batch else f"Merged {v['key']} into {k['key']}",
+                  artist_dir=k["artist_dir"], album_key=k["key"])
+
+
+async def unmerge(change: dict) -> list[str]:
+    """Undo one merge_into (its journal row), once the undo of its batch has
+    put v's files back at v's key: v is its own album again, with its own
+    unit id, its decisions, overrides, pause and issues; k gets back what
+    the merge changed of its own, where nothing has changed it since.
+    Returns the keys of both. One transaction; raises (and changes
+    nothing) if v's files aren't back."""
+    async with db.transaction():
+        return await _unmerge(change)
+
+
+async def _unmerge(change: dict) -> list[str]:
+    from .apply import AUTO_PAUSED
+    old, new = json.loads(change["old_value"]), json.loads(change["new_value"])
+    v, keeper = old["record"], old["keeper"]
+    v_uid, k_uid, now = v["unit_id"], new["into"], utcnow()
+    rows = await load_unit(v["key"])
+    if not rows:
+        raise ValueError(f"{v['key']} holds none of its files again")
+    there = await db.fetchone("SELECT unit_id FROM md_albums WHERE key = ?", (v["key"],))
+    if there is None:
+        await db.execute(
+            "INSERT INTO md_albums (key, unit_id, dirpath, artist_dir, album_tag, release_mbid, "
+            "releasegroup_mbid, manual, no_release, ignored, next_check) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,0)", tuple(v[f] for f in RECORD_FIELDS))
+    elif there["unit_id"] != v_uid:
+        # the undo's own record (the registry or a check numbered the files
+        # meanwhile) becomes the album's
+        made = there["unit_id"]
+        await db.execute("UPDATE md_albums SET unit_id = ?, manual = ?, release_mbid = ?, "
+                         "no_release = ?, ignored = ?, next_check = 0 WHERE key = ?",
+                         (v_uid, v["manual"], v["release_mbid"], v["no_release"], v["ignored"],
+                          v["key"]))
+        await db.execute("UPDATE OR IGNORE md_issues SET key = substr(key, 1, length(key) - ?) "
+                         "|| ?, ref = ? WHERE ref = ?", (len(made), v_uid, v_uid, made))
+        await db.execute("UPDATE OR IGNORE md_overrides SET ref = ? WHERE entity = 'album' "
+                         "AND ref = ?", (v_uid, made))
+    await db.executemany("UPDATE library_index SET unit_id = ? WHERE path = ?",
+                         [(v_uid, r["path"]) for r in rows])
+    await db.execute("DELETE FROM md_unit_aliases WHERE unit_id = ?", (v_uid,))
+    for uid in old.get("aliases") or []:
+        await db.execute("UPDATE md_unit_aliases SET successor = ? WHERE unit_id = ? "
+                         "AND successor = ?", (v_uid, uid, k_uid))
+    # v's own again; what k took of them, where k still has it as taken
+    taken = set(keeper.get("overrides") or ())
+    for o in old.get("overrides") or []:
+        if o["field"] in taken:
+            await db.execute("DELETE FROM md_overrides WHERE entity = 'album' AND ref = ? "
+                             "AND field = ? AND value = ?", (k_uid, o["field"], o["value"]))
+        await db.execute("INSERT OR IGNORE INTO md_overrides (entity, ref, field, value, "
+                         "created_at) VALUES ('album', ?, ?, ?, ?)",
+                         (v_uid, o["field"], o["value"], o["created_at"]))
+    if old.get("pause"):
+        await db.execute("INSERT OR IGNORE INTO md_state (key, value) VALUES (?, ?)",
+                         (AUTO_PAUSED + v_uid, old["pause"]))
+    pause = keeper.get("pause") or {}
+    if pause.get("after") != pause.get("before"):
+        if pause.get("before") is None:
+            await db.execute("DELETE FROM md_state WHERE key = ? AND value = ?",
+                             (AUTO_PAUSED + k_uid, pause["after"]))
+        else:
+            await db.execute("UPDATE md_state SET value = ? WHERE key = ? AND value = ?",
+                             (pause["before"], AUTO_PAUSED + k_uid, pause["after"]))
+    # v's issues: back under its id, as they were (one queued then is asked
+    # for again)
+    for i in old.get("issues") or []:
+        state = "open" if i["state"] == "queued" else i["state"]
+        if i["fate"] == "rekeyed":
+            where, params = "id = ? AND key = ?", (i["id"], f"{i['kind']}:{k_uid}")
+        else:
+            where, params = "id = ? AND state = 'superseded'", (i["id"],)
+        await db.execute(f"UPDATE OR IGNORE md_issues SET key = ?, ref = ?, album_key = ?, "
+                         f"artist_dir = ?, state = ?, error = ?, updated_at = ? WHERE {where}",
+                         (i["key"], v_uid, v["key"], v["artist_dir"], state, i["error"], now,
+                          *params))
+        if await db.fetchone("SELECT 1 FROM md_issues WHERE id = ? AND key = ?",
+                             (i["id"], i["key"])):
+            await db.execute("DELETE FROM md_issue_refs WHERE issue_id = ?", (i["id"],))
+            await db.execute("INSERT INTO md_issue_refs (issue_id, artist_dir, album_key) "
+                             "VALUES (?,?,?)", (i["id"], v["artist_dir"], v["key"]))
+    for i in keeper.get("issues") or []:
+        await db.execute("UPDATE md_issues SET state = ?, error = ?, updated_at = ? "
+                         "WHERE id = ? AND state = 'dismissed'",
+                         (i["before"], i.get("error"), now, i["id"]))
+    # k's record, where it still holds what the merge made it: a pin, an
+    # ignore or a "not on MusicBrainz" set since is the user's
+    k = await db.fetchone("SELECT * FROM md_albums WHERE unit_id = ?", (k_uid,))
+    after, before = keeper["after"], keeper["before"]
+    if k is not None and after != before and all(k[f] == after[f] for f in KEEPER_FIELDS):
+        await db.execute("UPDATE md_albums SET ignored = ?, manual = ?, release_mbid = ?, "
+                         "no_release = ?, next_check = 0 WHERE unit_id = ?",
+                         (*(before[f] for f in KEEPER_FIELDS), k_uid))
+    await db.execute("UPDATE md_changes SET reverted_at = ? WHERE id = ?", (now, change["id"]))
+    return [v["key"]] + ([k["key"]] if k is not None else [])
 
 
 async def follow(key: str) -> str | None:
@@ -417,21 +553,23 @@ async def _sync(units: dict[str, list[dict]]) -> dict:
             f"UPDATE md_albums SET next_check = 0 WHERE key IN ({','.join('?' * len(chunk))})",
             tuple(chunk))
     gone = [k for k in gone if k not in followed]
+    now = utcnow()
     for i in range(0, len(gone), 400):
         chunk = gone[i:i + 400]
         marks = ','.join('?' * len(chunk))
         await db.execute(f"DELETE FROM md_albums WHERE key IN ({marks})", tuple(chunk))
         await db.execute(
-            f"UPDATE md_issues SET state = 'applied', error = NULL, updated_at = datetime('now') "
-            f"WHERE state IN ('open', 'queued', 'failed') AND album_key IN ({marks}) "
-            f"AND kind NOT IN ('dup_album', 'dup_track', 'split_artist')", tuple(chunk))
+            f"UPDATE md_issues SET state = 'superseded', error = 'the album is gone', "
+            f"updated_at = ? WHERE state IN ('open', 'queued', 'failed', 'tried') "
+            f"AND album_key IN ({marks}) "
+            f"AND kind NOT IN ('dup_album', 'dup_track', 'split_artist')", (now, *chunk))
     # an album's issues outlive it when it moves mid-apply under a new key
     from .issues import UNIT_KINDS
     await db.execute(
-        f"UPDATE md_issues SET state = 'applied', error = NULL, updated_at = datetime('now') "
-        f"WHERE state IN ('open', 'queued', 'failed') AND album_key IS NOT NULL "
+        f"UPDATE md_issues SET state = 'superseded', error = 'the album is no longer there', "
+        f"updated_at = ? WHERE state IN ('open', 'queued', 'failed') AND album_key IS NOT NULL "
         f"AND kind IN ({','.join('?' * len(UNIT_KINDS))}) "
-        f"AND album_key NOT IN (SELECT key FROM md_albums)", UNIT_KINDS)
+        f"AND album_key NOT IN (SELECT key FROM md_albums)", (now, *UNIT_KINDS))
     # each file carries the unit it is in, for the pass that finds it moved
     restamp = [(ids[key], r["path"]) for key, rows in units.items() if ids.get(key)
                for r in rows if stamps.get(r["path"]) != ids[key]]

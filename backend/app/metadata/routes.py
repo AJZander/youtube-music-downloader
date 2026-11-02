@@ -251,8 +251,10 @@ async def attention(artist_dir: str | None = None):
 
 
 ISSUE_STATES = {"open": views.OPEN_STATES,
-                "all": ("open", "failed", "queued", "applied", "dismissed"),
-                "dismissed": ("dismissed",), "applied": ("applied",), "failed": ("failed",)}
+                "all": ("open", "failed", "queued", "tried", "applied", "dismissed", "superseded",
+                        "cleared"),
+                "dismissed": ("dismissed",), "applied": ("applied",), "failed": ("failed",),
+                "tried": ("tried",), "superseded": ("superseded",), "cleared": ("cleared",)}
 
 
 @router.get("/issues")
@@ -379,18 +381,22 @@ async def revert_batch(batch_id: str):
     rows = await db.fetchall("SELECT DISTINCT album_key, artist_dir FROM md_changes "
                              "WHERE batch_id = ?", (batch_id,))
     result = await revert(batch_id)
+    # the batch's albums, and those an undone merge made their own again
+    # (the batch names only the album they had joined)
+    keys = list(dict.fromkeys([r["album_key"] for r in rows if r["album_key"]]
+                              + (result.get("restored_keys") or [])))
     unit_ids = []
-    for r in rows:
-        if r["album_key"]:
-            try:
-                await runner.check_unit(r["album_key"])
-            except Exception:
-                log.info("re-check after undo failed for %s", r["album_key"])
-            unit_ids.append(await units.unit_id_of(r["album_key"]))
+    for key in keys:
+        try:
+            await runner.check_unit(key)
+        except Exception:
+            log.info("re-check after undo failed for %s", key)
+        unit_ids.append(await units.unit_id_of(key))
     from ..events import bus
-    bus.publish("library.changed", {"album_keys": [r["album_key"] for r in rows if r["album_key"]],
-                                    "unit_ids": [u for u in unit_ids if u],
-                                    "artist_dirs": [r["artist_dir"] for r in rows if r["artist_dir"]]})
+    bus.publish("library.changed", {"album_keys": keys, "unit_ids": [u for u in unit_ids if u],
+                                    "artist_dirs": list(dict.fromkeys(
+                                        [r["artist_dir"] for r in rows if r["artist_dir"]]
+                                        + [k.split("/", 1)[0] for k in keys]))})
     return result
 
 

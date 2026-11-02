@@ -20,6 +20,7 @@ before it starts."""
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import stat
 from collections import Counter, defaultdict
@@ -57,8 +58,8 @@ async def bump() -> None:
                      "DO UPDATE SET value = CAST(value AS INTEGER) + 1", (GENERATION,))
 
 
-async def relocate(pairs, *, units: dict[str, str] | None = None,
-                   reread: bool = False) -> dict[str, str | None]:
+async def relocate(pairs, *, units: dict[str, str] | None = None, reread: bool = False,
+                   batch: str | None = None) -> dict[str, str | None]:
     """These files moved (old -> new library paths): everything that names
     them, or a folder they left, names where they are now.
 
@@ -73,6 +74,9 @@ async def relocate(pairs, *, units: dict[str, str] | None = None,
     `units`: albums the mover moved whole, {old key: new key}; their records
     follow them even from a folder that still holds other files. `reread`:
     the moved files' tags changed just before they moved; read them now.
+    `batch`: the journal batch of the moves, where an album merged into
+    another is journalled, to be undone with them; by default the batch
+    that journalled them (every mover journals before it calls this).
     Returns {old key: unit id} for each album record that moved."""
     pairs = [(old, new) for old, new in dict(pairs).items() if old != new]
     units = units or {}
@@ -80,6 +84,8 @@ async def relocate(pairs, *, units: dict[str, str] | None = None,
         return {}
     read = await read_files([new for _, new in pairs]) if pairs and reread else []
     async with db.transaction():
+        if batch is None:
+            batch = await _move_batch(pairs)
         if pairs:
             # a row already at a new path is for a file that wasn't there (the
             # move found the name free): it gives way
@@ -92,9 +98,27 @@ async def relocate(pairs, *, units: dict[str, str] | None = None,
             await _follow_tracks(pairs)
             for old, new in pairs:
                 await rekey_exclusions("track", old, new)
-        moved = await _follow_folders(pairs, units)
+        moved = await _follow_folders(pairs, units, batch)
         await bump()
     return moved
+
+
+# the journal batch a move is in, by name, so a test can ask SQLite how it
+# is answered (idx_changes_target_ref: db v14). Any field: a song is a
+# 'file', a booklet or a cover an artist merge moved a 'leftover'.
+MOVE_BATCH = ("SELECT batch_id FROM md_changes WHERE target = 'move' AND ref = ? "
+              "AND new_value = ? AND reverted_at IS NULL ORDER BY id DESC LIMIT 1")
+
+
+async def _move_batch(pairs: list[tuple[str, str]]) -> str | None:
+    """The batch that journalled these moves: the first of them the
+    journal has (an artist merge also passes index rows of files that were
+    no longer there, which it never journalled)."""
+    for old, new in pairs:
+        row = await db.fetchone(MOVE_BATCH, (old, json.dumps(new)))
+        if row:
+            return row["batch_id"]
+    return None
 
 
 async def _follow_tracks(pairs: list[tuple[str, str]]) -> None:
@@ -169,7 +193,8 @@ async def _landing(key: str, unit_id: str | None,
     return (best[0] if best[1] else None), pool
 
 
-async def _follow_folders(pairs: list[tuple[str, str]], moving: dict[str, str]) -> dict:
+async def _follow_folders(pairs: list[tuple[str, str]], moving: dict[str, str],
+                          batch: str | None = None) -> dict:
     from .metadata import apply, units
     # each folder files left, and the album folder above a disc subfolder:
     # where most of their files went
@@ -187,7 +212,8 @@ async def _follow_folders(pairs: list[tuple[str, str]], moving: dict[str, str]) 
     moved: dict[str, str | None] = {}
     for old_key, new_key in moving.items():
         paths = landed.get(units.unit_folder(old_key)) or [new for _, new in pairs]
-        moved[old_key] = await apply.rekey_unit(old_key, new_key, _artist(new_key), paths)
+        moved[old_key] = await apply.rekey_unit(old_key, new_key, _artist(new_key), paths,
+                                                batch=batch)
     emptied: dict[str, str] = {}
     for folder, counter in sorted(votes.items()):
         to = max(sorted(counter.items()), key=lambda kv: kv[1])[0]
@@ -201,7 +227,8 @@ async def _follow_folders(pairs: list[tuple[str, str]], moving: dict[str, str]) 
                 continue
             target, pool = await _landing(r["key"], r["unit_id"], landed.get(folder) or [])
             if target and target != r["key"]:
-                moved[r["key"]] = await apply.rekey_unit(r["key"], target, _artist(target), pool)
+                moved[r["key"]] = await apply.rekey_unit(r["key"], target, _artist(target), pool,
+                                                          batch=batch)
         await rekey_exclusions("album", folder, to)
         await units.repoint(folder, to, _artist(to))
         await _follow_state(folder, to)

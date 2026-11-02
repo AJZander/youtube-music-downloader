@@ -557,9 +557,10 @@ class ArtistMergeTestCase(RelocateTestCase):
                          ["albumartist"], ["New"])
         changes = await self.db.fetchall(
             "SELECT target, field FROM md_changes WHERE batch_id = ?", (result["batch_id"],))
+        # ("unit", "merge"): Old's album record folded into New's, undone with the rest
         self.assertEqual({(r["target"], r["field"]) for r in changes},
                          {("move", "file"), ("move", "leftover"), ("trash", "files"),
-                          ("file", "tags")})
+                          ("file", "tags"), ("unit", "merge")})
         undone = await apply.revert(result["batch_id"])
         self.assertFalse(undone["failures"], undone)
         after = {str(p.relative_to(self.lib)): tagio.read(p)["fields"]

@@ -1244,10 +1244,11 @@ class LibraryAwareTestCase(unittest.IsolatedAsyncioTestCase):
             "error, created_at, updated_at) VALUES ('f', 'move', 'album', 'A/Singles|x', "
             "'A/Singles|x', 'info', 'x', 'failed', 'the album is no longer there', '', '')")
         await units.sync_registry()
-        row = await self.db.fetchone("SELECT state FROM md_issues WHERE key = 'g'")
-        self.assertEqual(row["state"], "applied")
+        # superseded, saying why: no fix of ours ran (review 2026-11, P1-A1)
+        row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 'g'")
+        self.assertEqual((row["state"], row["error"]), ("superseded", "the album is no longer there"))
         row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 'f'")
-        self.assertEqual((row["state"], row["error"]), ("applied", None))
+        self.assertEqual((row["state"], row["error"]), ("superseded", "the album is no longer there"))
 
     async def test_a_fix_for_an_album_that_is_gone_closes_rather_than_fails(self):
         from app.metadata import runner as runmod
@@ -1259,7 +1260,7 @@ class LibraryAwareTestCase(unittest.IsolatedAsyncioTestCase):
         issue = dict(await self.db.fetchone("SELECT * FROM md_issues WHERE key = 't'"))
         self.assertEqual(await r._start_album("A/Singles|x", [issue]), (0, 0, None))
         row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 't'")
-        self.assertEqual((row["state"], row["error"]), ("applied", None))
+        self.assertEqual((row["state"], row["error"]), ("superseded", "the album is no longer there"))
 
     async def named(self, credited, listed, aliases=()):
         rel = release(artist=credited)

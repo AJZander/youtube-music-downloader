@@ -2,9 +2,15 @@
 every judgement the user has to make.
 
 An issue has a stable key (kind + what it is about), so a re-check updates
-it in place instead of piling up copies; a problem that goes away is closed
-as `applied`; one the user dismissed stays dismissed ("not a problem" is a
-decision, like the duplicate exclusions).
+it in place instead of piling up copies; one the user dismissed stays
+dismissed ("not a problem" is a decision, like the duplicate exclusions).
+
+Its state says what happened to it: `open` (to do), `queued` (a fix is
+about to run), `applied` (a fix of ours ran), `failed` (it ran and failed,
+or the issue was still there right after it), `tried` (Download missing
+fetched what it could; the rest isn't there to fetch), `dismissed` (the
+user's call), `superseded` (the album moved, merged into another or went
+away) and `cleared` (no longer found, with no fix of ours behind it).
 """
 from __future__ import annotations
 
@@ -178,23 +184,70 @@ def unchanged(key: str) -> dict:
 
 async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: str | None = None,
                artist_dir: str | None = None, all_scope: bool = False,
-               close_others: bool = True) -> None:
+               close_others: bool = True, close_as: str = "cleared",
+               reason: str | None = "no longer found") -> None:
     """Upsert `items` and close every other open issue of `scope_kinds` in the
-    same scope (this album, this artist, or everywhere). All of it, or (on
-    an error) none: one transaction."""
+    same scope (this album, this artist, or everywhere), as `close_as`
+    (`superseded`, with the reason, when the album itself is gone). All of
+    it, or (on an error) none: one transaction."""
     async with db.transaction():
-        await _save(items, scope_kinds, album_key, artist_dir, all_scope, close_others)
+        await _save(items, scope_kinds, album_key, artist_dir, all_scope, close_others,
+                    close_as, reason)
+
+
+# A fix of ours found again as it was within this long of running didn't
+# stick: the issue is failed, and auto-apply leaves it for the user. Found
+# later, or with something new in it, it is a new problem.
+REOPEN_WINDOW = 24 * 3600
+STILL_THERE = "still there after the fix"
+
+
+def _missing(detail: str | None) -> set[str]:
+    try:
+        tracks = (json.loads(detail) if detail else {}).get("missing") or []
+    except (TypeError, ValueError, AttributeError):
+        return set()
+    return {t.get("releasetrack_mbid") or t.get("title") or "" for t in tracks}
+
+
+def _same_problem(existing, detail: str) -> bool:
+    """Whether an issue planned again is what its fix was for: the same
+    detail, or (missing tracks) nothing missing that wasn't then. A new
+    file in the album (a Download missing's) plans a fix of its own."""
+    if existing["detail"] == detail:
+        return True
+    return existing["kind"] == "missing_tracks" and _missing(detail) <= _missing(existing["detail"])
+
+
+def _replanned(existing, detail: str) -> tuple[str, str | None]:
+    """The state (and error) of an issue planned again. Dismissed stays
+    dismissed; queued stays queued (it is about to run); failed stays
+    failed while the fix planned is the same one, so auto-apply doesn't
+    retry it every pass (Apply still does); a fix of ours that ran lately
+    and is planned again as it was didn't stick, and fails; the Tried
+    bucket keeps what is still all it was. Anything else is open."""
+    state, error = existing["state"], existing["error"]
+    if state in ("dismissed", "queued") or (state == "failed" and existing["detail"] == detail):
+        return state, error
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - REOPEN_WINDOW))
+    if state == "applied" and existing["applied_at"] and existing["applied_at"] >= since \
+            and _same_problem(existing, detail):
+        return "failed", STILL_THERE
+    if state == "tried" and _missing(detail) <= _missing(existing["detail"]):
+        return state, error
+    return "open", None
 
 
 async def _save(items: list[dict], scope_kinds: tuple[str, ...], album_key: str | None,
-                artist_dir: str | None, all_scope: bool, close_others: bool) -> None:
+                artist_dir: str | None, all_scope: bool, close_others: bool,
+                close_as: str, reason: str | None) -> None:
     now = utcnow()
     keys = {i["key"] for i in items}
     for item in items:
         if item.get("unchanged"):
             continue
-        existing = await db.fetchone("SELECT id, state, detail FROM md_issues WHERE key = ?",
-                                     (item["key"],))
+        existing = await db.fetchone("SELECT id, kind, state, detail, error, applied_at "
+                                     "FROM md_issues WHERE key = ?", (item["key"],))
         detail = json.dumps(item["detail"], default=str)
         if existing is None:
             await db.execute(
@@ -208,23 +261,14 @@ async def _save(items: list[dict], scope_kinds: tuple[str, ...], album_key: str 
             issue_id = row["id"]
         else:
             issue_id = existing["id"]
-            # dismissed stays dismissed; queued stays queued (it is about to
-            # run); failed stays failed while the fix planned is the same one,
-            # so auto-apply doesn't retry it every pass (Apply still does)
-            state = existing["state"]
-            if state in ("dismissed", "queued") or (state == "failed"
-                                                    and existing["detail"] == detail):
-                new_state = state
-            else:
-                new_state = "open"
+            new_state, error = _replanned(existing, detail)
             await db.execute(
                 "UPDATE md_issues SET entity = ?, ref = ?, artist_dir = ?, album_key = ?, "
-                "severity = ?, summary = ?, detail = ?, auto = ?, state = ?, "
-                "error = CASE WHEN ? = 'open' THEN NULL ELSE error END, updated_at = ? "
-                "WHERE id = ?",
+                "severity = ?, summary = ?, detail = ?, auto = ?, state = ?, error = ?, "
+                "updated_at = ? WHERE id = ?",
                 (item["entity"], item["ref"], item["artist_dir"], item["album_key"],
                  item["severity"], item["summary"], detail, int(item["auto"]), new_state,
-                 new_state, now, issue_id))
+                 error, now, issue_id))
         await db.execute("DELETE FROM md_issue_refs WHERE issue_id = ?", (issue_id,))
         refs = item["refs"] or [(item["artist_dir"], item["album_key"])]
         await db.executemany(
@@ -234,7 +278,7 @@ async def _save(items: list[dict], scope_kinds: tuple[str, ...], album_key: str 
         return
     # close what is no longer a problem
     marks = ",".join("?" * len(scope_kinds))
-    where = f"state IN ('open', 'failed') AND kind IN ({marks})"
+    where = f"state IN ('open', 'failed', 'tried') AND kind IN ({marks})"
     params: list = list(scope_kinds)
     if not all_scope:
         if album_key is not None:
@@ -248,8 +292,8 @@ async def _save(items: list[dict], scope_kinds: tuple[str, ...], album_key: str 
     for i in range(0, len(stale), 400):
         chunk = stale[i:i + 400]
         await db.execute(
-            f"UPDATE md_issues SET state = 'applied', updated_at = ? "
-            f"WHERE id IN ({','.join('?' * len(chunk))})", (now, *chunk))
+            f"UPDATE md_issues SET state = ?, error = ?, updated_at = ? "
+            f"WHERE id IN ({','.join('?' * len(chunk))})", (close_as, reason, now, *chunk))
 
 
 # ------------------------------------------------------------------ comparing

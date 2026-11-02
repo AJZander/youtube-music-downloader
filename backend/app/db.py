@@ -546,6 +546,37 @@ MIGRATIONS: list = [
     CREATE INDEX IF NOT EXISTS idx_changes_target_ref ON md_changes(target, ref, field);
     CREATE INDEX IF NOT EXISTS idx_changes_target_field_at ON md_changes(target, field, applied_at);
     """,
+    # v15 — issue states that say what happened. attempts: how many times a
+    # fix of ours ran on the issue; applied_at: when one last did, so the
+    # check after it can tell a fix that didn't stick (failed) from a new
+    # problem (open). Rows from before keep NULL: nothing is made up for
+    # them. md_issue_events: every change of state, written by the triggers
+    # (whoever writes it), so "came back within 24 h" can be counted.
+    """
+    ALTER TABLE md_issues ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE md_issues ADD COLUMN applied_at TEXT;
+    CREATE TABLE md_issue_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      issue_id INTEGER NOT NULL,
+      at TEXT NOT NULL,
+      from_state TEXT,
+      to_state TEXT NOT NULL,
+      reason TEXT
+    );
+    CREATE INDEX idx_issue_events_issue ON md_issue_events(issue_id, id);
+    CREATE INDEX idx_issue_events_to ON md_issue_events(to_state, at);
+    CREATE TRIGGER md_issues_event_insert AFTER INSERT ON md_issues
+    BEGIN
+      INSERT INTO md_issue_events (issue_id, at, from_state, to_state, reason)
+      VALUES (NEW.id, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), NULL, NEW.state, NEW.error);
+    END;
+    CREATE TRIGGER md_issues_event_state AFTER UPDATE OF state ON md_issues
+      FOR EACH ROW WHEN OLD.state IS NOT NEW.state
+    BEGIN
+      INSERT INTO md_issue_events (issue_id, at, from_state, to_state, reason)
+      VALUES (NEW.id, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), OLD.state, NEW.state, NEW.error);
+    END;
+    """,
 ]
 
 

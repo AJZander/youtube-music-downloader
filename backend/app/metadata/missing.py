@@ -137,9 +137,18 @@ async def refresh(release_mbid: str | None) -> None:
     # a few songs of a bigger album aren't an album with gaps — unless
     # someone asked for the rest
     if not info or not info["missing"] or (info["partial"] and not download):
-        if existing and existing["state"] in ("open", "failed", "queued"):
-            await db.execute("UPDATE md_issues SET state = 'applied', updated_at = ? WHERE id = ?",
-                             (utcnow(), existing["id"]))
+        if existing and existing["state"] in ("open", "failed", "queued", "tried"):
+            # filled by a download of ours (counted and timed, as
+            # runner._mark does: found again within the day, the same gap is
+            # failed, not open), or no longer missing by itself
+            now = utcnow()
+            if (download or {}).get("attempts") or (download or {}).get("job_id"):
+                await db.execute("UPDATE md_issues SET state = 'applied', error = NULL, "
+                                 "updated_at = ?, applied_at = ?, attempts = attempts + 1 "
+                                 "WHERE id = ?", (now, now, existing["id"]))
+            else:
+                await db.execute("UPDATE md_issues SET state = 'cleared', error = NULL, "
+                                 "updated_at = ? WHERE id = ?", (now, existing["id"]))
         return
     if download and not await _job_active(download.get("job_id")):
         download = {**download, "active": False}
@@ -428,9 +437,13 @@ async def queue_download(release_mbid: str, skip_videos: set[str] | frozenset = 
                             "attempts": attempts,
                             "active": await _job_active(before.get("job_id"))}
                 detail["download"] = download
+                # the Tried bucket: never queued again by itself (request_apply
+                # and wanted_downloads take open and failed), until Retry or
+                # a new gap (issues._replanned); a dismissal stands
                 await db.execute(
-                    "UPDATE md_issues SET detail = ?, summary = ?, error = ?, updated_at = ? "
-                    "WHERE id = ?",
+                    "UPDATE md_issues SET detail = ?, summary = ?, error = ?, updated_at = ?, "
+                    "state = CASE WHEN state IN ('open', 'failed', 'queued') THEN 'tried' "
+                    "ELSE state END WHERE id = ?",
                     (json.dumps(detail), _summary(info, download),
                      f"already tried: {already} track{'s were' if already != 1 else ' was'} "
                      f"downloaded or skipped by an earlier download; Retry from the album "

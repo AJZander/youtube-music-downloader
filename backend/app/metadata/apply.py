@@ -35,7 +35,7 @@ from .issues import (FLIPFLOP_WINDOW, MERGE_KEEPER, OSCILLATION_WINDOW, SHARED_F
                      junk_fix_fields, match_flipflop, same_file)
 from .plexsync import jlist
 from .desired import album_tags_of, plain as plain_title, track_tags
-from .units import folder_of, unit_folder
+from .units import folder_of, unit_folder, unit_id_of
 from ..paths import PathBuildError, build_track_relpath
 
 log = logging.getLogger("mdl.apply")
@@ -149,13 +149,14 @@ async def rekey_folder(old: str, new: str) -> None:
     await relocate.rekey_exclusions("album", old, new)
 
 
-async def rekey_unit(old_key: str, new_key: str, artist_dir: str, paths=()) -> str | None:
+async def rekey_unit(old_key: str, new_key: str, artist_dir: str, paths=(), *,
+                     batch: str | None = None) -> str | None:
     """The album moved from old_key to new_key, with these files (their new
     paths): its record and its issues follow it, or, where an album is
     already at new_key (another disc of it, the copy it merged into), it
-    becomes that one, decisions and all (units.merge_into). Its issues keep
-    their ids: the re-check updates them in place. Returns the unit id the
-    album has now. One transaction."""
+    becomes that one, decisions and all (units.merge_into, journalled in
+    `batch`, the moves'). Its issues keep their ids: the re-check updates
+    them in place. Returns the unit id the album has now. One transaction."""
     from . import units
     async with db.transaction():
         uid = await units.unit_id_of(old_key)
@@ -165,7 +166,7 @@ async def rekey_unit(old_key: str, new_key: str, artist_dir: str, paths=()) -> s
                 # the moved files are the mover's until the merge makes them
                 # that album's (so they don't count as what it already was)
                 await units.stamp(uid, paths)
-                await units.merge_into(uid, there, reason=f"moved into {new_key}")
+                await units.merge_into(uid, there, reason=f"moved into {new_key}", batch=batch)
                 uid = there
             elif uid:
                 await units.rekey(old_key, new_key, artist_dir=artist_dir)
@@ -467,7 +468,9 @@ async def refuse_oscillation(ctx: Ctx, moves: list[dict]) -> None:
     """Refuse moves that would send files back and forth once more (see
     oscillation) before anything is tagged, trashed or moved, and pause the
     album's auto-apply for the window: what keeps undoing a fix is for the
-    user to look at."""
+    user to look at. An Apply asked for by hand is refused the same way,
+    until the back-and-forth is older than the window or one of its moves
+    is undone."""
     found = await oscillation(moves)
     if found is None:
         return
@@ -479,8 +482,9 @@ async def refuse_oscillation(ctx: Ctx, moves: list[dict]) -> None:
                      (AUTO_PAUSED + unit_id,
                       json.dumps({"until": time.time() + OSCILLATION_WINDOW, "reason": reason})))
     log.warning("%s: %s; nothing moved, and its fixes wait for the user", ctx.key, reason)
-    raise ApplyError(f"{reason}: nothing was moved, and this album's fixes are not applied "
-                     f"automatically for {OSCILLATION_WINDOW // 86400} days")
+    raise ApplyError(f"{reason}: nothing was moved. Moves of these files are refused, "
+                     f"automatic or applied by hand, while the back-and-forth is within "
+                     f"{OSCILLATION_WINDOW // 86400} days; undo one of the moves to lift it sooner")
 
 
 @settles
@@ -914,12 +918,13 @@ async def do_album_copies(issue: dict, ctx: Ctx) -> str:
                 log.info("could not merge %s into %s: %s", m["from"], folder, exc)
                 continue
             done.append((m["from"], m["to"]))
-            # its row moves, then learns its new tags; a copy's folder left
-            # empty hands its record on to this album (relocate)
-            await relocate.relocate([(m["from"], m["to"])], reread=True)
             await journal(batch, "move", m["from"], "file", m["from"], m["to"],
                           f"Moved {Path(m['from']).name}", artist_dir=ctx.artist_dir,
                           album_key=ctx.key)
+            # its row moves, then learns its new tags; a copy's folder left
+            # empty hands its record on to this album (relocate: in this
+            # batch, the move's, to be undone with it)
+            await relocate.relocate([(m["from"], m["to"])], reread=True)
             for suffix in SIDECARS:
                 side = (root / m["from"]).with_suffix(suffix)
                 side_dst = (root / m["to"]).with_suffix(suffix)
@@ -944,13 +949,17 @@ async def do_album_copies(issue: dict, ctx: Ctx) -> str:
     await db.execute("UPDATE md_changes SET summary = ? WHERE batch_id = ?",
                      (note[:1].upper() + note[1:], batch))
     # the album is this release now, and the files moved in say so too
+    # (what it was pinned to before goes back with an undo)
+    was = await db.fetchone("SELECT manual, release_mbid FROM md_albums WHERE key = ?", (ctx.key,))
     await db.execute("UPDATE md_albums SET manual = 1, release_mbid = ?, next_check = 0 "
                      "WHERE key = ?", (plan["pin"], ctx.key))
     # its folder isn't moved out of for a while: see issues.plan_unit
     await db.execute("INSERT INTO md_state (key, value) VALUES (?, ?) ON CONFLICT(key) "
                      "DO UPDATE SET value = excluded.value",
                      (MERGE_KEEPER + folder.casefold(),
-                      json.dumps({"at": time.time(), "release": plan["pin"], "batch": batch})))
+                      json.dumps({"at": time.time(), "release": plan["pin"], "batch": batch,
+                                  "unit_id": ctx.unit_id or await unit_id_of(ctx.key),
+                                  "was": dict(was) if was else None})))
     keys = await copy_keys(issue["detail"])
     if keys:
         await db.execute(f"UPDATE md_albums SET next_check = 0 WHERE key IN "
@@ -1572,7 +1581,12 @@ async def _revert(batch_id: str, rows: list[dict]) -> dict:
     touched: set[str] = set()
     moved_back: list[tuple[str, str]] = []
     reindex_paths: list[str] = []
+    # albums the moves merged into others: made their own again once their
+    # files are back (below)
+    merges = [c for c in rows if c["target"] == "unit"]
     for change in rows:
+        if change["target"] == "unit":
+            continue
         try:
             if change["target"] == "file":
                 _require_online()
@@ -1631,17 +1645,27 @@ async def _revert(batch_id: str, rows: list[dict]) -> dict:
         except Exception as exc:
             failures.append({"ref": change["ref"], "error": str(exc)[:200]})
     if not failures:
-        # a merge of copies undone no longer holds its folder (issues.merged_into)
+        # a merge of copies undone no longer holds its folder (issues.merged_into),
+        # and its keeper is pinned as it was, if nothing pinned it since
         for r in await db.fetchall("SELECT key, value FROM md_state WHERE key LIKE ?",
                                    (MERGE_KEEPER + "%",)):
             try:
-                if json.loads(r["value"]).get("batch") == batch_id:
-                    await db.execute("DELETE FROM md_state WHERE key = ?", (r["key"],))
+                held = json.loads(r["value"])
+                if held.get("batch") != batch_id:
+                    continue
             except (TypeError, ValueError, AttributeError):
                 continue
+            await db.execute("DELETE FROM md_state WHERE key = ?", (r["key"],))
+            if held.get("was") and held.get("unit_id"):
+                await db.execute("UPDATE md_albums SET manual = ?, release_mbid = ? "
+                                 "WHERE unit_id = ? AND manual = 1 AND release_mbid = ?",
+                                 (held["was"]["manual"], held["was"]["release_mbid"],
+                                  held["unit_id"], held.get("release")))
     if moved_back:
         # what names the files, and the folders they left, follows them back
-        await relocate.relocate(moved_back)
+        # (an album the way back empties joins the one there in a batch of
+        # its own: there is nothing to undo of an undo)
+        await relocate.relocate(moved_back, batch=uuid.uuid4().hex[:12])
 
         # tidy now-empty folders the files came back out of
         def tidy():
@@ -1659,7 +1683,16 @@ async def _revert(batch_id: str, rows: list[dict]) -> dict:
         # tags put back before their file moved back are read where it is now
         back = dict(moved_back)
         await reindex(list(dict.fromkeys(back.get(p, p) for p in reindex_paths)))
+    from . import units
+    restored: list[str] = []
+    for change in merges:       # newest first, as the batch was undone
+        try:
+            restored += await units.unmerge(change)
+            reverted += 1
+        except Exception as exc:
+            failures.append({"ref": change["ref"], "error": str(exc)[:200]})
     if touched and plex.configured:
         for folder in sorted(touched)[:10]:
             await plex.refresh_path(folder)
-    return {"reverted": reverted, "failures": failures, "folders": sorted(touched)}
+    return {"reverted": reverted, "failures": failures, "folders": sorted(touched),
+            "restored_keys": list(dict.fromkeys(restored))}

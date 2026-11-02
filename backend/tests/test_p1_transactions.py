@@ -320,6 +320,7 @@ class IndexTestCase(DbTestCase):
         return [r["detail"] for r in await self.db.fetchall(f"EXPLAIN QUERY PLAN {sql}", params)]
 
     async def test_the_journal_lookups_use_an_index(self):
+        from app import relocate
         from app.metadata import apply
         cases = {
             "ours_locked": (apply.OURS_LOCKED, ("123", "genre")),
@@ -327,6 +328,7 @@ class IndexTestCase(DbTestCase):
             "oscillation": (apply.OSCILLATION, ("2026-10-19T00:00:00Z",)),
             "match_flipflop": (issues.MATCH_FLIPFLOP, ("123", "2026-10-19T00:00:00Z")),
             "changed_by_us": (issues.CHANGED_BY_US, ("123", *issues.SHARED_FIELDS)),
+            "move_batch": (relocate.MOVE_BATCH, ("A/x/01.mp3", '"B/x/01.mp3"')),
         }
         for name, (sql, params) in cases.items():
             with self.subTest(query=name):

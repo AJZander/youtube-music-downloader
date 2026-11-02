@@ -18,7 +18,9 @@ from . import units
 from .plexsync import album_for_paths, jlist, last_sync
 from .runner import runner
 
-OPEN_STATES = ("open", "failed", "queued")
+# what an album or artist page lists as its issues: what is to do, under way,
+# or in the Tried bucket (Download missing fetched all it could)
+OPEN_STATES = ("open", "failed", "queued", "tried")
 _SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 
 
@@ -552,12 +554,15 @@ async def changes(*, album_key: str | None = None, artist_dir: str | None = None
         where.append("artist_dir = ?")
         params.append(artist_dir)
     sql_where = f"WHERE {' AND '.join(where)}" if where else ""
+    # a batch of album records merged and nothing else (the registry
+    # following files moved outside the app) has nothing on disk to undo
     rows = await db.fetchall(
         f"SELECT batch_id, MIN(applied_at) AS applied_at, MAX(summary) AS summary, "
         f"MIN(target) AS target, COUNT(*) AS count, "
         f"SUM(reverted_at IS NOT NULL) AS reverted_n, MAX(album_key) AS album_key, "
         f"MAX(artist_dir) AS artist_dir, MAX(id) AS last_id FROM md_changes {sql_where} "
-        f"GROUP BY batch_id ORDER BY last_id DESC LIMIT ?", (*params, limit))
+        f"GROUP BY batch_id HAVING SUM(target != 'unit') > 0 ORDER BY last_id DESC LIMIT ?",
+        (*params, limit))
     return [{"batch_id": r["batch_id"], "applied_at": r["applied_at"], "summary": r["summary"],
              "target": r["target"], "count": r["count"],
              "reverted": r["reverted_n"] == r["count"], "album_key": r["album_key"],
