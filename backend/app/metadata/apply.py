@@ -23,6 +23,7 @@ from pathlib import Path
 
 import httpx
 
+from .. import relocate
 from ..config import settings
 from ..db import db, utcnow
 from ..engine import tagio
@@ -105,49 +106,13 @@ async def _run(func, *args):
 async def reindex(paths: list[str]) -> None:
     """Re-read files we just changed, so the index (and the next plan) sees
     the new tags without waiting for a library scan."""
-    from .. import library
-    root = settings.library_dir
-
-    def read_all() -> list[tuple]:
-        out = []
-        for rel in paths:
-            try:
-                st = (root / rel).stat()
-            except OSError:
-                continue
-            out.append(library._read_file(root, rel, st.st_size, st.st_mtime))
-        return out
-
-    rows = await _run(read_all)
-    if rows:
-        await db.executemany(library._UPSERT, rows)
-
-
-async def rekey_paths(pairs: list[tuple[str, str]]) -> None:
-    """Point everything that names a file at its new path."""
-    for old, new in pairs:
-        parts = Path(new).parts
-        artist_dir = parts[0] if len(parts) > 1 else ""
-        dirpath = str(Path(new).parent) if len(parts) > 1 else ""
-        await db.execute(
-            "UPDATE library_index SET path = ?, dirpath = ?, artist_dir = ? WHERE path = ?",
-            (new, dirpath, artist_dir, old))
-        await db.execute("UPDATE tracks SET library_path = ? WHERE library_path = ?", (new, old))
-        await _rekey_exclusions("track", old, new)
+    await relocate.reread_files(paths)
 
 
 async def rekey_folder(old: str, new: str) -> None:
-    await _rekey_exclusions("album", old, new)
-
-
-async def _rekey_exclusions(scope: str, old: str, new: str) -> None:
-    """"Not duplicates" decisions follow a renamed file or folder. One the
-    new name already has (merged copies) is kept once."""
-    for column in ("key_a", "key_b"):
-        await db.execute(f"UPDATE OR IGNORE library_exclusions SET {column} = ? "
-                         f"WHERE scope = ? AND {column} = ?", (new, scope, old))
-        await db.execute(f"DELETE FROM library_exclusions WHERE scope = ? AND {column} = ?",
-                         (scope, old))
+    """"Not duplicates" decisions about a folder follow it (relocate does
+    this, and everything else, for the folders a move empties)."""
+    await relocate.rekey_exclusions("album", old, new)
 
 
 async def rekey_unit(old_key: str, new_key: str, artist_dir: str, paths=()) -> str | None:
@@ -331,12 +296,14 @@ async def _file_in_downloads(issue: dict, ctx: Ctx) -> tuple[int, set[str]]:
     root = settings.library_dir
     target = folder_of(ctx.rows[0])
     ours = {r["path"] for r in ctx.rows}
+    # the file where it is, however the download spelt its path
     found = await db.fetchall(
-        "SELECT t.library_path, t.provider_track_id FROM tracks t JOIN library_index l "
-        "ON l.path = t.library_path WHERE t.job_id = ? AND t.status = 'completed'", (job_id,))
+        "SELECT l.path, t.provider_track_id FROM tracks t JOIN library_index l "
+        "ON l.path = t.library_path OR l.path_key = path_key(t.library_path) "
+        "WHERE t.job_id = ? AND t.status = 'completed'", (job_id,))
     moves = []
     for t in found:
-        src = t["library_path"]
+        src = t["path"]
         if src in ours or folder_of({"path": src}) == target:
             continue
         dst = f"{target}/{Path(src).name}"
@@ -364,7 +331,7 @@ async def _file_in_downloads(issue: dict, ctx: Ctx) -> tuple[int, set[str]]:
                           artist_dir=ctx.artist_dir, album_key=ctx.key)
     if not done:
         return 0, set()
-    await rekey_paths(done)
+    await relocate.relocate(done)
     sources = {folder_of({"path": s}) for s, _ in done}
     await _tidy_folders(sources, target, batch, ctx)
     await db.execute("UPDATE md_changes SET summary = ? WHERE batch_id = ?",
@@ -517,17 +484,16 @@ async def _relocate(ctx: Ctx, moves: list[dict], batch: str, summary: str | None
                     except (ApplyError, OSError) as exc:
                         log.info("sidecar %s left behind: %s", side_src, exc)
     except (OSError, ApplyError) as exc:
-        await rekey_paths(done)
+        await relocate.relocate(done)
         raise ApplyError(f"stopped after {len(done)} of {len(moves)} files: {exc}") from exc
 
     await _tidy_folders(source_dirs, target_dir, batch, ctx)
-    await rekey_paths(done)
-    for folder in source_dirs:
-        await rekey_folder(folder, target_dir)
     new_artist = Path(target_dir).parts[0]
     new_key = target_dir
-    ctx.unit_id = await rekey_unit(ctx.key, new_key, new_artist,
-                                   [new for _, new in done]) or ctx.unit_id
+    # the album's record follows it (rekey_unit), and what names its files
+    # and the folders they left follows them
+    followed = await relocate.relocate(done, units={ctx.key: new_key})
+    ctx.unit_id = followed.get(ctx.key) or ctx.unit_id
     await db.execute("UPDATE md_changes SET summary = ?, album_key = ?, artist_dir = ? "
                      "WHERE batch_id = ?",
                      (summary or f"Moved {len(done)} files to {target_dir}", new_key, new_artist,
@@ -900,8 +866,9 @@ async def do_album_copies(issue: dict, ctx: Ctx) -> str:
                 log.info("could not merge %s into %s: %s", m["from"], folder, exc)
                 continue
             done.append((m["from"], m["to"]))
-            await rekey_paths([(m["from"], m["to"])])
-            await reindex([m["to"]])
+            # its row moves, then learns its new tags; a copy's folder left
+            # empty hands its record on to this album (relocate)
+            await relocate.relocate([(m["from"], m["to"])], reread=True)
             await journal(batch, "move", m["from"], "file", m["from"], m["to"],
                           f"Moved {Path(m['from']).name}", artist_dir=ctx.artist_dir,
                           album_key=ctx.key)
@@ -1605,10 +1572,8 @@ async def revert(batch_id: str) -> dict:
             except (TypeError, ValueError, AttributeError):
                 continue
     if moved_back:
-        await rekey_paths(moved_back)
-        for new_dir, old_dir in {(str(Path(n).parent), str(Path(o).parent))
-                                 for n, o in moved_back}:
-            await rekey_folder(new_dir, old_dir)
+        # what names the files, and the folders they left, follows them back
+        await relocate.relocate(moved_back)
 
         # tidy now-empty folders the files came back out of
         def tidy():
@@ -1623,7 +1588,9 @@ async def revert(batch_id: str) -> dict:
                     pass
         await _run(tidy)
     if reindex_paths:
-        await reindex(reindex_paths)
+        # tags put back before their file moved back are read where it is now
+        back = dict(moved_back)
+        await reindex(list(dict.fromkeys(back.get(p, p) for p in reindex_paths)))
     if touched and plex.configured:
         for folder in sorted(touched)[:10]:
             await plex.refresh_path(folder)

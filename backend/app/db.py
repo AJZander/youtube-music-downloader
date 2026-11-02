@@ -8,7 +8,32 @@ import aiosqlite
 
 from .config import settings
 
-MIGRATIONS: list[str] = [
+
+async def _v13_path_keys(conn) -> None:
+    """v13 — one key for a path however it is spelled. /library is a
+    case-insensitive share: `SAM SMITH/x.flac` and `Sam Smith/x.flac` are one
+    file, and a name may arrive in either Unicode form. Paths are compared by
+    identity.path_key (NFC, casefolded); the index carries it, so a lookup by
+    it is an index search, and connect() registers the same function in SQL
+    for the other side of a join. Filled in chunks, in the migration's one
+    transaction. References that name no indexed file today stay as they
+    are: repairing them is a data repair, for the user to agree to."""
+    from .identity import path_key
+    await conn.execute("ALTER TABLE library_index ADD COLUMN path_key TEXT")
+    last = -1
+    while True:
+        cur = await conn.execute(
+            "SELECT id, path FROM library_index WHERE id > ? ORDER BY id LIMIT 2000", (last,))
+        rows = await cur.fetchall()
+        if not rows:
+            break
+        await conn.executemany("UPDATE library_index SET path_key = ? WHERE id = ?",
+                               [(path_key(r[1]), r[0]) for r in rows])
+        last = rows[-1][0]
+    await conn.execute("CREATE INDEX idx_li_path_key ON library_index(path_key)")
+
+
+MIGRATIONS: list = [
     # v1 — initial schema
     """
     CREATE TABLE jobs (
@@ -507,6 +532,8 @@ MIGRATIONS: list[str] = [
                                WHERE m.key = substr(md_state.key, 13))
     WHERE substr(key, 1, 12) = 'auto_paused:' AND substr(key, 13) IN (SELECT key FROM md_albums);
     """,
+    # v13 — library_index.path_key (see _v13_path_keys)
+    _v13_path_keys,
 ]
 
 
@@ -523,6 +550,10 @@ class Database:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(settings.db_path)
         self._conn.row_factory = aiosqlite.Row
+        # path_key(path) in SQL is identity.path_key: library_index.path_key
+        # joins any spelling of a path to it
+        from .identity import path_key
+        await self._conn.create_function("path_key", 1, path_key, deterministic=True)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.execute("PRAGMA foreign_keys=ON")

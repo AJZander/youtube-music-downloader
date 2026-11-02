@@ -266,8 +266,9 @@ class DecisionsTestCase(UnitTestCase):
             keeper_unit = (await self.record(KEEP))["unit_id"]
             merged = await self.merge()
             self.assertEqual(merged["state"], "applied", merged["error"])
-            counts = await self.rescan()
-            self.assertEqual(counts["merged"], 1)
+            await self.rescan()
+            # the merge folded the copy's record into the keeper's (relocate)
+            self.assertIsNone(await self.record(ORIG))
             app = FastAPI()
             app.include_router(routes.router)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
@@ -392,7 +393,8 @@ class DecisionsTestCase(UnitTestCase):
             keeper_unit = (await self.record(KEEP))["unit_id"]
             merged = await self.merge()
             self.assertEqual(merged["state"], "applied", merged["error"])
-            self.assertEqual((await self.rescan())["merged"], 1)
+            await self.rescan()
+            self.assertIsNone(await self.record(ORIG))
             self.assertIn("redirect", await views.album(ORIG))
             batch = await self.db.fetchone(
                 "SELECT batch_id FROM md_changes WHERE summary LIKE 'Merged %' LIMIT 1")
@@ -433,8 +435,9 @@ class DecisionsTestCase(UnitTestCase):
         with self.services():
             result = await library.merge_artist_folders(["Old"], "New")
             self.assertEqual(result["failures"], [])
-            counts = await self.rescan()
-        self.assertEqual(counts["merged"], 1)
+            await self.rescan()
+        # the merge folded Old's record into New's (relocate)
+        self.assertIsNone(await self.record(old))
         self.assertEqual(len(await units.load_unit(new)), 5)
         keeper = await self.record(new)
         self.assertEqual((keeper["manual"], keeper["release_mbid"]), (0, None))
@@ -598,7 +601,7 @@ class MigrationTestCase(unittest.IsolatedAsyncioTestCase):
         # the real one then runs
         await self.db.connect()
         row = await self.db.fetchone("SELECT MAX(version) AS v FROM schema_migrations")
-        self.assertEqual(row["v"], 12)
+        self.assertEqual(row["v"], len(dbmod.MIGRATIONS))
         self.assertIsNone(await self.db.fetchone("SELECT 1 FROM md_albums WHERE unit_id IS NULL"))
 
     async def test_a_python_step_runs_in_one_transaction_with_its_version(self):

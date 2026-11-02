@@ -578,7 +578,10 @@ class MergeArtistsTestCase(unittest.TestCase):
                               property(lambda s: self.root / ".mdl-trash")),
             mock.patch.object(library, "_require_online", lambda: None),
             mock.patch.object(library, "_refresh_plex", mock.AsyncMock()),
-            mock.patch.object(library, "_retag_album_artist", mock.AsyncMock(return_value=0)),
+            mock.patch.object(library, "_retag_album_artist", mock.AsyncMock(return_value=[])),
+            # what names the moved files follows them: tested in test_p1_relocate
+            mock.patch.object(library.relocate, "relocate", mock.AsyncMock(return_value={})),
+            mock.patch.object(library.db, "fetchall", mock.AsyncMock(return_value=[])),
             mock.patch.object(library.db, "execute", mock.AsyncMock()),
             mock.patch.object(library.db, "executemany",
                               mock.AsyncMock(side_effect=lambda sql, rows:
@@ -625,15 +628,25 @@ class MergeRetagTestCase(unittest.TestCase):
     """The merge writes the target's own album artist, never its folder name."""
 
     def retag(self, tags, known):
+        from app.engine import tagio
         root = Path(self._tmp.name)
         for name in tags:
             (root / "AC_DC" / name).touch()
         files = {str(root / "AC_DC" / n): t for n, t in tags.items()}
         row = {"album_artist": known} if known else None
+
+        def write(path, fields, **kwargs):
+            tags = files[str(path)]
+            before = {k: list(tags.get(k) or []) for k in fields}
+            tags.update(fields)
+            tags.save()
+            return {"before": before, "removed": [], "changed": True}
+
         with mock.patch.object(library.settings, "library_dir", root), \
                 mock.patch.object(library.db, "fetchone", mock.AsyncMock(return_value=row)), \
-                mock.patch("mutagen.File", side_effect=lambda p, easy: files[str(p)]):
-            return asyncio.run(library._retag_album_artist("AC_DC", ["ACDC"]))
+                mock.patch.object(tagio, "read", lambda p: {"fields": dict(files[str(p)])}), \
+                mock.patch.object(tagio, "write", write):
+            return len(asyncio.run(library._retag_album_artist("AC_DC", ["ACDC"])))
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

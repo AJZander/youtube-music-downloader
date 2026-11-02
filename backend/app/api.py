@@ -265,16 +265,20 @@ async def _album_context(rows) -> dict:
     """What _different_album compares, loaded once for a list of skips: the
     matched files' index rows, each Download-missing job's target folder,
     and the release groups and album tags the metadata manager knows
-    folders by."""
+    folders by. Files are found however the skip spelt their path (by
+    identity.path_key: the share ignores case)."""
     paths = sorted({r["library_path"] for r in rows if r["library_path"]})
     files: dict[str, dict] = {}
     for i in range(0, len(paths), 500):
         chunk = paths[i:i + 500]
+        marks = ",".join("?" * len(chunk))
         for f in await db.fetchall(
                 "SELECT path, dirpath, album, norm_album, album_artist, artist_dir, "
-                "mb_releasegroupid FROM library_index "
-                f"WHERE path IN ({','.join('?' * len(chunk))})", tuple(chunk)):
-            files[f["path"]] = dict(f)
+                f"mb_releasegroupid FROM library_index WHERE path IN ({marks}) "
+                f"OR path_key IN ({marks})", (*chunk, *(identity.path_key(p) for p in chunk))):
+            key = identity.path_key(f["path"])
+            if key not in files or f["path"] in chunk:     # the very spelling first
+                files[key] = dict(f)
     job_ids = sorted({r["job_id"] for r in rows})
     targets: dict[str, str] = {}
     for i in range(0, len(job_ids), 500):
@@ -322,7 +326,7 @@ def _different_album(row, ctx: dict | None = None) -> str | None:
     # album tags the metadata manager knows it by (the files that stayed
     # carry those); the folder of one the importer indexed is taken from its
     # path (no dirpath until the next scan)
-    indexed = (ctx.get("files") or {}).get(path)
+    indexed = (ctx.get("files") or {}).get(identity.path_key(path))
     file = indexed or {"path": path, "artist_dir": path.split("/", 1)[0]}
     folder = library.unit_dir(file.get("dirpath") or path.rpartition("/")[0])
     target = (ctx.get("targets") or {}).get(row["job_id"])

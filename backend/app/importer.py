@@ -11,6 +11,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from . import relocate
 from .config import settings
 from .db import utcnow
 from .engine import lyrics as lyrics_mod
@@ -108,6 +109,10 @@ async def import_track(staging_file: Path, validated: dict, track_meta: dict,
             relpath = _in_folder(target_dir, relpath.name)
     except PathBuildError as exc:
         raise ImportError_("path_build", str(exc), ErrorClass.VALIDATION_FAILED) from exc
+    # The share ignores case: a "Sam Smith/..." file lands in the "SAM SMITH"
+    # folder the library already has, so it is named as it lands, and its
+    # index row isn't dropped by the next scan for a spelling nothing has.
+    relpath = Path(await relocate.on_disk(str(relpath.parent))) / relpath.name
 
     dest = settings.library_dir / relpath
     dest_dir = dest.parent

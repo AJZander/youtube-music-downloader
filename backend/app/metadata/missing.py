@@ -105,13 +105,16 @@ async def compute(release_mbid: str) -> dict | None:
 
 
 async def _album_download(paths: list[str]) -> bool:
-    """Whether any of these files came from downloading the whole album."""
+    """Whether any of these files came from downloading the whole album
+    (the download may have spelt the path in another case)."""
     for i in range(0, len(paths), 400):
         chunk = paths[i:i + 400]
+        marks = ",".join("?" * len(chunk))
         if await db.fetchone(
                 f"SELECT 1 FROM tracks t JOIN jobs j ON j.id = t.job_id "
-                f"WHERE t.library_path IN ({','.join('?' * len(chunk))}) "
-                f"AND j.source_url LIKE '%browse/MPREb_%' LIMIT 1", tuple(chunk)):
+                f"WHERE (t.library_path IN ({marks}) OR path_key(t.library_path) IN ({marks})) "
+                f"AND j.source_url LIKE '%browse/MPREb_%' LIMIT 1",
+                (*chunk, *(identity.path_key(p) for p in chunk))):
             return True
     return False
 
@@ -195,15 +198,21 @@ async def _job_active(job_id: str | None) -> bool:
 
 # ------------------------------------------------------------------ download
 async def _browse_from_history(release_mbid: str) -> str | None:
-    """The YouTube Music release we downloaded these files from, if we did."""
-    rows = await db.fetchall(
-        "SELECT j.source_url FROM library_index l JOIN tracks t ON t.library_path = l.path "
-        "JOIN jobs j ON j.id = t.job_id WHERE l.mb_albumid = ? AND j.source_url LIKE "
-        "'%browse/MPREb_%' LIMIT 5", (release_mbid,))
-    for r in rows:
-        m = re.search(r"browse/(MPREb_[A-Za-z0-9_-]+)", r["source_url"] or "")
-        if m:
-            return m.group(1)
+    """The YouTube Music release we downloaded these files from, if we did
+    (the download may have spelt their paths in another case)."""
+    paths = [r["path"] for r in await db.fetchall(
+        "SELECT path FROM library_index WHERE mb_albumid = ?", (release_mbid,))]
+    for i in range(0, len(paths), 400):
+        chunk = paths[i:i + 400]
+        marks = ",".join("?" * len(chunk))
+        for r in await db.fetchall(
+                f"SELECT j.source_url FROM tracks t JOIN jobs j ON j.id = t.job_id "
+                f"WHERE (t.library_path IN ({marks}) OR path_key(t.library_path) IN ({marks})) "
+                f"AND j.source_url LIKE '%browse/MPREb_%' LIMIT 5",
+                (*chunk, *(identity.path_key(p) for p in chunk))):
+            m = re.search(r"browse/(MPREb_[A-Za-z0-9_-]+)", r["source_url"] or "")
+            if m:
+                return m.group(1)
     return None
 
 

@@ -112,7 +112,10 @@ async def on_disk(folder: str, other_names: tuple[str, ...] = ()) -> str:
     so "Sam Smith/…" would land in the existing "SAM SMITH" folder anyway,
     under a path nothing here knows about. A release credited to "Alanis"
     files with "Alanis Morissette" (`other_names`: the artist's listed
-    name) when that folder exists."""
+    name) when that folder exists. A folder the index doesn't know yet is
+    spelled as the share has it (relocate.on_disk, which the importer
+    uses too)."""
+    from .. import relocate
     artist, _, album = folder.partition("/")
     known = await _existing_artists()
     existing = (known.get(_words(name)) for name in (artist, *other_names))
@@ -122,7 +125,7 @@ async def on_disk(folder: str, other_names: tuple[str, ...] = ()) -> str:
         parts = r["dirpath"].split("/")
         if len(parts) >= 2 and _fold(parts[1]) == _fold(album):
             return f"{artist}/{parts[1]}"
-    return f"{artist}/{album}"
+    return await relocate.on_disk(f"{artist}/{album}")
 
 
 def _said_in(label: str, title: str) -> bool:

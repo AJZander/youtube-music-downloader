@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
-from . import identity
+from . import identity, relocate
 from .config import settings
 from .db import db, utcnow
 from .engine.matcher import normalize
@@ -121,7 +121,7 @@ _COLUMNS = ("norm_artist", "norm_title", "norm_album", "path", "format",
             "artist_dir", "scanned_at", "added_at", "unreadable",
             "genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
             "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
-            "releasetype", "label", "originaldate", "junk", "tags_version")
+            "releasetype", "label", "originaldate", "junk", "tags_version", "path_key")
 _EXTENDED = ("genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
              "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
              "releasetype", "label", "originaldate", "junk", "tags_version")
@@ -146,7 +146,7 @@ ON CONFLICT(path) DO UPDATE SET
   mb_trackid=excluded.mb_trackid, mb_releasetrackid=excluded.mb_releasetrackid,
   compilation=excluded.compilation, releasetype=excluded.releasetype,
   label=excluded.label, originaldate=excluded.originaldate, junk=excluded.junk,
-  tags_version=excluded.tags_version,
+  tags_version=excluded.tags_version, path_key=excluded.path_key,
   -- a rescan must not forget which download produced the file
   provider_track_id=COALESCE(library_index.provider_track_id,
                              excluded.provider_track_id)
@@ -223,7 +223,7 @@ def _unreadable_row(root: Path, rel: str, size: int, mtime: float) -> tuple:
             None, stem, None, None, None, None, None, None, None, None, None,
             size, mtime, dirpath, artist_dir, utcnow(), utcnow(), 1,
             None, None, None, None, None, None, None, None, None, None, None, None, None,
-            TAGS_VERSION)
+            TAGS_VERSION, identity.path_key(rel))
 
 
 def _read_file(root: Path, rel: str, size: int, mtime: float) -> tuple:
@@ -316,7 +316,7 @@ def _read_file(root: Path, rel: str, size: int, mtime: float) -> tuple:
         (date or "")[:4] or None,
         bitrate_kbps, sample_rate, bits, channels,
         size, mtime, dirpath, artist_dir, utcnow(), utcnow(), 0,
-        *extended,
+        *extended, identity.path_key(rel),
     )
 
 
@@ -506,11 +506,13 @@ def pair_key(a: str, b: str) -> tuple[str, str]:
 
 
 async def load_exclusions() -> dict[str, set[tuple[str, str]]]:
-    """Pairs the user has said may coexist, by scope."""
+    """Pairs the user has said may coexist, by scope. Each in pair_key's
+    order, however it was stored (a rename used to leave a pair the other
+    way round)."""
     out: dict[str, set[tuple[str, str]]] = collections.defaultdict(set)
     for row in await db.fetchall(
             "SELECT scope, key_a, key_b FROM library_exclusions"):
-        out[row["scope"]].add((row["key_a"], row["key_b"]))
+        out[row["scope"]].add(pair_key(row["key_a"], row["key_b"]))
     return out
 
 
@@ -1237,14 +1239,9 @@ async def trash_paths(relpaths: list[str], reason: str = "") -> dict:
         await db.executemany(
             "INSERT INTO library_trash (batch_id, original_path, trash_path, kind, "
             "reason, filesize_bytes, trashed_at) VALUES (?,?,?,?,?,?,?)", entries)
-    audio_paths = [e[1] for e in entries if e[3] == "audio"]
-    for start in range(0, len(audio_paths), 400):
-        batch = audio_paths[start:start + 400]
-        await db.execute(
-            f"DELETE FROM library_index WHERE path IN ({','.join('?' * len(batch))})",
-            tuple(batch))
-    for dirrel in emptied:
-        await db.execute("DELETE FROM library_index WHERE dirpath = ?", (dirrel,))
+    # out of the index; what else names them keeps their path (relocate.forget)
+    await relocate.forget([e[1] for e in entries if e[3] == "audio"],
+                          [e[1] for e in entries if e[3] == "dir"] + emptied)
 
     artist_dirs = {Path(e[1]).parts[0] for e in entries if Path(e[1]).parts}
     await _refresh_plex(artist_dirs)
@@ -1278,7 +1275,7 @@ async def list_trash(limit: int = 200, include_restored: bool = False) -> dict:
 
 
 async def restore_batch(batch_id: str) -> dict:
-    """Put a trashed batch back exactly where it came from."""
+    """Put a trashed batch back exactly where it came from, and in the index."""
     _require_online()
     rows = await db.fetchall(
         "SELECT * FROM library_trash WHERE batch_id = ? AND restored_at IS NULL",
@@ -1306,10 +1303,11 @@ async def restore_batch(batch_id: str) -> dict:
             restored.append(row["original_path"])
         except (LibraryError, OSError) as exc:
             failures.append({"path": row["original_path"], "error": str(exc)[:200]})
+    if restored:
+        await relocate.unforget(restored)
     await _refresh_plex({Path(p).parts[0] for p in restored if Path(p).parts})
     log.info("restored %d entries from batch %s", len(restored), batch_id)
-    return {"restored": len(restored), "failures": failures,
-            "rescan_needed": bool(restored)}
+    return {"restored": len(restored), "failures": failures, "rescan_needed": False}
 
 
 async def purge_trash(batch_id: str | None = None, older_than_days: int | None = None) -> dict:
@@ -1364,12 +1362,37 @@ async def merge_artist_folders(sources: list[str], target: str,
     Plex splits artists on the albumartist *tag*, not the folder, so moving
     folders without rewriting the tag just relocates the problem. The artist
     tag is only rewritten where it equals the old folder name — a featured
-    guest's name on a track must survive the merge."""
+    guest's name on a track must survive the merge.
+
+    The merge is one change in the journal (md_changes), undone as one: each
+    file moved, each tag rewritten (with what it said before), and the copies
+    the target already had, which go to Trash. Everything that names the
+    moved files and folders follows them (relocate): their index rows keep
+    their video ids and albums, and nothing waits for a rescan."""
+    from .metadata.apply import journal
     _require_online()
     loop = asyncio.get_running_loop()
+    root = settings.library_dir
     target_dir = _safe_abs(target)
     if not target_dir.is_dir():
         raise LibraryError(f"target artist folder does not exist: {target!r}")
+
+    def rel(path: Path) -> str:
+        return str(path.relative_to(root))
+
+    batch = uuid.uuid4().hex[:12]
+    journalled = 0
+    pairs: dict[str, str] = {}                      # what moved, old -> new
+    into_leftovers: list[tuple[str, str]] = []      # of those, out of a folder trashed below
+
+    async def record(old: str, new: str) -> None:
+        nonlocal journalled
+        audio = Path(new).suffix.lower() in AUDIO_SUFFIXES
+        await journal(batch, "move", old, "file" if audio else "leftover",
+                      old if audio else None, new, f"Moved {Path(old).name}",
+                      artist_dir=target, album_key=identity.unit_dir(str(Path(new).parent)))
+        journalled += 1
+        pairs[old] = new
 
     moved, merged_into, retagged, failures = [], [], 0, []
     leftovers: list[str] = []
@@ -1382,7 +1405,6 @@ async def merge_artist_folders(sources: list[str], target: str,
         if not source_dir.is_dir():
             failures.append({"path": source, "error": "not a folder"})
             continue
-        files, folders = [], []         # (old, new) of what moved
         for child in sorted(source_dir.iterdir()):
             destination = target_dir / child.name
             try:
@@ -1395,15 +1417,16 @@ async def merge_artist_folders(sources: list[str], target: str,
                         if final.exists():
                             continue   # a copy is already there; deal with it below
                         await loop.run_in_executor(None, _relocate, inner, final)
-                        moved.append(str(final.relative_to(settings.library_dir)))
-                        files.append((str(inner.relative_to(settings.library_dir)), moved[-1]))
+                        moved.append(rel(final))
+                        await record(rel(inner), moved[-1])
+                        into_leftovers.append((rel(inner), moved[-1]))
                     merged_into.append(child.name)
                     # Whatever could not move is a file the target already has.
                     # It still goes through the trash — this module does not
                     # delete, and "it looked like a duplicate" is exactly the
                     # judgement the duplicate screens exist to make explicit.
                     if any(f.is_file() for f in child.rglob("*")):
-                        leftovers.append(str(child.relative_to(settings.library_dir)))
+                        leftovers.append(rel(child))
                     else:
                         await loop.run_in_executor(
                             None, lambda c=child: shutil.rmtree(c, ignore_errors=True))
@@ -1412,25 +1435,37 @@ async def merge_artist_folders(sources: list[str], target: str,
                                      "error": "a file of that name already exists in the target"})
                 else:
                     await loop.run_in_executor(None, os.replace, child, destination)
-                    moved.append(str(destination.relative_to(settings.library_dir)))
-                    (folders if destination.is_dir() else files).append(
-                        (str(child.relative_to(settings.library_dir)), moved[-1]))
+                    moved.append(rel(destination))
+                    if not destination.is_dir():
+                        await record(rel(child), moved[-1])
+                        continue
+                    old_dir = rel(child)
+                    for inner in sorted(destination.rglob("*")):
+                        if inner.is_file():
+                            await record(str(Path(old_dir) / inner.relative_to(destination)),
+                                         rel(inner))
+                    # and whatever the index has there that is no longer on disk
+                    for r in await db.fetchall(
+                            "SELECT path FROM library_index WHERE path >= ? AND path < ?",
+                            (old_dir + "/", old_dir + "0")):
+                        pairs.setdefault(r["path"], moved[-1] + r["path"][len(old_dir):])
             except OSError as exc:
                 failures.append({"path": child.name, "error": str(exc)[:200]})
-        # The moved files' index rows follow them, with what they carry (the
-        # album they were seen in, their video id), rather than being read
-        # again as new files by the next scan.
-        await _follow_index(files, folders)
+    # What names the moved files names where they are now. Their index rows
+    # go first, so the copies trashed next are all that is left behind.
+    await relocate.relocate(list(pairs.items()))
 
     trashed = {}
     if leftovers:
         trashed = await trash_paths(
             leftovers, f"already present in {target} after an artist merge")
-        if trashed.get("trashed"):
-            for folder in leftovers:
-                if not _safe_abs(folder).exists():
-                    await db.execute("DELETE FROM library_index WHERE path >= ? AND path < ?",
-                                     (folder + "/", folder + "0"))
+        if trashed.get("batch_id") and trashed.get("trashed"):
+            await journal(batch, "trash", trashed["batch_id"], "files", leftovers, None,
+                          f"Trashed {len(leftovers)} folders of copies {target} already had",
+                          artist_dir=target, album_key=None)
+            journalled += 1
+        # the folders that emptied hand on what names them
+        await relocate.relocate(into_leftovers)
 
     # Only now can the source folders go, and only if they really are empty.
     for source in sources:
@@ -1444,34 +1479,21 @@ async def merge_artist_folders(sources: list[str], target: str,
                                  "error": f"folder not empty, left in place ({exc})"})
 
     if rewrite_tags:
-        retagged = await _retag_album_artist(target, sources, name)
+        written = await _retag_album_artist(target, sources, name, batch=batch)
+        retagged = len(written)
+        journalled += retagged
+        await relocate.reread_files(written)
+    if journalled:
+        await db.execute("UPDATE md_changes SET summary = ? WHERE batch_id = ?",
+                         (f"Merged {', '.join(s for s in sources if s != target)} into {target}",
+                          batch))
     await _refresh_plex({target})
     log.info("merged %s into %s: %d items moved, %d retagged",
              sources, target, len(moved), retagged)
     return {"moved": len(moved), "merged_albums": merged_into,
             "retagged": retagged, "trashed": trashed.get("trashed", 0),
-            "failures": failures, "rescan_needed": True}
-
-
-async def _follow_index(files: list[tuple[str, str]], folders: list[tuple[str, str]]) -> None:
-    """Point the index rows of moved files and folders (relative paths,
-    old -> new) at where they are now. A row already at a new path is for a
-    file that wasn't there (the move found the name free): it gives way."""
-    def parent(path: str) -> tuple[str, str]:
-        parts = Path(path).parts
-        return (str(Path(path).parent), parts[0]) if len(parts) > 1 else ("", "")
-
-    if files:
-        await db.executemany("UPDATE OR REPLACE library_index SET path = ?, dirpath = ?, "
-                             "artist_dir = ? WHERE path = ?",
-                             [(new, *parent(new), old) for old, new in files])
-    if folders:
-        # everything under the folder ("/" sorts just before "0")
-        await db.executemany(
-            "UPDATE OR REPLACE library_index SET path = ? || substr(path, ?), "
-            "dirpath = ? || substr(dirpath, ?), artist_dir = ? WHERE path >= ? AND path < ?",
-            [(new, len(old) + 1, new, len(old) + 1, Path(new).parts[0], old + "/", old + "0")
-             for old, new in folders])
+            "failures": failures, "batch_id": batch if journalled else None,
+            "rescan_needed": False}
 
 
 async def _album_artist_of(artist_dir: str) -> str:
@@ -1481,47 +1503,57 @@ async def _album_artist_of(artist_dir: str) -> str:
     return row["album_artist"] if row else artist_dir
 
 
-async def _retag_album_artist(target: str, old_names: list[str], name: str | None = None) -> int:
+async def _retag_album_artist(target: str, old_names: list[str], name: str | None = None,
+                              *, batch: str | None = None) -> list[str]:
     """Set albumartist to the target's own name across the merged folder.
 
     That name is the album artist the target's files already carry, not the
     folder name: a folder can't hold "AC/DC", and "AC_DC" is no name. And
     "AC/DC" reduces to the same key as an "ACDC" folder, so a tag already
-    spelt the target's way is left alone."""
-    import mutagen
+    spelt the target's way is left alone. Written with tagio, and journalled
+    in `batch` with what each tag said before, so the merge can be undone.
+    Returns the files rewritten."""
+    from .engine import tagio
+    from .metadata.apply import journal
 
     loop = asyncio.get_running_loop()
     name = name or await _album_artist_of(target)
     old_keys = {strict_key(n) for n in old_names}
     target_dir = _safe_abs(target)
+    root = settings.library_dir
 
-    def _rewrite() -> int:
-        changed = 0
-        for path in target_dir.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
+    def _rewrite() -> list[tuple[str, dict, dict]]:
+        changed = []
+        for path in sorted(target_dir.rglob("*")):
+            # a dot name is a file still being written (.incoming-*), or hidden
+            if not path.is_file() or path.name.startswith(".") \
+                    or path.suffix.lower() not in tagio.WRITABLE_SUFFIXES:
                 continue
             try:
-                audio = mutagen.File(path, easy=True)
-                if audio is None:
-                    continue
-                current_aa = (audio.get("albumartist") or [None])[0]
-                current_artist = (audio.get("artist") or [None])[0]
-                dirty = False
+                fields = tagio.read(path)["fields"]
+                current_aa = (fields.get("albumartist") or [None])[0]
+                current_artist = (fields.get("artist") or [None])[0]
+                wanted = {}
                 if current_aa != name and (not current_aa or strict_key(current_aa) in old_keys):
-                    audio["albumartist"] = [name]
-                    dirty = True
+                    wanted["albumartist"] = [name]
                 if current_artist and current_artist != name \
                         and strict_key(current_artist) in old_keys:
-                    audio["artist"] = [name]
-                    dirty = True
-                if dirty:
-                    audio.save()
-                    changed += 1
+                    wanted["artist"] = [name]
+                if wanted:
+                    result = tagio.write(path, wanted, strip_junk=False)
+                    if result["changed"]:
+                        changed.append((str(path.relative_to(root)), result["before"], wanted))
             except Exception as exc:
                 log.debug("retag skipped for %s: %s", path, exc)
         return changed
 
-    return await loop.run_in_executor(None, _rewrite)
+    changed = await loop.run_in_executor(None, _rewrite)
+    if batch:
+        for path, before, wanted in changed:
+            await journal(batch, "file", path, "tags", before, wanted,
+                          f"Wrote tags on {Path(path).name}", artist_dir=target,
+                          album_key=identity.unit_dir(str(Path(path).parent)))
+    return [path for path, _, _ in changed]
 
 
 # ------------------------------------------------------------------ browsing

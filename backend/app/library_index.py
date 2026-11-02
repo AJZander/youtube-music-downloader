@@ -6,6 +6,7 @@ from pathlib import Path
 from . import ownership
 from .db import db, utcnow
 from .engine.matcher import normalize
+from .identity import path_key
 
 
 async def find_duplicate_match(provider_track_id: str | None, artist: str | None,
@@ -54,18 +55,27 @@ async def in_legacy_archive(provider: str, provider_id: str) -> bool:
 async def add_entry(path: str, artist: str, title: str, album: str | None,
                     fmt: str | None, duration: float | None,
                     provider_track_id: str | None) -> None:
-    await db.execute(
-        """INSERT INTO library_index
-           (norm_artist, norm_title, norm_album, path, format, duration_sec,
-            provider_track_id, added_at)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(path) DO UPDATE SET
-             norm_artist=excluded.norm_artist, norm_title=excluded.norm_title,
-             norm_album=excluded.norm_album, format=excluded.format,
-             duration_sec=excluded.duration_sec,
-             provider_track_id=excluded.provider_track_id""",
-        (normalize(artist), normalize(title), normalize(album or ""),
-         path, fmt, duration, provider_track_id, utcnow()))
+    """The importer's new file, indexed as a scan reads it (its tags, its
+    folder, path_key), with the video it was downloaded from: the next scan
+    has nothing to read again, and the album sees the file at once. A file
+    that can't be read just now gets the bare row it always got."""
+    from . import relocate
+    if not await relocate.reread_files([path]):
+        await db.execute(
+            """INSERT INTO library_index
+               (norm_artist, norm_title, norm_album, path, format, duration_sec,
+                provider_track_id, added_at, path_key)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(path) DO UPDATE SET
+                 norm_artist=excluded.norm_artist, norm_title=excluded.norm_title,
+                 norm_album=excluded.norm_album, format=excluded.format,
+                 duration_sec=excluded.duration_sec,
+                 provider_track_id=excluded.provider_track_id""",
+            (normalize(artist), normalize(title), normalize(album or ""),
+             path, fmt, duration, provider_track_id, utcnow(), path_key(path)))
+    if provider_track_id:
+        await db.execute("UPDATE library_index SET provider_track_id = ? WHERE path = ?",
+                         (provider_track_id, path))
 
 
 async def rebuild(progress_cb=None) -> dict:
