@@ -13,11 +13,11 @@ Per-phase plans and reports are in `docs/review/progress/`. Statuses: todo / in-
 | P0-5 | done | fix/review-2026-11-p0 | 779d60b | tests/test_p0_skips.py: 4 failed before (real Worker._process_track) | DownloadDetails.jsx shows the skip reason in error colour (cosmetic) |
 | P0-6 | done | fix/review-2026-11-p0 | 5e0a7cb | tests/test_p0_footguns.py: 3 failed before (real scan+sync_registry keeps manual=1; real httpx request has no token) | README still documents 'mdl index --rebuild' via exec; 'mdl library scan --full' has no app-running guard; library.py:609 unreadable counter bug → P2-D1 |
 | P1-G4 | done | fix/review-2026-11-p0 | 918bb3e | tests/test_p0_plex_foreign.py; dry run: 0 album-level Plex edits on 451 shared units (5 before), 156 plex_foreign; flip-flops: Doggystyle 235578, ABBA 202038 | runner._check_unit still uses a foreign album's MBID as resolver hint (one-line follow-up); plex_foreign not applyable until P1-C5; Library.jsx TAB_FOR_KIND lacks plex_foreign |
-| P1-F1 | todo | fix/review-2026-11-p1 | | | |
-| P1-F2 | todo | fix/review-2026-11-p1 | | | |
-| P1-F3 | todo | fix/review-2026-11-p1 | | | |
-| P1-F4 | todo | fix/review-2026-11-p1 | | | |
-| P1-F5 | todo | fix/review-2026-11-p1 | | | |
+| P1-F1 | done | fix/review-2026-11-p1 | 02f9565 | tests/test_p1_identity.py + identity_golden.py (127 rows); 24 failed before; parity on 457 albums: 452 identical, 4 diffs all F1 (split_key re-key, near-identical titles); gate 'have' 2,307→2,143; picker 7,909→7,767 picks | DECISION PENDING: edition-blind gate + one-way version rule in picker (127 live/acoustic/remix takes dropped) → revisit in P1-B4; rockstar names-only is a known gap; Beatles Anthology 30 exact-title copies re-download |
+| P1-F2 | done | fix/review-2026-11-p1 | a188607 | tests/test_p1_unit_identity.py (dismiss→move→recheck, accept→move into key, artist merge); migration v12 on copy: 4.4 s, 0 decisions lost, 2,514 dismissals re-keyed kind:unit_id | v12 is ONE-WAY: take a .backup before deploy. DECISION PENDING: undo of a registry merge doesn't restore folded decisions (follow-up with P1-A1). 11 units re-keyed by F1 → ~10 dismissed issues re-open once. 163 pre-existing orphaned dismissals → phase 5 |
+| P1-F3 | done | fix/review-2026-11-p1 | 8118e4b | tests/test_p1_relocate.py (property: every path resolves case-insensitively after each mover); migration v13 2.9 s; baseline: tracks.library_path unresolved 1,167 / 18,545 | app/relocate.py (not library/relocate.py: library.py is a module). merge_artist_folders dest spelling (unconfirmed, low). jobs.target_dir/plex_items follow only emptied folders |
+| P1-F4 | done | fix/review-2026-11-p1 | dc102dd | tests/test_p1_settling.py (import into X while move of X planned → move deferred, import lands in current folder) | settling misses a plain album download's first track (P1-B6); API cancel/delete doesn't call job_ended (1 h fallback); folder locks held through do_scan Plex re-add (~7 min) |
+| P1-F5 | done | fix/review-2026-11-p1 | a9b8ba2 | tests/test_p1_transactions.py; migration v14 2.4 s; EXPLAIN now uses indexes for ours_locked, P0-1 breaker, match_flipflop | DECISION PENDING: tracks(library_path) index not added (updates are by id now; lookups use path_key). sync_registry is one 5-10 s transaction per cycle: watch UI responsiveness |
 | P1-A1 | todo | fix/review-2026-11-p2 | | | |
 | P1-A2 | todo | fix/review-2026-11-p2 | | | |
 | P1-A3 | todo | fix/review-2026-11-p2 | | | |
@@ -79,3 +79,4 @@ Per-phase plans and reports are in `docs/review/progress/`. Statuses: todo / in-
 
 - 2026-11-02: p0 branch created off `main` (0fec8a2); triage + prompt committed. Baseline suite: 394 tests OK.
 - 2026-11-02: p0 integrated at 15299c6 (7 tickets, 4 lanes, 0 integration-fix attempts). Suite: Ran 451 tests OK; frontend build OK. §7 oscillation baseline on the copy: 0 rows (48 h). No migrations. Ready to deploy (user's call).
+- 2026-11-02: p1 integrated at b93d41c (5 tickets, chain of 4 lanes; resumed once after a session restart). Suite: Ran 533 tests OK; frontend build OK. Migrations v12-v14: 9.7 s on the copy, idempotent. 4 needs-decision items asked at phase end.
