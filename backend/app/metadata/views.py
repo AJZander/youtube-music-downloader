@@ -18,7 +18,9 @@ from . import units
 from .plexsync import album_for_paths, jlist, last_sync
 from .runner import runner
 
-OPEN_STATES = ("open", "failed", "queued")
+# what an album or artist page lists as its issues: what is to do, under way,
+# or in the Tried bucket (Download missing fetched all it could)
+OPEN_STATES = ("open", "failed", "queued", "tried")
 _SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 
 
@@ -59,14 +61,11 @@ async def overview() -> dict:
         "albums_total", "albums_checked", "albums_resolved", "plex_artists",
         "plex_unmatched_artists", "plex_albums", "plex_unmatched_albums", "plex_tracks",
         "files_not_in_plex", "files_with_mbids", "albums_with_genre", "albums_with_mood")}
-    rows = await db.fetchall("SELECT kind, COUNT(*) AS n FROM md_issues "
-                             "WHERE state IN ('open', 'failed', 'queued') GROUP BY kind")
-    by_kind = {r["kind"]: r["n"] for r in rows}
     prefs_row = await one("SELECT value FROM md_state WHERE key = 'plex_prefs'")
     prefs = json.loads(prefs_row["value"]) if prefs_row and prefs_row["value"] else {}
     return {
         **base, "coverage": coverage,
-        "issues": {"open": sum(by_kind.values()), "by_kind": by_kind},
+        "issues": await issues_mod.counts(),
         "metadata": await runner.status(),
         "plex": {"reachable": await plex.reachable(), "last_sync": _iso(synced),
                  "settings": {k: prefs.get(k) for k in ("respectTags", "genres", "albumPosters")}},
@@ -75,15 +74,21 @@ async def overview() -> dict:
 
 # ------------------------------------------------------------------ issues
 async def _issue_counts_by_artist() -> dict[str, Counter]:
+    """What needs the user, by artist and kind (issues.ATTENTION_STATES)."""
     rows = await db.fetchall(
         "SELECT r.artist_dir, i.kind, COUNT(DISTINCT i.id) AS n FROM md_issues i "
-        "JOIN md_issue_refs r ON r.issue_id = i.id WHERE i.state IN ('open', 'failed', 'queued') "
+        "JOIN md_issue_refs r ON r.issue_id = i.id WHERE i.state IN ('open', 'failed') "
         "AND r.artist_dir IS NOT NULL GROUP BY r.artist_dir, i.kind")
     out: dict[str, Counter] = {}
     for r in rows:
         out.setdefault(r["artist_dir"], Counter())[r["kind"]] += r["n"]
     return out
 
+
+# Missing tracks a download was queued for (missing.queue_download lists
+# each; one queued before that left only its job id)
+_DOWNLOAD_TRIED = ("COALESCE(json_array_length(i.detail, '$.download.attempts'), 0) > 0 "
+                   "OR json_extract(i.detail, '$.download.job_id') IS NOT NULL")
 
 # Narrower views of one kind's issues, for picking what a bulk action takes.
 ISSUE_FILTERS = {
@@ -100,12 +105,19 @@ ISSUE_FILTERS = {
               "(COALESCE(json_extract(i.detail, '$.artist'), -1) >= 1 AND "
               "COALESCE(json_extract(i.detail, '$.matched'), -1) = "
               "COALESCE(json_extract(i.detail, '$.files'), -2)))",
-    # Missing tracks: a download was tried (what is left isn't on YouTube
-    # Music, or hasn't arrived) / never tried
-    "tried": "json_extract(i.detail, '$.download') IS NOT NULL",
-    "untried": "json_extract(i.detail, '$.download') IS NULL",
+    # Missing tracks: a download was queued (what is left isn't on YouTube
+    # Music, was skipped as held, or hasn't arrived) / never queued (one
+    # asked for while YouTube Music was busy hasn't been)
+    "tried": _DOWNLOAD_TRIED,
+    "untried": f"NOT ({_DOWNLOAD_TRIED})",
     "failed": "i.state = 'failed'",
 }
+
+# What the sidebar's "<action> all" takes of a kind (the attention group
+# says, and the sidebar asks for it): "Download missing all" takes the
+# albums never tried; one already tried is retried from its own page, or
+# picked in Review.
+BULK_FILTERS = {"missing_tracks": "untried"}
 
 
 async def issues_for(*, artist_dir: str | None = None, album_keys: list[str] | None = None,
@@ -144,20 +156,47 @@ async def issues_for(*, artist_dir: str | None = None, album_keys: list[str] | N
         f"SELECT DISTINCT i.* FROM md_issues i {joins} WHERE {sql_where} "
         "ORDER BY CASE i.severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, "
         "i.updated_at DESC LIMIT ? OFFSET ?", (*params, limit, offset))
-    return total["n"], [issues_mod.issue_out(r) for r in rows]
+    items = [issues_mod.issue_out(r) for r in rows]
+    # the album each is about, by the id its page is opened with
+    ids = await _unit_ids([i["album_key"] for i in items if i.get("album_key")])
+    for item in items:
+        item["unit_id"] = ids.get(item.get("album_key"))
+    return total["n"], items
+
+
+async def _unit_ids(keys: list[str]) -> dict[str, str]:
+    keys = list(dict.fromkeys(keys))
+    out: dict[str, str] = {}
+    for i in range(0, len(keys), 400):
+        chunk = keys[i:i + 400]
+        for r in await db.fetchall(
+                f"SELECT key, unit_id FROM md_albums WHERE key IN ({','.join('?' * len(chunk))})",
+                tuple(chunk)):
+            out[r["key"]] = r["unit_id"]
+    return out
 
 
 async def attention(artist_dir: str | None = None) -> dict:
-    joins, where, params = "", "i.state IN ('open', 'failed', 'queued')", []
+    """Needs attention, by kind: `count` is what needs the user (open and
+    failed, issues.ATTENTION_STATES), and the total is theirs. Beside it,
+    what is under way (`queued_count`) and the Tried bucket (`tried_count`),
+    so a kind with only those still shows."""
+    joins, where, params = "", "i.state IN ('open', 'failed', 'queued', 'tried')", []
     if artist_dir is not None:
         joins = "JOIN md_issue_refs r ON r.issue_id = i.id"
         where += " AND r.artist_dir = ?"
         params.append(artist_dir)
+    bulk = " OR ".join(f"(i.kind = '{kind}' AND ({ISSUE_FILTERS[f]}))"
+                       for kind, f in BULK_FILTERS.items())
     rows = await db.fetchall(
-        f"SELECT i.kind, COUNT(DISTINCT i.id) AS n, "
+        f"SELECT i.kind, "
+        f"COUNT(DISTINCT CASE WHEN i.state IN ('open', 'failed') THEN i.id END) AS n, "
         f"COUNT(DISTINCT CASE WHEN i.auto = 1 AND i.state = 'open' THEN i.id END) AS auto_n, "
         f"COUNT(DISTINCT CASE WHEN i.state = 'failed' THEN i.id END) AS failed_n, "
-        f"COUNT(DISTINCT CASE WHEN i.state = 'queued' THEN i.id END) AS queued_n "
+        f"COUNT(DISTINCT CASE WHEN i.state = 'queued' THEN i.id END) AS queued_n, "
+        f"COUNT(DISTINCT CASE WHEN i.state = 'tried' THEN i.id END) AS tried_n, "
+        f"COUNT(DISTINCT CASE WHEN i.state IN ('open', 'failed') AND ({bulk}) "
+        f"THEN i.id END) AS bulk_n "
         f"FROM md_issues i {joins} WHERE {where} GROUP BY i.kind", tuple(params))
     groups = []
     for r in rows:
@@ -165,9 +204,14 @@ async def attention(artist_dir: str | None = None) -> dict:
         groups.append({"kind": r["kind"], "label": meta.get("label", r["kind"]),
                        "severity": meta.get("severity", "info"), "count": r["n"],
                        "auto_count": r["auto_n"], "failed_count": r["failed_n"],
-                       "queued_count": r["queued_n"], "applyable": bool(meta.get("applyable")),
+                       "queued_count": r["queued_n"], "tried_count": r["tried_n"],
+                       "applyable": bool(meta.get("applyable")),
                        "action_label": meta.get("action"),
                        "description": meta.get("description")})
+        if r["kind"] in BULK_FILTERS:
+            # what "<action> all" takes (open, failed: not queued)
+            groups[-1]["bulk_count"] = r["bulk_n"]
+            groups[-1]["bulk_filter"] = BULK_FILTERS[r["kind"]]
     groups.sort(key=lambda g: (_SEVERITY_RANK.get(g["severity"], 3), -g["count"]))
     return {"scope": artist_dir or "library", "total": sum(g["count"] for g in groups),
             "groups": groups}
@@ -258,10 +302,11 @@ async def _album_summary(key: str, rows: list[dict], record: dict | None,
     target = None
     if want and want.get("folder") and want["folder"] != folder:
         target = want["folder"]
+    unit_id = (record or {}).get("unit_id")
     return {
-        **summary, "key": key,
+        **summary, "key": key, "unit_id": unit_id,
         "album": summary["album"] if "|" not in key or summary["album"] else key.split("|", 1)[1],
-        "art_url": _art_url(key=key),
+        "art_url": _art_url(key=unit_id or key),
         "status": (record or {}).get("status") or "pending",
         "ignored": bool((record or {}).get("ignored")),
         "no_release": bool((record or {}).get("no_release")),
@@ -327,6 +372,12 @@ async def _issue_album_targets(issue: dict) -> list[str]:
     d = issue.get("detail") or {}
     targets += d.get("dirpaths") or []
     targets += d.get("units") or []
+    for uid in d.get("unit_ids") or []:
+        # the albums it names, where they are now
+        found = await units.resolve(uid)
+        key = (found or {}).get("key") or ((found or {}).get("redirect") or {}).get("key")
+        if key:
+            targets.append(key)
     if issue["kind"] == "dup_track":
         targets += sorted({p.rsplit("/", 1)[0] for p in d.get("paths") or []})
     return list(dict.fromkeys(targets))
@@ -347,6 +398,12 @@ def _norm(value) -> list[str]:
 
 
 async def album(key: str) -> dict | None:
+    """One album, named by its unit id or its key (an old link's). One
+    merged into another answers {"redirect": that one}."""
+    found = await units.resolve(key)
+    if found and found.get("redirect"):
+        return {"redirect": found["redirect"]}
+    key = found["key"] if found else key
     rows = await units.load_unit(key)
     if not rows:
         return None
@@ -359,7 +416,7 @@ async def album(key: str) -> dict | None:
     _, album_issues = await issues_for(album_keys=list(dict.fromkeys([key, folder])), limit=500)
     summary = await _album_summary(key, rows, record, album_issues)
     from .desired import overrides_for
-    overrides = await overrides_for("album", key)
+    overrides = await overrides_for("album", record["unit_id"]) if record else {}
 
     file_genres = sorted({g for r in rows for g in (r.get("genre") or "").split("; ") if g})
     plex_title_artist = None
@@ -461,7 +518,8 @@ async def album(key: str) -> dict | None:
                                 (f"missing_tracks:{record['release_mbid']}",))
         if row and row["state"] in OPEN_STATES:
             d = json.loads(row["detail"] or "{}")
-            missing = {"issue_id": row["id"], "total": d.get("total"), "have": d.get("have"),
+            missing = {"issue_id": row["id"], "state": row["state"],
+                       "total": d.get("total"), "have": d.get("have"),
                        "tracks": d.get("missing") or [], "download": d.get("download"),
                        "partial": False,
                        "other_folders": [u for u in d.get("units") or [] if u != key]}
@@ -470,8 +528,9 @@ async def album(key: str) -> dict | None:
             # is worth showing
             d = await missing_tracks.compute(record["release_mbid"])
             if d and d["missing"] and d["partial"]:
-                missing = {"issue_id": None, "total": d["total"], "have": d["have"],
-                           "tracks": d["missing"], "download": None, "partial": True,
+                missing = {"issue_id": None, "state": None, "total": d["total"],
+                           "have": d["have"], "tracks": d["missing"], "download": None,
+                           "partial": True,
                            "other_folders": [u for u in d["units"] if u != key]}
     return {
         **summary,
@@ -502,12 +561,15 @@ async def changes(*, album_key: str | None = None, artist_dir: str | None = None
         where.append("artist_dir = ?")
         params.append(artist_dir)
     sql_where = f"WHERE {' AND '.join(where)}" if where else ""
+    # a batch of album records merged and nothing else (the registry
+    # following files moved outside the app) has nothing on disk to undo
     rows = await db.fetchall(
         f"SELECT batch_id, MIN(applied_at) AS applied_at, MAX(summary) AS summary, "
         f"MIN(target) AS target, COUNT(*) AS count, "
         f"SUM(reverted_at IS NOT NULL) AS reverted_n, MAX(album_key) AS album_key, "
         f"MAX(artist_dir) AS artist_dir, MAX(id) AS last_id FROM md_changes {sql_where} "
-        f"GROUP BY batch_id ORDER BY last_id DESC LIMIT ?", (*params, limit))
+        f"GROUP BY batch_id HAVING SUM(target != 'unit') > 0 ORDER BY last_id DESC LIMIT ?",
+        (*params, limit))
     return [{"batch_id": r["batch_id"], "applied_at": r["applied_at"], "summary": r["summary"],
              "target": r["target"], "count": r["count"],
              "reverted": r["reverted_n"] == r["count"], "album_key": r["album_key"],

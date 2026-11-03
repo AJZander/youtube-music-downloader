@@ -139,6 +139,8 @@ class PlanTestCase(unittest.TestCase):
                                               mock.AsyncMock(return_value=box)),
                             mock.patch.object(issues, "other_album",
                                               mock.AsyncMock(return_value=False)),
+                            mock.patch.object(issues, "match_flipflop",
+                                              mock.AsyncMock(return_value=[])),
                             as_spelled()):
             want = asyncio.run(desired.build_album(rows, res, plex_album=None, plex_artist=None,
                                                    overrides={}))
@@ -619,7 +621,8 @@ class ReaddTestCase(DbTestCase):
         from app.metadata import apply
         rows = [{"path": "A/B/1.m4a", "dirpath": "A/B", "artist_dir": "A"}]
         ctx = apply.Ctx("A/B", rows, None, "A")
-        fake = mock.MagicMock(configured=True)
+        # Plex itself doesn't list the file either (see test_p0_plex_mirror)
+        fake = mock.MagicMock(configured=True, folder_files=mock.AsyncMock(return_value={}))
         with mock.patch.object(apply, "plex", fake), \
                 mock.patch.object(apply.plexsync, "album_for_paths",
                                   mock.AsyncMock(return_value={"tracks": {}})), \

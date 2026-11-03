@@ -36,7 +36,8 @@ from .catalog import BACKGROUND, CatalogError
 from .config import settings
 from .db import db
 from .events import bus
-from .library import album_identity, fold, strict_key
+from .identity import (TYPE_WORDS, album_id, album_identity, album_keys, artist_keys, fold,
+                       strict_key, type_words, unit_dir)
 from .models import ErrorClass, JobStatus
 
 log = logging.getLogger("mdl.discover")
@@ -399,7 +400,13 @@ async def owned_albums() -> frozenset[tuple[str, str]]:
     library — enough to say a listed release is already here without
     fetching its tracklist. Cached briefly; the library changes slowly. While
     nothing has changed the same set comes back, so callers can tell by
-    identity."""
+    identity.
+
+    An album whose tag or folder says it is a single or EP (`(1980) The Boys
+    Light Up [Single]`, tagged plainly) is keyed with its type (`…|single`):
+    it is that single, never the album named like it (see _owned_by). Its
+    names in any edition (every bracketed qualifier dropped) are keyed
+    too, behind a `*`."""
     if time.time() - _feed["at"] < OWNED_TTL:
         return _feed["keys"]
     rows = await db.fetchall(
@@ -408,13 +415,20 @@ async def owned_albums() -> frozenset[tuple[str, str]]:
     keys = set()
     for r in rows:
         hints = [r["top"], r["album_artist"]]
-        names = album_identity(r["album"], hints) | album_identity(r["norm_album"], hints)
         folder = r["dirpath"] or ""
-        if folder and folder != r["top"]:
-            names |= album_identity(folder.rsplit("/", 1)[-1], hints)
-        for artist in _artist_keys(r["top"]) | _artist_keys(r["album_artist"]):
+        names = set()
+        for name in (r["album"], r["norm_album"],
+                     folder.rsplit("/", 1)[-1] if folder and folder != r["top"] else None):
+            names |= album_keys(name, hints)
+            names |= {"*" + k for k in album_identity(name, hints)}
+        unit = unit_dir(folder)
+        leaf = unit.rsplit("/", 1)[-1] if unit and unit != r["top"] else None
+        kind = _type_suffix(type_words(r["album"], leaf, hints=hints))
+        # a release with several artists is filed under the whole credit
+        # ("Will Sparks, AnGy KoRe/Describe") but listed under the one scanned
+        for artist in artist_keys(r["top"]) | artist_keys(r["album_artist"]):
             for name in names:
-                keys.add((artist, name))
+                keys.add((artist, name + kind))
     keys = frozenset(keys)
     if keys != _feed["keys"]:
         _feed["keys"] = keys
@@ -422,34 +436,34 @@ async def owned_albums() -> frozenset[tuple[str, str]]:
     return _feed["keys"]
 
 
-# A release with several artists is filed under the whole credit
-# ("Will Sparks, AnGy KoRe/Describe") but listed under the one scanned.
-_CREDIT_SPLIT = re.compile(
-    r"\s+(?:x|and|&|feat\.?|ft\.?|featuring|with)\s+|\s*[,;/]\s*", re.I)
+def _type_suffix(words) -> str:
+    """How owned_albums keys an album that says it is a single or EP."""
+    found = sorted(set(words) & TYPE_WORDS)
+    return "|" + ",".join(found) if found else ""
 
 
-def _artist_keys(credit: str | None) -> set[str]:
-    """The whole credit's key and each named artist's."""
-    if not credit:
-        return set()
-    keys = {strict_key(credit)} | {strict_key(p) for p in _CREDIT_SPLIT.split(credit)}
-    keys.discard("")
-    return keys
-
+_ANY_TYPE = ("", "|ep", "|single", "|ep,single")
 
 # Run over every release an artist has, each time one is stored; a title
 # says the same thing each time.
 _key = functools.lru_cache(maxsize=1 << 16)(strict_key)
-_identity = functools.lru_cache(maxsize=1 << 16)(album_identity)
+_album = functools.lru_cache(maxsize=1 << 16)(album_id)
 _classify = functools.lru_cache(maxsize=1 << 16)(catalog.classify_release)
 
 
-def _owned_by(owned, artist_key: str, title: str) -> bool:
-    return any((artist_key, name) in owned for name in _identity(title))
+def _owned_by(owned, artist_key: str, title: str, kind: str | None = None) -> bool:
+    """Whether the library holds this release, by name in any edition
+    (identity.same_album, "release_group"). A single or EP (`kind`) is held
+    by its `[Single]` folder or under its plain name; an album is never held
+    by a single named like it."""
+    album = _album(title, kind=kind if kind in TYPE_WORDS else None)
+    suffixes = _ANY_TYPE if album.kind else (_type_suffix(album.types),)
+    names = list(album.keys) + ["*" + k for k in album.names]
+    return any((artist_key, name + suffix) in owned for name in names for suffix in suffixes)
 
 
-def _in_library(owned, artist: str | None, title: str) -> bool:
-    return _owned_by(owned, _key(artist or ""), title)
+def _in_library(owned, artist: str | None, title: str, kind: str | None = None) -> bool:
+    return _owned_by(owned, _key(artist or ""), title, kind)
 
 
 def _chunks(items, size: int = 500):
@@ -488,7 +502,7 @@ async def _derive(channel_ids) -> None:
                 updates.append((
                     _classify(r["title"], r["type"] or "album"), title_key, artist_key,
                     fold(f"{r['title']} {artist}"), int(i == 0),
-                    int(_owned_by(owned, artist_key, r["title"])), dismissed,
+                    int(_owned_by(owned, artist_key, r["title"], r["type"])), dismissed,
                     r["browse_id"]))
     await db.executemany(
         "UPDATE discover_releases SET category = ?, title_key = ?, artist_key = ?, "
@@ -502,7 +516,7 @@ async def _sync_owned() -> None:
     synced = _feed.get("synced")
     if synced is owned:
         return
-    columns = "SELECT browse_id, artist_key, title, owned FROM discover_releases"
+    columns = "SELECT browse_id, artist_key, title, type, owned FROM discover_releases"
     if synced is None:
         rows = await db.fetchall(columns)
     else:
@@ -512,7 +526,7 @@ async def _sync_owned() -> None:
                 f"{columns} WHERE artist_key IN ({_marks(len(chunk))})", tuple(chunk))
     changes = []
     for r in rows:
-        have = int(_owned_by(owned, r["artist_key"] or "", r["title"]))
+        have = int(_owned_by(owned, r["artist_key"] or "", r["title"], r["type"]))
         if have != r["owned"]:
             changes.append((have, r["browse_id"]))
     await db.executemany("UPDATE discover_releases SET owned = ? WHERE browse_id = ?",
@@ -756,7 +770,7 @@ async def annotate_youtube(found: dict) -> dict:
     for a in found["albums"]:
         row = stored.get(a["browse_id"])
         albums.append({**a, "in_library": bool(row["owned"]) if row
-                       else _in_library(owned, a["artist"], a["title"]),
+                       else _in_library(owned, a["artist"], a["title"], a.get("type")),
                        "downloaded": bool(row and row["downloaded"])})
     return {
         "artists": [{**a, "source": known.get(a["channel_id"])} for a in found["artists"]],

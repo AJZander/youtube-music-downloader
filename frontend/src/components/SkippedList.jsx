@@ -15,16 +15,23 @@ export default function SkippedList({ onChanged }) {
 
   const [recheck, setRecheck] = useState(null)
   const [notice, setNotice] = useState(null)
+  // what went wrong with the last action or load, said rather than swallowed
+  const [error, setError] = useState(null)
 
   const refresh = useCallback(() => {
     api.skipped({ limit: 500, only_different_album: onlyDifferent })
-      .then(setData).catch(() => {})
+      .then(setData).catch((e) => setError(e.message))
     api.skippedRecheckPreview().then(setRecheck).catch(() => {})
   }, [onlyDifferent])
   useEffect(() => { refresh(); setShown(PAGE) }, [refresh])
 
   const act = async (id, action) => {
-    await api.resolveTrack(id, action)
+    try {
+      await api.resolveTrack(id, action)
+      setError(null)
+    } catch (e) {
+      setError(e.message)
+    }
     refresh(); onChanged?.()
   }
 
@@ -34,6 +41,7 @@ export default function SkippedList({ onChanged }) {
       + 'clears the list.')) return
     setBusy(true)
     try { await api.acknowledgeSkipped(null); refresh(); onChanged?.() }
+    catch (e) { setError(e.message) }
     finally { setBusy(false) }
   }
 
@@ -47,6 +55,8 @@ export default function SkippedList({ onChanged }) {
       const r = await api.skippedRecheck()
       setNotice(`Re-queued ${r.requeued} tracks from ${r.jobs} downloads.`)
       refresh(); onChanged?.()
+    } catch (e) {
+      setError(e.message)
     } finally { setBusy(false) }
   }
 
@@ -56,6 +66,8 @@ export default function SkippedList({ onChanged }) {
     <>
       {notice && <Alert severity="success" sx={{ mb: 1.5 }} onClose={() => setNotice(null)}>
         {notice}</Alert>}
+      {error && <Alert severity="error" sx={{ mb: 1.5 }} onClose={() => setError(null)}>
+        {error}</Alert>}
       {recheck?.tracks > 0 && (
         <Alert severity="info" sx={{ mb: 1.5 }}
           action={<Button size="small" color="inherit" disabled={busy} onClick={runRecheck}>
@@ -108,9 +120,12 @@ export default function SkippedList({ onChanged }) {
             <Typography variant="body1" sx={{ flexGrow: 1 }}>
               {[t.artist, t.title].filter(Boolean).join(' — ') || t.source_url}
             </Typography>
-            {t.different_album && (
+            {t.different_album && (t.different_reason === 'edition' ? (
+              <Chip size="small" color="info" label="other edition"
+                title="Another edition of this album, in another folder, has the track" />
+            ) : (
               <Chip size="small" color="warning" label="different album" />
-            )}
+            ))}
           </Box>
           <Typography variant="caption" color="text.secondary" display="block">
             Wanted from: {t.album || '(no album)'}
@@ -118,6 +133,11 @@ export default function SkippedList({ onChanged }) {
           <Typography variant="caption" color="text.secondary" display="block">
             Already in library: {t.matched_path || '(unknown)'}
           </Typography>
+          {t.error_message && (
+            <Typography variant="caption" color="text.secondary" display="block">
+              Why: {t.error_message}
+            </Typography>
+          )}
           <Box sx={{ mt: 1, display: 'flex', gap: 1 }}>
             <Button size="small" variant="outlined"
               onClick={() => act(t.id, 'force_download')}

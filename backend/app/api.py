@@ -14,14 +14,13 @@ from .config import settings
 from .db import db, utcnow
 from .engine import spotify, ytdlp_engine
 from .engine.governor import governor
-from .engine.matcher import normalize
 from .engine.router import UnsupportedURL, route
-from . import catalog, discover, library, ordering
+from . import catalog, discover, identity, library, ordering
 from .events import bus, sse_format
 from .importer import library_online
+from .metadata import recheck
 from .models import (ACTIVE_JOB_STATUSES, JobStatus, TrackStatus, row_to_job,
                      row_to_track)
-from .paths import PathBuildError, sanitize_component
 from .plex import plex
 from .worker import FORCE_GUARDS, FORCE_VALIDATION, worker
 
@@ -259,25 +258,100 @@ def _matched_album(library_path: str | None) -> str | None:
     return parts[-2] if len(parts) >= 2 else None
 
 
-def _album_key(name: str) -> str:
-    """Comparison key for 'is this the same album as the folder it matched'.
-
-    It has to go through sanitize_component first: that is what built the
-    folder, and it maps / : ? * etc to '_'. normalize() keeps underscores (they
-    are \\w) while stripping the punctuation they replaced, so comparing the raw
-    album name reports 'Speakerboxxx/The Love Below' as a different album from
-    its own folder 'Speakerboxxx_The Love Below'."""
-    try:
-        name = sanitize_component(name)
-    except PathBuildError:
-        pass
-    return normalize(str(name).replace("_", " "))
+# The error codes today's gate stamps on the skips it makes (worker.py).
+_GATE_CODES = ("held_same_album", "dest_exists")
 
 
-def _different_album(row) -> bool:
-    """A skip whose library match sits in another album's folder."""
-    matched = _matched_album(row["library_path"])
-    return bool(matched and row["album"] and _album_key(matched) != _album_key(row["album"]))
+async def _album_context(rows) -> dict:
+    """What _different_album compares, loaded once for a list of skips: the
+    matched files' index rows, each Download-missing job's target folder,
+    and the release groups and album tags the metadata manager knows
+    folders by. Files are found however the skip spelt their path (by
+    identity.path_key: the share ignores case)."""
+    paths = sorted({r["library_path"] for r in rows if r["library_path"]})
+    files: dict[str, dict] = {}
+    for i in range(0, len(paths), 500):
+        chunk = paths[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for f in await db.fetchall(
+                "SELECT path, dirpath, album, norm_album, album_artist, artist_dir, "
+                f"mb_releasegroupid FROM library_index WHERE path IN ({marks}) "
+                f"OR path_key IN ({marks})", (*chunk, *(identity.path_key(p) for p in chunk))):
+            key = identity.path_key(f["path"])
+            if key not in files or f["path"] in chunk:     # the very spelling first
+                files[key] = dict(f)
+    job_ids = sorted({r["job_id"] for r in rows})
+    targets: dict[str, str] = {}
+    for i in range(0, len(job_ids), 500):
+        chunk = job_ids[i:i + 500]
+        for j in await db.fetchall(
+                "SELECT id, target_dir FROM jobs WHERE target_dir IS NOT NULL "
+                f"AND id IN ({','.join('?' * len(chunk))})", tuple(chunk)):
+            targets[j["id"]] = j["target_dir"]
+    # by folder, in any case: /library is case-insensitive
+    groups: dict[str, set[str]] = {}
+    tags: dict[str, set[str]] = {}
+    if targets or len(files) < len(paths):
+        for a in await db.fetchall(
+                "SELECT dirpath, releasegroup_mbid, album_tag FROM md_albums "
+                "WHERE releasegroup_mbid IS NOT NULL OR album_tag IS NOT NULL"):
+            folder = a["dirpath"].casefold()
+            if a["releasegroup_mbid"]:
+                groups.setdefault(folder, set()).add(a["releasegroup_mbid"])
+            if a["album_tag"]:
+                tags.setdefault(folder, set()).add(a["album_tag"])
+    return {"files": files, "targets": targets, "groups": groups, "tags": tags}
+
+
+def _different_album(row, ctx: dict | None = None) -> str | None:
+    """Why a skip's library match is on another album than the one wanted,
+    or None when it is the same album, or nothing says otherwise.
+
+      edition        a Download missing held by another folder of the same
+                     release group: a sibling edition has the track
+      release group  the match is on another release group (a single, a
+                     compilation, another album)
+      album          by name (identity.same_album): the year stripped,
+                     edition words and `[Single]` kept, so `(2019) Rare Ass
+                     Shit` is `Rare Ass Shit` and `Seventy (Deluxe Edition)`
+                     is not `Seventy`
+
+    A Download missing whose match is in the album's own folder (its disc
+    subfolders counted in, in any case) is the same album, whatever YouTube
+    Music calls it."""
+    path = row["library_path"]
+    if not path:
+        return None
+    ctx = ctx or {}
+    # a file no longer indexed is judged by its folder: its name, and the
+    # album tags the metadata manager knows it by (the files that stayed
+    # carry those); the folder of one the importer indexed is taken from its
+    # path (no dirpath until the next scan)
+    indexed = (ctx.get("files") or {}).get(identity.path_key(path))
+    file = indexed or {"path": path, "artist_dir": path.split("/", 1)[0]}
+    folder = library.unit_dir(file.get("dirpath") or path.rpartition("/")[0])
+    target = (ctx.get("targets") or {}).get(row["job_id"])
+    if target:
+        if folder.casefold() == target.casefold():
+            return None
+        groups = ctx.get("groups") or {}
+        wanted = groups.get(target.casefold(), set())
+        held = ({file["mb_releasegroupid"]} if file.get("mb_releasegroupid")
+                else groups.get(folder.casefold(), set()))
+        if wanted and held:
+            return "edition" if wanted & held else "release group"
+    held = identity.row_album_id(file)
+    if not indexed:
+        hints = (file["artist_dir"],)
+        tags = sorted((ctx.get("tags") or {}).get(folder.casefold(), ()))
+        named = [identity.album_id(tag, hints) for tag in tags]
+        held = identity.AlbumId(held.keys.union(*(a.keys for a in named)),
+                                held.edition.union(*(a.edition for a in named)),
+                                types=held.types.union(*(a.types for a in named)),
+                                names=held.names.union(*(a.names for a in named)))
+    # by name, in any edition, as the gate judges it
+    verdict = identity.same_album(identity.album_id(row["album"]), held, "release_group")
+    return "album" if verdict.same is False else None
 
 
 @router.get("/tracks/skipped")
@@ -287,18 +361,22 @@ async def list_skipped(limit: int = Query(100, le=500), offset: int = 0,
 
     The gate used to match on artist+title and ignore the album, so a track
     on a compilation blocked the studio-album copy; skips from then are
-    flagged by album disagreement. It now requires the same album, so new
-    skips should not disagree — /tracks/skipped/recheck re-queues old ones."""
+    flagged by album disagreement (different_reason: see _different_album).
+    It now requires the same album, and says why in error_message —
+    /tracks/skipped/recheck re-queues old ones."""
     rows = await db.fetchall(
         "SELECT * FROM tracks WHERE status = ? AND review_acked = 0 "
         "ORDER BY created_at DESC", (TrackStatus.SKIPPED_DUPLICATE,))
+    ctx = await _album_context(rows)
 
     items = []
     for r in rows:
         track = row_to_track(r).model_dump()
         track["matched_album"] = _matched_album(r["library_path"])
         track["matched_path"] = r["library_path"]
-        track["different_album"] = _different_album(r)
+        reason = _different_album(r, ctx)
+        track["different_album"] = reason is not None
+        track["different_reason"] = reason
         items.append(track)
 
     differing = sum(1 for t in items if t["different_album"])
@@ -312,12 +390,19 @@ async def list_skipped(limit: int = Query(100, le=500), offset: int = 0,
 async def _cross_album_skips() -> list:
     """Every skip — reviewed or not — that matched a song on another album,
     outside cancelled jobs. Under the same-album rule these should not have
-    been skipped."""
+    been skipped. Left out: skips today's gate made, which it would make
+    again — the ones it stamps, and every Download missing one: Download
+    missing came after the same-album gate, so it made all of those, stamped
+    or not. Re-queueing them only brings the banner back, or downloads what
+    another edition holds."""
     rows = await db.fetchall(
         "SELECT t.* FROM tracks t JOIN jobs j ON j.id = t.job_id "
-        "WHERE t.status = ? AND j.status != ? ORDER BY j.created_at, t.position",
-        (TrackStatus.SKIPPED_DUPLICATE, JobStatus.CANCELLED))
-    return [r for r in rows if _different_album(r)]
+        "WHERE t.status = ? AND j.status != ? AND j.target_dir IS NULL "
+        f"AND COALESCE(t.error_code, '') NOT IN ({','.join('?' * len(_GATE_CODES))}) "
+        "ORDER BY j.created_at, t.position",
+        (TrackStatus.SKIPPED_DUPLICATE, JobStatus.CANCELLED, *_GATE_CODES))
+    ctx = await _album_context(rows)
+    return [r for r in rows if _different_album(r, ctx)]
 
 
 @router.get("/tracks/skipped/recheck")
@@ -839,6 +924,10 @@ async def library_trash(body: TrashIn):
                 body.reason or "kept side by side")
     except library.LibraryError as exc:
         raise HTTPException(409, str(exc))
+    folders = await library.trash_folders(result["batch_id"]) if result.get("batch_id") else []
+    kept = body.keep_together if body.keep_together and len(body.keep_together) > 1 else []
+    result["recheck"] = await _recheck(folders + _exclusion_folders(body.scope, kept),
+                                       artist_dirs=_artists_of(folders))
     return result
 
 
@@ -851,7 +940,34 @@ async def library_add_exclusion(body: ExclusionIn):
         pairs = await library.add_exclusions(body.scope, body.keys, body.reason)
     except library.LibraryError as exc:
         raise HTTPException(422, str(exc))
-    return {"pairs": pairs}
+    return {"pairs": pairs,
+            "recheck": await _recheck(_exclusion_folders(body.scope, body.keys))}
+
+
+async def _recheck(folders: list[str], artist_dirs=()) -> dict | None:
+    """Needs attention brought up to date with what the action just
+    changed (metadata.recheck). The action is done by then: a re-check that
+    fails is left to the next cycle, and doesn't fail the request."""
+    try:
+        return await recheck.after_library_change(folders, artist_dirs=artist_dirs)
+    except Exception:
+        log.exception("re-check after a library change failed")
+        return None
+
+
+def _artists_of(folders) -> list[str]:
+    return sorted({f.split("/", 1)[0] for f in folders if f})
+
+
+def _exclusion_folders(scope: str, keys: list[str]) -> list[str]:
+    """The album folders a "not duplicates" decision is about: an album
+    pair's own, a track pair's folders. An artist pair's changes only the
+    duplicate findings."""
+    if scope == "album":
+        return list(keys)
+    if scope == "track":
+        return [k.rpartition("/")[0] for k in keys]
+    return []
 
 
 @router.get("/library/exclusions")
@@ -861,8 +977,13 @@ async def library_list_exclusions():
 
 @router.delete("/library/exclusions")
 async def library_delete_exclusions(body: ExclusionDeleteIn):
-    """Undo a decision, so the group can be reported again."""
-    return {"removed": await library.remove_exclusions(body.ids)}
+    """Undo a decision, so the group can be reported again: at once, as
+    "not duplicates" closed it."""
+    pairs = await library.exclusion_pairs(body.ids)
+    removed = await library.remove_exclusions(body.ids)
+    folders = {f for p in pairs for f in _exclusion_folders(p["scope"], [p["key_a"], p["key_b"]])}
+    return {"removed": removed,
+            "recheck": await _recheck(sorted(folders)) if pairs else None}
 
 
 @router.get("/library/trash")
@@ -873,9 +994,12 @@ async def library_trash_list(include_restored: bool = False):
 @router.post("/library/trash/{batch_id}/restore")
 async def library_trash_restore(batch_id: str):
     try:
-        return await library.restore_batch(batch_id)
+        result = await library.restore_batch(batch_id)
     except library.LibraryError as exc:
         raise HTTPException(409, str(exc))
+    folders = await library.trash_folders(batch_id)
+    result["recheck"] = await _recheck(folders, artist_dirs=_artists_of(folders))
+    return result
 
 
 @router.post("/library/trash/purge")
@@ -890,10 +1014,13 @@ async def library_trash_purge(body: PurgeIn):
 @router.post("/library/artists/merge")
 async def library_merge_artists(body: MergeArtistsIn):
     try:
-        return await library.merge_artist_folders(
+        result = await library.merge_artist_folders(
             body.sources, body.target, rewrite_tags=body.rewrite_tags)
     except library.LibraryError as exc:
         raise HTTPException(409, str(exc))
+    artists = sorted({*body.sources, body.target})
+    result["recheck"] = await _recheck(artists, artist_dirs=artists)
+    return result
 
 
 @router.post("/library/plex/empty-trash")

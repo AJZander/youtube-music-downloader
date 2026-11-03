@@ -97,9 +97,14 @@ function TrackStatus({ track, ticked }) {
     )
   }
   if (track.library === 'elsewhere') {
-    const different = track.library_mismatch ? ', and looks like a different version' : ''
+    // the copy on this very album is a different version or length: not the track
+    const where = track.library_mismatch && track.library_same_album
+      ? 'In your library on this album, but a different version or length'
+      : 'Also in your library on another album'
+    const different = track.library_mismatch && !track.library_same_album
+      ? ', and looks like a different version' : ''
     return (
-      <Tooltip title={`Also in your library on another album: ${track.library_path}`
+      <Tooltip title={`${where}: ${track.library_path}`
         + `${lengths(track)}${different}. This album's copy still downloads.`}>
         <LibraryMusicOutlinedIcon sx={{ fontSize: 16, color: 'text.secondary' }} />
       </Tooltip>

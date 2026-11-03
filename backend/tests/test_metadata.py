@@ -586,7 +586,10 @@ class SharedPlexAlbumTestCase(unittest.TestCase):
                 mock.patch.object(desired.mb, "artist", mock.AsyncMock(return_value={})), \
                 mock.patch.object(issues, "conflict_of", mock.AsyncMock(return_value=None)), \
                 mock.patch.object(issues, "changed_by_us", mock.AsyncMock(return_value=changed)), \
+                mock.patch.object(issues, "match_flipflop", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(issues.db, "fetchall", mock.AsyncMock(return_value=[])), \
                 as_spelled():
+            # (no registry: another unit is named by its folder)
             want = asyncio.run(desired.build_album(rows, res, plex_album=None, plex_artist=None,
                                                    overrides={}))
             want["genres"] = ["Pop"]
@@ -617,10 +620,14 @@ class SharedPlexAlbumTestCase(unittest.TestCase):
         self.assertEqual(plan["plex_shared"]["detail"]["rating_key"], "50")
 
     def test_the_same_albums_tracks_from_another_folder_are_not_another_album(self):
+        # nothing of another album's to put back, but an album holding another
+        # folder's tracks is no one folder's to match or tag until it is one
         plan = self.plan(self.rows, self.plex([{"path": "A/B (bonus)/2.flac", "album": "Celebrity",
-                                                "mb_releasegroupid": None}]))
-        self.assertIn("unmatched", plan)
-        self.assertNotIn("album", plan["genres"]["detail"])
+                                                "mb_releasegroupid": None}]), changed=True)
+        self.assertNotIn("plex_shared", plan)
+        self.assertNotIn("unmatched", plan)
+        self.assertEqual(plan["plex_foreign"]["detail"]["folders"], ["A/B (bonus)"])
+        self.assertIs(plan["genres"]["detail"]["album"], False)
 
     def test_a_stray_track_does_not_take_the_album_from_its_owner(self):
         from app.metadata.plexsync import shares_album
@@ -994,6 +1001,7 @@ class OldPlexEntriesTestCase(unittest.IsolatedAsyncioTestCase):
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "Arctic Monkeys" / "(2013) AM").mkdir(parents=True)
         (self.tmp / "Queen").mkdir()
+        (self.tmp / ".mdl-library-online").touch()      # Plex's trash is emptied only then
         self.patch = mock.patch.object(settings, "library_dir", self.tmp)
         self.patch.start()
 
@@ -1061,14 +1069,16 @@ class ApplyPassesTestCase(unittest.IsolatedAsyncioTestCase):
                                        (3, "tags", "A/y"), (4, "move", "A/z")]}
 
         async def fetchall(sql, params):
+            if "FROM md_albums" in sql:
+                return []       # the albums' layout folders (runner._folders)
             return [queued[i] for i in params]
 
-        async def start(key, members):
+        async def start(key, members, queue=True):
             return 0, 0, {"key": key, "ctx": apply.Ctx(key, [], None, "A"), "old_artist": "A",
                           "files": [m for m in members if m["kind"] in apply.FILE_STAGE],
                           "plex_stage": [m for m in members if m["kind"] in apply.PLEX_STAGE]}
 
-        async def simple(todo, ctx, executors):
+        async def simple(todo, ctx, executors, **kwargs):
             order.extend((i["kind"], ctx.key) for i in todo)
             ctx.plex_dirty = True
             if ctx.key == "A/x":
@@ -1234,10 +1244,11 @@ class LibraryAwareTestCase(unittest.IsolatedAsyncioTestCase):
             "error, created_at, updated_at) VALUES ('f', 'move', 'album', 'A/Singles|x', "
             "'A/Singles|x', 'info', 'x', 'failed', 'the album is no longer there', '', '')")
         await units.sync_registry()
-        row = await self.db.fetchone("SELECT state FROM md_issues WHERE key = 'g'")
-        self.assertEqual(row["state"], "applied")
+        # superseded, saying why: no fix of ours ran (review 2026-11, P1-A1)
+        row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 'g'")
+        self.assertEqual((row["state"], row["error"]), ("superseded", "the album is no longer there"))
         row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 'f'")
-        self.assertEqual((row["state"], row["error"]), ("applied", None))
+        self.assertEqual((row["state"], row["error"]), ("superseded", "the album is no longer there"))
 
     async def test_a_fix_for_an_album_that_is_gone_closes_rather_than_fails(self):
         from app.metadata import runner as runmod
@@ -1249,7 +1260,7 @@ class LibraryAwareTestCase(unittest.IsolatedAsyncioTestCase):
         issue = dict(await self.db.fetchone("SELECT * FROM md_issues WHERE key = 't'"))
         self.assertEqual(await r._start_album("A/Singles|x", [issue]), (0, 0, None))
         row = await self.db.fetchone("SELECT state, error FROM md_issues WHERE key = 't'")
-        self.assertEqual((row["state"], row["error"]), ("applied", None))
+        self.assertEqual((row["state"], row["error"]), ("superseded", "the album is no longer there"))
 
     async def named(self, credited, listed, aliases=()):
         rel = release(artist=credited)

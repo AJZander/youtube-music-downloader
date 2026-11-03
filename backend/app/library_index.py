@@ -1,35 +1,48 @@
 """library_index is the ground truth for duplicate detection — not yt-dlp's
 download archive (whose misuse in v1 claimed downloads whose files never
-existed). Bootstrapped by a full mutagen scan, maintained by the importer."""
-import asyncio
-import logging
+existed). Filled by library.scan, maintained by the importer."""
 from pathlib import Path
 
 from . import ownership
-from .config import settings
 from .db import db, utcnow
 from .engine.matcher import normalize
-from .engine.tagger import read_tags
+from .identity import path_key
 
-log = logging.getLogger("mdl.index")
 
-AUDIO_SUFFIXES = {".mp3", ".flac", ".opus", ".m4a", ".ogg", ".wav", ".aac", ".wma"}
+async def find_duplicate_match(provider_track_id: str | None, artist: str | None,
+                               title: str | None, album: str | None = None,
+                               duration: float | None = None,
+                               kind: str | None = None) -> dict | None:
+    """The library's copy of this track on this album, if it is already
+    there: the whole ownership lookup, so a skip can say what it matched and
+    how (`library_via`, `library_mismatch`).
+
+    Same album only (ownership.LibraryIndex.lookup): the song on a
+    compilation or a single is not a reason to skip it on the album being
+    downloaded. With no album known — a bare video link — only a file
+    downloaded from the very same video counts. `kind`: the release's type
+    when the job knows it (a YouTube Music release), else None."""
+    primary = (artist or "").split(",")[0].strip()
+    index = await ownership.load_index({artist or ""}, [primary], [provider_track_id])
+    found = index.lookup(title=title, credit=artist, album=album,
+                         video_id=provider_track_id, length=duration, kind=kind)
+    return found if found["library"] == "have" else None
 
 
 async def find_duplicate(provider_track_id: str | None, artist: str | None,
                          title: str | None, album: str | None = None,
                          duration: float | None = None) -> str | None:
-    """The library path of this track on this album, if it is already there.
+    """The library path of this track on this album, if it is already there
+    (see find_duplicate_match)."""
+    found = await find_duplicate_match(provider_track_id, artist, title, album, duration)
+    return found["library_path"] if found else None
 
-    Same album only (ownership.LibraryIndex.lookup): the song on a
-    compilation or a single is not a reason to skip it on the album being
-    downloaded. With no album known — a bare video link — only a file
-    downloaded from the very same video counts."""
-    primary = (artist or "").split(",")[0].strip()
-    index = await ownership.load_index({artist or ""}, [primary], [provider_track_id])
-    found = index.lookup(title=title, credit=artist, album=album,
-                         video_id=provider_track_id, length=duration)
-    return found["library_path"] if found["library"] == "have" else None
+
+def held_message(found: dict) -> str:
+    """Why the dedup gate skipped a track, for the Skipped list."""
+    note = "; version or length differs" if found.get("library_mismatch") else ""
+    return (f"Already in the library: {found['library_path']} "
+            f"(matched by {found.get('library_via') or 'title'}{note})")
 
 
 async def in_legacy_archive(provider: str, provider_id: str) -> bool:
@@ -42,84 +55,36 @@ async def in_legacy_archive(provider: str, provider_id: str) -> bool:
 async def add_entry(path: str, artist: str, title: str, album: str | None,
                     fmt: str | None, duration: float | None,
                     provider_track_id: str | None) -> None:
-    await db.execute(
-        """INSERT INTO library_index
-           (norm_artist, norm_title, norm_album, path, format, duration_sec,
-            provider_track_id, added_at)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(path) DO UPDATE SET
-             norm_artist=excluded.norm_artist, norm_title=excluded.norm_title,
-             norm_album=excluded.norm_album, format=excluded.format,
-             duration_sec=excluded.duration_sec,
-             provider_track_id=excluded.provider_track_id""",
-        (normalize(artist), normalize(title), normalize(album or ""),
-         path, fmt, duration, provider_track_id, utcnow()))
-
-
-def _scan_file(path: Path) -> tuple | None:
-    try:
-        tags = read_tags(path)
-    except Exception:
-        return None
-    artist = tags.get("artist") or ""
-    title = tags.get("title") or path.stem
-    if not artist:
-        # fall back to the artist folder name (library layout is Artist/Album/file)
-        try:
-            artist = path.relative_to(settings.library_dir).parts[0]
-        except Exception:
-            return None
-    return (normalize(artist), normalize(title), normalize(tags.get("album") or ""),
-            str(path.relative_to(settings.library_dir)),
-            path.suffix.lstrip(".").lower(), tags.get("duration_sec"), None, utcnow())
+    """The importer's new file, indexed as a scan reads it (its tags, its
+    folder, path_key), with the video it was downloaded from: the next scan
+    has nothing to read again, and the album sees the file at once. A file
+    that can't be read just now gets the bare row it always got."""
+    from . import relocate
+    if not await relocate.reread_files([path]):
+        await db.execute(
+            """INSERT INTO library_index
+               (norm_artist, norm_title, norm_album, path, format, duration_sec,
+                provider_track_id, added_at, path_key)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(path) DO UPDATE SET
+                 norm_artist=excluded.norm_artist, norm_title=excluded.norm_title,
+                 norm_album=excluded.norm_album, format=excluded.format,
+                 duration_sec=excluded.duration_sec,
+                 provider_track_id=excluded.provider_track_id""",
+            (normalize(artist), normalize(title), normalize(album or ""),
+             path, fmt, duration, provider_track_id, utcnow(), path_key(path)))
+    if provider_track_id:
+        await db.execute("UPDATE library_index SET provider_track_id = ? WHERE path = ?",
+                         (provider_track_id, path))
 
 
 async def rebuild(progress_cb=None) -> dict:
-    """Full rescan of the library into library_index. Runs file IO in a
-    thread; commits in batches. Takes a while over CIFS — CLI/maintenance."""
-    root = settings.library_dir
-    loop = asyncio.get_running_loop()
-
-    def _walk() -> list[Path]:
-        return [p for p in root.rglob("*")
-                if p.is_file() and p.suffix.lower() in AUDIO_SUFFIXES
-                and not p.name.startswith(".")]
-
-    files = await loop.run_in_executor(None, _walk)
-    log.info("library rebuild: %d audio files found", len(files))
-    # preserve provider-id associations of previously imported tracks
-    known_ids = {r["path"]: r["provider_track_id"] for r in await db.fetchall(
-        "SELECT path, provider_track_id FROM library_index "
-        "WHERE provider_track_id IS NOT NULL")}
-    await db.execute("DELETE FROM library_index")
-
-    rows, scanned, skipped = [], 0, 0
-    for i in range(0, len(files), 200):
-        batch = files[i:i + 200]
-        results = await loop.run_in_executor(
-            None, lambda b=batch: [_scan_file(p) for p in b])
-        for r in results:
-            if r:
-                if r[3] in known_ids:  # restore provider id for this path
-                    r = r[:6] + (known_ids[r[3]],) + r[7:]
-                rows.append(r)
-            else:
-                skipped += 1
-        scanned += len(batch)
-        if rows:
-            await db.executemany(
-                """INSERT INTO library_index
-                   (norm_artist, norm_title, norm_album, path, format,
-                    duration_sec, provider_track_id, added_at)
-                   VALUES (?,?,?,?,?,?,?,?)
-                   ON CONFLICT(path) DO NOTHING""",
-                rows)
-            rows = []
-        if progress_cb:
-            progress_cb(scanned, len(files))
-    count = (await db.fetchone("SELECT COUNT(*) AS c FROM library_index"))["c"]
-    log.info("library rebuild complete: %d indexed, %d unreadable", count, skipped)
-    return {"files": len(files), "indexed": count, "unreadable": skipped}
+    """Re-read every file in the library: library.scan(full=True). It used
+    to empty library_index and write back 8 columns with no dirpath, which
+    the next registry sync took for every album gone, Accept match and all.
+    The scan upserts in place and keeps each file's provider id."""
+    from . import library
+    return await library.scan(full=True, progress_cb=progress_cb)
 
 
 async def import_legacy_archive(archive_path: Path) -> int:

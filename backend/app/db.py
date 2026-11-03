@@ -1,6 +1,10 @@
 """SQLite access layer. One shared connection, writes serialized by a lock —
-throughput here is a handful of rows per track, contention is not a concern."""
+throughput here is a handful of rows per track, contention is not a concern.
+
+Each statement commits on its own, unless it runs in a transaction():
+then the task's statements are one commit, or none."""
 import asyncio
+import contextlib
 import shutil
 from datetime import datetime, timezone
 
@@ -8,7 +12,32 @@ import aiosqlite
 
 from .config import settings
 
-MIGRATIONS: list[str] = [
+
+async def _v13_path_keys(conn) -> None:
+    """v13 — one key for a path however it is spelled. /library is a
+    case-insensitive share: `SAM SMITH/x.flac` and `Sam Smith/x.flac` are one
+    file, and a name may arrive in either Unicode form. Paths are compared by
+    identity.path_key (NFC, casefolded); the index carries it, so a lookup by
+    it is an index search, and connect() registers the same function in SQL
+    for the other side of a join. Filled in chunks, in the migration's one
+    transaction. References that name no indexed file today stay as they
+    are: repairing them is a data repair, for the user to agree to."""
+    from .identity import path_key
+    await conn.execute("ALTER TABLE library_index ADD COLUMN path_key TEXT")
+    last = -1
+    while True:
+        cur = await conn.execute(
+            "SELECT id, path FROM library_index WHERE id > ? ORDER BY id LIMIT 2000", (last,))
+        rows = await cur.fetchall()
+        if not rows:
+            break
+        await conn.executemany("UPDATE library_index SET path_key = ? WHERE id = ?",
+                               [(path_key(r[1]), r[0]) for r in rows])
+        last = rows[-1][0]
+    await conn.execute("CREATE INDEX idx_li_path_key ON library_index(path_key)")
+
+
+MIGRATIONS: list = [
     # v1 — initial schema
     """
     CREATE TABLE jobs (
@@ -457,6 +486,97 @@ MIGRATIONS: list[str] = [
     ALTER TABLE md_albums ADD COLUMN no_release INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE jobs ADD COLUMN target_dir TEXT;
     """,
+    # v12 — albums that keep who they are. An album's key is its folder, which
+    # a move or a merge changes, and every decision keyed by it (an accepted
+    # match, a dismissal, a pinned genre) was lost with it. unit_id is the
+    # album's own: issues, overrides and pauses are keyed by it, and the key
+    # stays its location. library_index.unit_id says which album each file
+    # was last seen in (an app move updates the row, so the file carries it);
+    # the registry follows a vanished album to where its files went. An
+    # album merged into another leaves an alias, so its page can follow.
+    #
+    # Unit issues of live albums are re-keyed `kind:unit_id` here; history
+    # rows of albums already gone stay as they are. missing_tracks (keyed by
+    # release) and album_copies (planned again each pass) are left alone.
+    """
+    ALTER TABLE md_albums ADD COLUMN unit_id TEXT;
+    UPDATE md_albums SET unit_id = lower(hex(randomblob(8))) WHERE unit_id IS NULL;
+    CREATE UNIQUE INDEX idx_md_albums_unit ON md_albums(unit_id);
+    -- whatever inserts a row without one (a test's, an old code path's)
+    CREATE TRIGGER md_albums_unit_id AFTER INSERT ON md_albums
+      FOR EACH ROW WHEN NEW.unit_id IS NULL
+    BEGIN
+      UPDATE md_albums SET unit_id = lower(hex(randomblob(8))) WHERE rowid = NEW.rowid;
+    END;
+    ALTER TABLE library_index ADD COLUMN unit_id TEXT;
+    CREATE INDEX idx_li_unit ON library_index(unit_id);
+    CREATE TABLE md_unit_aliases (
+      unit_id TEXT PRIMARY KEY,
+      successor TEXT NOT NULL,
+      old_key TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_unit_aliases_key ON md_unit_aliases(old_key);
+    CREATE INDEX idx_unit_aliases_successor ON md_unit_aliases(successor);
+
+    UPDATE md_issues SET
+      ref = (SELECT m.unit_id FROM md_albums m WHERE m.key = md_issues.album_key),
+      key = kind || ':' || (SELECT m.unit_id FROM md_albums m WHERE m.key = md_issues.album_key)
+    WHERE kind IN ('not_in_plex', 'unmatched', 'wrong_match', 'tags', 'track_order', 'move',
+                   'move_conflict', 'plex_shared', 'plex_foreign', 'bad_file', 'genres',
+                   'moods', 'poster', 'review_match', 'unresolved', 'folder_artist',
+                   'extra_tracks')
+      AND key = kind || ':' || album_key
+      AND album_key IN (SELECT key FROM md_albums);
+    UPDATE md_overrides SET ref = (SELECT m.unit_id FROM md_albums m WHERE m.key = md_overrides.ref)
+    WHERE entity = 'album' AND ref IN (SELECT key FROM md_albums);
+    UPDATE md_state SET
+      key = 'auto_paused:' || (SELECT m.unit_id FROM md_albums m
+                               WHERE m.key = substr(md_state.key, 13))
+    WHERE substr(key, 1, 12) = 'auto_paused:' AND substr(key, 13) IN (SELECT key FROM md_albums);
+    """,
+    # v13 — library_index.path_key (see _v13_path_keys)
+    _v13_path_keys,
+    # v14 — the journal, looked up without reading it all (285,911 rows on a
+    # copy of the live data): by what a change was made to (a Plex item's
+    # locks and matches, a file's moves), and the moves of the last weeks
+    # (apply.oscillation's window).
+    """
+    CREATE INDEX IF NOT EXISTS idx_changes_target_ref ON md_changes(target, ref, field);
+    CREATE INDEX IF NOT EXISTS idx_changes_target_field_at ON md_changes(target, field, applied_at);
+    """,
+    # v15 — issue states that say what happened. attempts: how many times a
+    # fix of ours ran on the issue; applied_at: when one last did, so the
+    # check after it can tell a fix that didn't stick (failed) from a new
+    # problem (open). Rows from before keep NULL: nothing is made up for
+    # them. md_issue_events: every change of state, written by the triggers
+    # (whoever writes it), so "came back within 24 h" can be counted.
+    """
+    ALTER TABLE md_issues ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE md_issues ADD COLUMN applied_at TEXT;
+    CREATE TABLE md_issue_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      issue_id INTEGER NOT NULL,
+      at TEXT NOT NULL,
+      from_state TEXT,
+      to_state TEXT NOT NULL,
+      reason TEXT
+    );
+    CREATE INDEX idx_issue_events_issue ON md_issue_events(issue_id, id);
+    CREATE INDEX idx_issue_events_to ON md_issue_events(to_state, at);
+    CREATE TRIGGER md_issues_event_insert AFTER INSERT ON md_issues
+    BEGIN
+      INSERT INTO md_issue_events (issue_id, at, from_state, to_state, reason)
+      VALUES (NEW.id, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), NULL, NEW.state, NEW.error);
+    END;
+    CREATE TRIGGER md_issues_event_state AFTER UPDATE OF state ON md_issues
+      FOR EACH ROW WHEN OLD.state IS NOT NEW.state
+    BEGIN
+      INSERT INTO md_issue_events (issue_id, at, from_state, to_state, reason)
+      VALUES (NEW.id, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), OLD.state, NEW.state, NEW.error);
+    END;
+    """,
 ]
 
 
@@ -468,11 +588,18 @@ class Database:
     def __init__(self) -> None:
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None     # the task a transaction is open in
 
     async def connect(self) -> None:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
+        # the connection's own (one waited on belongs to the loop it was used in)
+        self._lock, self._owner = asyncio.Lock(), None
         self._conn = await aiosqlite.connect(settings.db_path)
         self._conn.row_factory = aiosqlite.Row
+        # path_key(path) in SQL is identity.path_key: library_index.path_key
+        # joins any spelling of a path to it
+        from .identity import path_key
+        await self._conn.create_function("path_key", 1, path_key, deterministic=True)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
@@ -484,36 +611,100 @@ class Database:
             self._conn = None
 
     async def _migrate(self) -> None:
+        """Each pending migration and its version row in one transaction: one
+        that fails, or is cut off, leaves nothing behind and runs again at the
+        next start. A migration is SQL, or an `async def step(conn)` that
+        runs its statements on the connection (no commits of its own)."""
         await self._conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT)"
         )
+        await self._conn.commit()
         cur = await self._conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
         current = (await cur.fetchone())[0]
-        for version, sql in enumerate(MIGRATIONS, start=1):
-            if version > current:
-                await self._conn.executescript(sql)
-                await self._conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    (version, utcnow()),
-                )
-        await self._conn.commit()
+        for version, step in enumerate(MIGRATIONS, start=1):
+            if version <= current:
+                continue
+            try:
+                if callable(step):
+                    await self._conn.execute("BEGIN")
+                    await step(self._conn)
+                    await self._conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                        (version, utcnow()))
+                    await self._conn.commit()
+                else:
+                    # executescript commits whatever is pending before it runs,
+                    # so the transaction is the script's own
+                    await self._conn.executescript(
+                        f"BEGIN;\n{step}\n;\nINSERT INTO schema_migrations (version, applied_at) "
+                        f"VALUES ({int(version)}, '{utcnow()}');\nCOMMIT;")
+            except BaseException:
+                if self._conn.in_transaction:
+                    await self._conn.rollback()
+                raise
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """The statements this task runs inside are one transaction: all
+        committed at the end, or, on an exception, none. They run as ever
+        (execute, fetchall, ... and every helper made of them), only without
+        a commit each. Other tasks' statements wait for the end. One opened
+        inside another is part of it.
+
+        Only database work goes inside: the lock is every writer's, so a
+        file read or an HTTP call in one holds them all up."""
+        if self._mine():
+            yield
+            return
+        async with self._lock:
+            self._owner = asyncio.current_task()
+            try:
+                # sqlite3 opened one for a statement on its own that failed
+                # (a constraint), and left it open: committed, as the next
+                # execute would (the failed statement itself is undone)
+                if self._conn.in_transaction:
+                    await self._conn.commit()
+                try:
+                    await self._conn.execute("BEGIN IMMEDIATE")
+                    yield
+                    await self._conn.commit()
+                except BaseException:
+                    if self._conn.in_transaction:
+                        await self._conn.rollback()
+                    raise
+            finally:
+                self._owner = None
+
+    def _mine(self) -> bool:
+        """Whether this task has a transaction open."""
+        return self._owner is not None and self._owner is asyncio.current_task()
 
     async def execute(self, sql: str, params: tuple = ()) -> None:
+        if self._mine():
+            await self._conn.execute(sql, params)
+            return
         async with self._lock:
             await self._conn.execute(sql, params)
             await self._conn.commit()
 
     async def executemany(self, sql: str, rows: list[tuple]) -> None:
+        if self._mine():
+            await self._conn.executemany(sql, rows)
+            return
         async with self._lock:
             await self._conn.executemany(sql, rows)
             await self._conn.commit()
 
     async def fetchone(self, sql: str, params: tuple = ()) -> aiosqlite.Row | None:
+        if self._mine():
+            return await (await self._conn.execute(sql, params)).fetchone()
         async with self._lock:
             cur = await self._conn.execute(sql, params)
             return await cur.fetchone()
 
     async def fetchall(self, sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
+        if self._mine():
+            return await (await self._conn.execute(sql, params)).fetchall()
         async with self._lock:
             cur = await self._conn.execute(sql, params)
             return await cur.fetchall()

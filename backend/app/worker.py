@@ -21,8 +21,9 @@ from .engine import tagger
 from .events import bus
 from .importer import (ImportError_, ensure_sentinel, import_track,
                        library_online, quarantine, scan_debouncer)
-from .library_index import add_entry, find_duplicate, in_legacy_archive
-from .models import ErrorClass, JobStatus, TrackStatus, TERMINAL_TRACK_STATUSES
+from .library_index import add_entry, find_duplicate_match, held_message, in_legacy_archive
+from .models import (ACTIVE_JOB_STATUSES, ErrorClass, JobStatus, TrackStatus,
+                     TERMINAL_TRACK_STATUSES)
 from .plex import plex
 from .validator import ALLOWED_SUFFIXES, ValidationError, validate_track
 
@@ -361,13 +362,19 @@ class Worker:
 
             # -------- pre-download dedup
             if not force_guards:
-                dup = await find_duplicate(track["provider_track_id"],
-                                           track["artist"], track["title"],
-                                           track["album"], track["expected_duration_sec"])
+                # a YouTube Music release's type: its album isn't its single
+                kind = await catalog.release_type(job["source_url"])
+                dup = await find_duplicate_match(track["provider_track_id"],
+                                                 track["artist"], track["title"],
+                                                 track["album"], track["expected_duration_sec"],
+                                                 kind=kind)
                 if dup:
+                    # The reason replaces whatever an earlier attempt left.
                     await self._update_track(
                         track_id, status=TrackStatus.SKIPPED_DUPLICATE,
-                        stage=None, library_path=dup, finished_at=utcnow())
+                        stage=None, library_path=dup["library_path"],
+                        error_code="held_same_album", error_message=held_message(dup)[:500],
+                        finished_at=utcnow())
                     await self._recompute_job(job_id)
                     return
             if track["provider_track_id"] and await in_legacy_archive(
@@ -420,20 +427,26 @@ class Worker:
 
             # -------- import
             await self._update_track(track_id, status=TrackStatus.IMPORTING, stage="importing")
+
+            async def landed(result: dict) -> None:
+                # indexed before the album's folder is let go (importer)
+                meta = result["meta"]
+                await add_entry(result["library_path"], meta["artist"], meta["title"],
+                                meta["album"], validated["format"],
+                                validated["duration_sec"], track["provider_track_id"])
+
+            # the folder as the job had it when the track started; the
+            # importer reads it again once it holds it (a move meanwhile)
             result = await import_track(validated["path"], validated, final_meta,
                                         force=force_guards,
                                         target_dir=job["target_dir"] if "target_dir" in job.keys()
-                                        else None)
+                                        else None, job_id=job_id, landed=landed)
             meta = result["meta"]
             if result["overwrote"]:
                 await bus.record(
                     "warning", "force_overwrite",
                     f"forced import replaced the existing {result['library_path']}",
                     job_id, track_id)
-
-            await add_entry(result["library_path"], meta["artist"], meta["title"],
-                            meta["album"], validated["format"],
-                            validated["duration_sec"], track["provider_track_id"])
             album_relpath = str(Path(result["library_path"]).parent)
             scan_debouncer.schedule(album_relpath)
 
@@ -626,6 +639,8 @@ class Worker:
                           ignore_errors=True)
             await self._update_track(track["id"], status=TrackStatus.SKIPPED_DUPLICATE,
                                      stage=None, library_path=exc.path,
+                                     error_code="dest_exists",
+                                     error_message=f"A file is already at {exc.path}"[:500],
                                      finished_at=utcnow())
             return
         # staging is intact — auto-retried by maintenance when the mount is healthy
@@ -728,6 +743,13 @@ class Worker:
                 fields["status"] = JobStatus.FAILED
             fields["finished_at"] = utcnow()
         await self._update_job(job_id, **fields)
+        if "status" in fields and job["status"] in ACTIVE_JOB_STATUSES:
+            # the albums it went into were left alone meanwhile (settling)
+            try:
+                from .metadata import runner
+                await runner.job_ended(job_id)
+            except Exception:
+                log.debug("metadata manager not told job %s ended", job_id, exc_info=True)
 
     # ------------------------------------------------------------ db + events
     async def _update_job(self, job_id: str, **fields) -> None:

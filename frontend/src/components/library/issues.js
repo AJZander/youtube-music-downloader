@@ -24,6 +24,8 @@ export const KINDS = {
     help: 'Files that can\'t be read — a zeroed or cut-off download. Nothing can tag them or show them in Plex. Applying re-reads each one and moves it to Trash only if it is still unreadable; "Download missing" then fetches a good copy.' },
   plex_shared: { label: 'Plex album shared', severity: 'warning', applyable: true,
     help: 'Plex files these tracks in one album with other albums\' tracks, and an earlier fix matched or tagged that album as this one. Applying puts back what Plex had.' },
+  plex_foreign: { label: 'Plex album mixes folders', severity: 'warning', applyable: false,
+    help: 'Plex shows these tracks in one album with another album folder\'s tracks — two editions tagged alike, or a track Plex first saw elsewhere — or the album was matched to different releases in turn. Until it holds this album\'s tracks only, nothing album-level is changed in Plex (no match, genres, moods or cover); the tracks still get their genres. Don\'t delete tracks in Plex to fix it: they are real files of the other album.' },
   genres: { label: 'Genres', severity: 'info', applyable: true,
     help: 'Plex shows different genres from ours. Applying sets and locks ours.' },
   moods: { label: 'Moods', severity: 'info', applyable: true,
@@ -85,16 +87,58 @@ export const BULK = {
       help: 'Keep the files\' own tags and stop asking' }],
   },
   missing_tracks: {
+    // The 'tried' filter is "a download ran"; it is not the Tried bucket
+    // (the issue's state 'tried': nothing left there is to fetch).
     filters: [
       { value: 'untried', label: 'Not tried yet' },
-      { value: 'tried', label: 'Download tried',
-        help: 'A download ran; what is left wasn\'t on YouTube Music or hasn\'t arrived' },
+      { value: 'tried', label: 'Download ran',
+        help: 'A download was queued; what is left may not be on YouTube Music, may have been '
+          + 'skipped as already held, or may still be coming. Download missing again moves it '
+          + 'to Tried.' },
     ],
     dismissLabel: 'Accept incomplete',
   },
   move_conflict: { confirmApply: true },
   album_copies: { confirmApply: true },
   bad_file: { confirmApply: true },
+}
+
+/** What an issue's state is called, and how loud its chip is ('open' has none). */
+export const ISSUE_STATES = {
+  failed: { label: 'failed', color: 'error',
+    help: 'The fix failed, or the problem was still there right after it. It isn\'t retried automatically.' },
+  queued: { label: 'in progress', color: 'info', help: 'A fix is queued or running.' },
+  tried: { label: 'tried', color: 'warning',
+    help: 'Download missing fetched what it could; the rest isn\'t there to fetch. Retry from the album, or accept it incomplete.' },
+  applied: { label: 'applied', color: 'success', help: 'A fix ran.' },
+  dismissed: { label: 'dismissed', color: 'default', help: 'Not reported again.' },
+  superseded: { label: 'superseded', color: 'default',
+    help: 'The album moved, was merged into another, or is gone: that one carries it now.' },
+  cleared: { label: 'cleared', color: 'default', help: 'No longer found.' },
+}
+
+/** The most issues one request lists (routes.list_issues: limit ≤ 1000). */
+export const MAX_PAGE = 1000
+
+/**
+ * `limit` issues from `offset`, asked for MAX_PAGE at a time: the Review
+ * dialog reads every row it shows again, and that can be more than one
+ * request gives. `page(offset, limit)` answers { total, items }.
+ */
+export async function readRows(page, offset, limit) {
+  const items = []
+  let d
+  do {
+    d = await page(offset + items.length, Math.min(MAX_PAGE, limit - items.length))
+    items.push(...d.items)
+  } while (d.items.length && items.length < limit && offset + items.length < d.total)
+  return { total: d.total, items }
+}
+
+/** The chip text for an issue's state: a failed fix says how often it ran. */
+export function stateLabel(issue) {
+  const label = ISSUE_STATES[issue.state]?.label || issue.state
+  return issue.state === 'failed' && issue.attempts > 1 ? `${label} ×${issue.attempts}` : label
 }
 
 export function kindLabel(kind) {
@@ -146,7 +190,21 @@ export function when(value) {
   return Number.isNaN(d.getTime()) ? value : d.toLocaleString()
 }
 
-/** #/library/<artist>/<album key> — both parts URL-encoded. */
+/**
+ * An album's reference in URLs, selections and API calls: its unit id, which
+ * stays the same when it moves (its key is its folder). A key still works,
+ * as old links have it.
+ */
+export function albumRef(album) {
+  return album ? (album.unit_id || album.key) : null
+}
+
+/** Whether `album` is the one `ref` (a unit id, or a key) names. */
+export function isAlbum(album, ref) {
+  return !!album && !!ref && (album.unit_id === ref || album.key === ref)
+}
+
+/** #/library/<artist>/<album unit id> — both parts URL-encoded. */
 export function parseHash(hash = window.location.hash) {
   const m = /^#\/library(?:\/([^/]*))?(?:\/([^/]*))?/.exec(hash || '')
   if (!m) return null

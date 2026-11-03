@@ -11,8 +11,9 @@ import shutil
 import uuid
 from pathlib import Path
 
+from . import locks, relocate
 from .config import settings
-from .db import utcnow
+from .db import db, utcnow
 from .engine import lyrics as lyrics_mod
 from .engine import tagger
 from .models import ErrorClass
@@ -77,13 +78,21 @@ async def _retry_io(func, description: str):
 
 
 async def import_track(staging_file: Path, validated: dict, track_meta: dict,
-                       force: bool = False, target_dir: str | None = None) -> dict:
+                       force: bool = False, target_dir: str | None = None,
+                       job_id: str | None = None, landed=None) -> dict:
     """Move a validated staging file into the library.
     track_meta carries authoritative metadata (Spotify) or {} (YouTube —
     validated tags are used). `target_dir` is an existing album folder the
     track belongs in (a missing track of that album): the file goes there,
     under its usual name, and the metadata manager tags and numbers it as
-    that album's. Returns import result fields for the DB."""
+    that album's. Returns import result fields for the DB.
+
+    The album folder is held (locks.hold) from the mkdir until the file is
+    in it and `landed(result)` has run (the worker indexes it there), so no
+    move, merge or Trash of the album runs meanwhile. `job_id`: the job the
+    track is of. A move that ran while the track waited for the folder took
+    the album elsewhere, and the job's target_dir with it (relocate): once
+    the folder is held, it is read again, and the track follows."""
     if not library_online():
         raise ImportError_("library_offline", "library sentinel missing — mount down?")
 
@@ -98,20 +107,43 @@ async def import_track(staging_file: Path, validated: dict, track_meta: dict,
         "release_date": track_meta.get("release_date") or tags.get("release_date"),
         "isrc": track_meta.get("isrc"),
     }
+    checksum = await asyncio.get_running_loop().run_in_executor(None, _blake2b, staging_file)
+    while True:
+        relpath = await _destination(meta, staging_file.suffix, target_dir)
+        async with locks.hold(str(relpath.parent)):
+            if job_id is not None:
+                row = await db.fetchone("SELECT target_dir FROM jobs WHERE id = ?", (job_id,))
+                if row is not None and row["target_dir"] != target_dir:
+                    target_dir = row["target_dir"]      # the album moved meanwhile
+                    continue
+            result = await _land(staging_file, relpath, meta, track_meta, validated,
+                                 checksum, force)
+            if landed is not None:
+                await landed(result)
+            return result
 
+
+async def _destination(meta: dict, suffix: str, target_dir: str | None) -> Path:
     try:
         relpath = build_track_relpath(
             meta["album_artist"], meta["album"], meta["title"],
-            staging_file.suffix, meta.get("track_number"), meta.get("disc_number"),
+            suffix, meta.get("track_number"), meta.get("disc_number"),
             year=(meta.get("release_date") or "")[:4])
         if target_dir:
             relpath = _in_folder(target_dir, relpath.name)
     except PathBuildError as exc:
         raise ImportError_("path_build", str(exc), ErrorClass.VALIDATION_FAILED) from exc
+    # The share ignores case: a "Sam Smith/..." file lands in the "SAM SMITH"
+    # folder the library already has, so it is named as it lands, and its
+    # index row isn't dropped by the next scan for a spelling nothing has.
+    return Path(await relocate.on_disk(str(relpath.parent))) / relpath.name
 
+
+async def _land(staging_file: Path, relpath: Path, meta: dict, track_meta: dict,
+                validated: dict, checksum: str, force: bool) -> dict:
+    """The copy, its check and the rename, then the sidecars."""
     dest = settings.library_dir / relpath
     dest_dir = dest.parent
-    checksum = await asyncio.get_running_loop().run_in_executor(None, _blake2b, staging_file)
 
     overwrote = dest.exists()
     if overwrote and not force:

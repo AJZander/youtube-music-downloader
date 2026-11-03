@@ -157,6 +157,13 @@ def _spammy(values) -> bool:
     return any(SPAM_RE.search(str(v)) for v in values)
 
 
+def spam(value: str | None) -> bool:
+    """Whether the writer strips this value as junk where it may be spam (a
+    label, a comment, an unknown tag): a URL, a site's name, an uploader's
+    mark. One rule, so what is wanted in a tag is never what is stripped."""
+    return bool(value) and _spammy([value])
+
+
 # ------------------------------------------------------------------ open
 def _open(path: Path):
     suffix = path.suffix.lower()

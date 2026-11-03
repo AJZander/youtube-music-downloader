@@ -14,6 +14,7 @@ Safety rules, the same as the importer's and the library manager's:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -23,16 +24,18 @@ from pathlib import Path
 
 import httpx
 
+from .. import locks, relocate
 from ..config import settings
 from ..db import db, utcnow
 from ..engine import tagio
 from ..importer import library_online
-from ..plex import ALBUM, ARTIST, TRACK, PlexError, is_matched, plex
+from ..plex import ALBUM, ARTIST, TRACK, PlexError, is_matched, nfc, plex
 from . import plexsync
-from .issues import SHARED_FIELDS, junk_fix_fields, same_file
+from .issues import (FLIPFLOP_WINDOW, MERGE_KEEPER, OSCILLATION_WINDOW, SHARED_FIELDS,
+                     junk_fix_fields, match_flipflop, same_file)
 from .plexsync import jlist
-from .desired import plain as plain_title
-from .units import folder_of
+from .desired import album_tags_of, plain as plain_title, track_tags
+from .units import folder_of, unit_folder, unit_id_of
 from ..paths import PathBuildError, build_track_relpath
 
 log = logging.getLogger("mdl.apply")
@@ -51,12 +54,39 @@ class KeepOpen(Exception):
     (a download was queued; the tracks aren't here yet)."""
 
 
+class Settling(KeepOpen):
+    """A download is going into the album (locks.settling): nothing ran,
+    and the issue stays open, saying why, until the album is checked again
+    once the download ends."""
+
+
+def settles(executor):
+    """An executor that changes an album's files, or queues its download:
+    not while a download is going into the album's folder, its layout
+    folder or (a merge of copies) a copy's, whoever asked. A plan may
+    predate the download. The checks inside the executor (the oscillation
+    breaker, a merge's destination) wait with it."""
+    @functools.wraps(executor)
+    async def run(issue: dict, ctx: Ctx) -> str:
+        folders = [unit_folder(ctx.key) if ctx.key else None,
+                   (ctx.desired or {}).get("folder")]
+        if issue.get("kind") == "album_copies":
+            folders += [unit_folder(k) for k in await copy_keys(issue.get("detail") or {})]
+        folder = await locks.settling_into(*(f for f in folders if f))
+        if folder:
+            raise Settling(f"waits for the download into {folder} to finish")
+        return await executor(issue, ctx)
+    run.settles = True
+    return run
+
+
 class Ctx:
     """What one album's apply knows and has done so far."""
 
     def __init__(self, key: str, rows: list[dict], desired: dict | None,
-                 artist_dir: str | None) -> None:
+                 artist_dir: str | None, unit_id: str | None = None) -> None:
         self.key = key
+        self.unit_id = unit_id      # the album's own id (units): its key is where it is
         self.rows = rows
         self.desired = desired
         self.artist_dir = artist_dir
@@ -82,12 +112,19 @@ async def journal(batch: str, target: str, ref: str, field: str, old, new, summa
          json.dumps(old, default=str), json.dumps(new, default=str), summary, utcnow()))
 
 
+# The journal's lookups, by name, so a test can ask SQLite how each is
+# answered (idx_changes_target_ref, idx_changes_target_field_at: db v14)
+OURS_LOCKED = ("SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? AND field = ? "
+               "AND reverted_at IS NULL LIMIT 1")
+OSCILLATION = ("SELECT id, ref, new_value FROM md_changes WHERE target = 'move' "
+               "AND field = 'file' AND reverted_at IS NULL AND applied_at >= ? ORDER BY id")
+CURRENT_PATH = ("SELECT new_value FROM md_changes WHERE target = 'move' AND ref = ? "
+                "AND reverted_at IS NULL ORDER BY id DESC LIMIT 1")
+
+
 async def ours_locked(rating_key: str, field: str) -> bool:
     """Did we lock this Plex field? (A lock we didn't set is the user's.)"""
-    row = await db.fetchone(
-        "SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? AND field = ? "
-        "AND reverted_at IS NULL LIMIT 1", (rating_key, field))
-    return row is not None
+    return await db.fetchone(OURS_LOCKED, (rating_key, field)) is not None
 
 
 def _require_online() -> None:
@@ -103,75 +140,71 @@ async def _run(func, *args):
 async def reindex(paths: list[str]) -> None:
     """Re-read files we just changed, so the index (and the next plan) sees
     the new tags without waiting for a library scan."""
-    from .. import library
-    root = settings.library_dir
-
-    def read_all() -> list[tuple]:
-        out = []
-        for rel in paths:
-            try:
-                st = (root / rel).stat()
-            except OSError:
-                continue
-            out.append(library._read_file(root, rel, st.st_size, st.st_mtime))
-        return out
-
-    rows = await _run(read_all)
-    if rows:
-        await db.executemany(library._UPSERT, rows)
-
-
-async def rekey_paths(pairs: list[tuple[str, str]]) -> None:
-    """Point everything that names a file at its new path."""
-    for old, new in pairs:
-        parts = Path(new).parts
-        artist_dir = parts[0] if len(parts) > 1 else ""
-        dirpath = str(Path(new).parent) if len(parts) > 1 else ""
-        await db.execute(
-            "UPDATE library_index SET path = ?, dirpath = ?, artist_dir = ? WHERE path = ?",
-            (new, dirpath, artist_dir, old))
-        await db.execute("UPDATE tracks SET library_path = ? WHERE library_path = ?", (new, old))
-        await _rekey_exclusions("track", old, new)
+    await relocate.reread_files(paths)
 
 
 async def rekey_folder(old: str, new: str) -> None:
-    await _rekey_exclusions("album", old, new)
+    """"Not duplicates" decisions about a folder follow it (relocate does
+    this, and everything else, for the folders a move empties)."""
+    await relocate.rekey_exclusions("album", old, new)
 
 
-async def _rekey_exclusions(scope: str, old: str, new: str) -> None:
-    """"Not duplicates" decisions follow a renamed file or folder. One the
-    new name already has (merged copies) is kept once."""
-    for column in ("key_a", "key_b"):
-        await db.execute(f"UPDATE OR IGNORE library_exclusions SET {column} = ? "
-                         f"WHERE scope = ? AND {column} = ?", (new, scope, old))
-        await db.execute(f"DELETE FROM library_exclusions WHERE scope = ? AND {column} = ?",
-                         (scope, old))
-
-
-async def rekey_unit(old_key: str, new_key: str, new_folder: str, artist_dir: str) -> None:
-    if old_key == new_key:
-        return
-    exists = await db.fetchone("SELECT 1 FROM md_albums WHERE key = ?", (new_key,))
-    if exists:
-        await db.execute("DELETE FROM md_albums WHERE key = ?", (old_key,))
-    else:
-        await db.execute(
-            "UPDATE md_albums SET key = ?, dirpath = ?, artist_dir = ?, next_check = 0 "
-            "WHERE key = ?", (new_key, new_folder, artist_dir, old_key))
-    await db.execute("UPDATE md_changes SET album_key = ?, artist_dir = ? WHERE album_key = ?",
-                     (new_key, artist_dir, old_key))
-    # The old unit's open issues are moot; the re-check files new ones. Queued
-    # ones are left alone: they are part of this apply, which re-plans them
-    # under the new key (marking them "applied" here would claim a fix that
-    # never ran).
-    await db.execute(
-        "UPDATE md_issues SET state = 'applied', updated_at = ? WHERE album_key = ? "
-        "AND state IN ('open', 'failed')", (utcnow(), old_key))
-    await db.execute("UPDATE md_issue_refs SET album_key = ? WHERE album_key = ?",
-                     (new_key, old_key))
+async def rekey_unit(old_key: str, new_key: str, artist_dir: str, paths=(), *,
+                     batch: str | None = None) -> str | None:
+    """The album moved from old_key to new_key, with these files (their new
+    paths): its record and its issues follow it, or, where an album is
+    already at new_key (another disc of it, the copy it merged into), it
+    becomes that one, decisions and all (units.merge_into, journalled in
+    `batch`, the moves'). Its issues keep their ids: the re-check updates
+    them in place. Returns the unit id the album has now. One transaction."""
+    from . import units
+    async with db.transaction():
+        uid = await units.unit_id_of(old_key)
+        if old_key != new_key:
+            there = await units.unit_id_of(new_key)
+            if there:
+                # the moved files are the mover's until the merge makes them
+                # that album's (so they don't count as what it already was)
+                await units.stamp(uid, paths)
+                await units.merge_into(uid, there, reason=f"moved into {new_key}", batch=batch)
+                uid = there
+            elif uid:
+                await units.rekey(old_key, new_key, artist_dir=artist_dir)
+            # what still names the old key (an album with no record of its own)
+            await units.repoint(old_key, new_key, artist_dir)
+        await units.stamp(uid, paths)
+    return uid
 
 
 # ------------------------------------------------------------------ file stage
+class TagsLeftWritten(ApplyError):
+    """A checked tag write that failed once written, and whose old tags
+    couldn't be put back: the caller journals .result, so it can be undone."""
+
+    def __init__(self, message: str, result: dict):
+        super().__init__(message)
+        self.result = result
+
+
+def _write_checked(p: Path, fields: dict) -> dict:
+    """A tag write (junk stripped) that fails if the audio's length changed
+    with it. The failed write is put back, leaving nothing to journal."""
+    before_len = tagio.read(p)["info"].get("length")
+    result = tagio.write(p, fields, strip_junk=True)
+    after_len = tagio.read(p)["info"].get("length")
+    if before_len and after_len and abs(before_len - after_len) > 0.5:
+        error = f"audio length changed after the tag write ({before_len} -> {after_len})"
+        if result["changed"]:
+            try:
+                tagio.restore(p, result["before"])
+            except (tagio.TagError, OSError) as exc:
+                raise TagsLeftWritten(f"{error}, and the old tags could not be put back: {exc}",
+                                      result) from exc
+        raise ApplyError(error)
+    return result
+
+
+@settles
 async def do_tags(issue: dict, ctx: Ctx) -> str:
     _require_online()
     root = settings.library_dir
@@ -185,19 +218,14 @@ async def do_tags(issue: dict, ctx: Ctx) -> str:
             fields = junk_fix_fields(row)
         if not fields and not row.get("junk"):
             continue
-
-        def write(p=root / path, f=fields):
-            before_len = tagio.read(p)["info"].get("length")
-            result = tagio.write(p, f, strip_junk=True)
-            after_len = tagio.read(p)["info"].get("length")
-            if before_len and after_len and abs(before_len - after_len) > 0.5:
-                raise ApplyError(f"audio length changed after the tag write ({before_len} -> {after_len})")
-            return result
-
         try:
-            result = await _run(write)
+            result = await _run(_write_checked, root / path, fields)
         except (tagio.TagError, OSError, ApplyError) as exc:
             failures.append(f"{path}: {exc}")
+            if isinstance(exc, TagsLeftWritten):
+                await journal(batch, "file", path, "tags", exc.result["before"], fields,
+                              f"Wrote tags on {Path(path).name}",
+                              artist_dir=ctx.artist_dir, album_key=ctx.key)
             continue
         if result["changed"]:
             written.append(path)
@@ -220,6 +248,7 @@ async def do_tags(issue: dict, ctx: Ctx) -> str:
 NUMBER_FIELDS = ("tracknumber", "totaltracks", "discnumber", "totaldiscs")
 
 
+@settles
 async def do_track_order_files(issue: dict, ctx: Ctx) -> str:
     """Write the release's track and disc numbers (only those) to the files."""
     _require_online()
@@ -272,6 +301,7 @@ async def do_track_order_plex(issue: dict, ctx: Ctx) -> str:
     return f"renumbered {len(fixes)} tracks in Plex"
 
 
+@settles
 async def do_download_missing(issue: dict, ctx: Ctx) -> str:
     from . import missing
     filed, videos = await _file_in_downloads(issue, ctx)
@@ -305,12 +335,14 @@ async def _file_in_downloads(issue: dict, ctx: Ctx) -> tuple[int, set[str]]:
     root = settings.library_dir
     target = folder_of(ctx.rows[0])
     ours = {r["path"] for r in ctx.rows}
+    # the file where it is, however the download spelt its path
     found = await db.fetchall(
-        "SELECT t.library_path, t.provider_track_id FROM tracks t JOIN library_index l "
-        "ON l.path = t.library_path WHERE t.job_id = ? AND t.status = 'completed'", (job_id,))
+        "SELECT l.path, t.provider_track_id FROM tracks t JOIN library_index l "
+        "ON l.path = t.library_path OR l.path_key = path_key(t.library_path) "
+        "WHERE t.job_id = ? AND t.status = 'completed'", (job_id,))
     moves = []
     for t in found:
-        src = t["library_path"]
+        src = t["path"]
         if src in ours or folder_of({"path": src}) == target:
             continue
         dst = f"{target}/{Path(src).name}"
@@ -319,6 +351,15 @@ async def _file_in_downloads(issue: dict, ctx: Ctx) -> tuple[int, set[str]]:
         moves.append((src, dst, t["provider_track_id"]))
     if not moves:
         return 0, set()
+    # the folders they leave too (the album's is held by the apply): one
+    # another writer has is locks.Busy, and the issue fails saying so,
+    # nothing filed or queued
+    async with locks.hold(target, *(folder_of({"path": s}) for s, _, _ in moves)):
+        return await _file_moves(moves, target, ctx)
+
+
+async def _file_moves(moves: list[tuple], target: str, ctx: Ctx) -> tuple[int, set[str]]:
+    root = settings.library_dir
     batch = ctx.new_batch()
     done = []
     for src, dst, _ in moves:
@@ -338,7 +379,7 @@ async def _file_in_downloads(issue: dict, ctx: Ctx) -> tuple[int, set[str]]:
                           artist_dir=ctx.artist_dir, album_key=ctx.key)
     if not done:
         return 0, set()
-    await rekey_paths(done)
+    await relocate.relocate(done)
     sources = {folder_of({"path": s}) for s, _ in done}
     await _tidy_folders(sources, target, batch, ctx)
     await db.execute("UPDATE md_changes SET summary = ? WHERE batch_id = ?",
@@ -363,6 +404,90 @@ def _move_file(src: Path, dst: Path) -> None:
     os.replace(src, dst)
 
 
+# md_state key, + an album's unit id: {"until", "reason"}. Until then none of
+# the album's fixes is applied automatically (an Apply the user asks for
+# runs). The pause follows the album wherever it moves.
+AUTO_PAUSED = "auto_paused:"
+
+
+async def auto_paused(unit_id: str | None) -> bool:
+    if not unit_id:
+        return False
+    row = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (AUTO_PAUSED + unit_id,))
+    try:
+        until = float(json.loads(row["value"])["until"]) if row and row["value"] else 0.0
+    except (ValueError, KeyError, TypeError):
+        return False
+    return until > time.time()
+
+
+async def oscillation(moves: list[dict]) -> tuple[str, str] | None:
+    """(A, B) if one of these moves would take a file from folder A to B
+    when, within the window, journalled moves took it from A to B and then
+    back to A: two fixes undoing each other (a merge and a layout move),
+    which a third leg would only feed. Folders compare as the share does,
+    ignoring case; a rename within one folder compares whole paths."""
+    if not moves:
+        return None
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - OSCILLATION_WINDOW))
+    arrived: dict[str, list[tuple[int, str]]] = {}     # path -> [(change id, where from)]
+    for r in await db.fetchall(OSCILLATION, (since,)):
+        try:
+            new = json.loads(r["new_value"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(new, str):
+            arrived.setdefault(new.casefold(), []).append((r["id"], r["ref"]))
+
+    def came_from(path: str, before: int | None = None) -> tuple[int, str] | None:
+        """The last journalled move that brought a file to `path`."""
+        for change_id, ref in reversed(arrived.get(path.casefold(), ())):
+            if before is None or change_id < before:
+                return change_id, ref
+        return None
+
+    def folder(path: str) -> str:
+        return folder_of({"path": path}).casefold()
+
+    for m in moves:
+        src, dst = m["from"], m["to"]
+        back = came_from(src)
+        there = came_from(back[1], before=back[0]) if back else None
+        if there is None:
+            continue
+        if folder(src) == folder(dst):
+            hit = back[1].casefold() == dst.casefold() and there[1].casefold() == src.casefold()
+        else:
+            hit = folder(back[1]) == folder(dst) and folder(there[1]) == folder(src)
+        if hit:
+            return folder_of({"path": src}), folder_of({"path": dst})
+    return None
+
+
+async def refuse_oscillation(ctx: Ctx, moves: list[dict]) -> None:
+    """Refuse moves that would send files back and forth once more (see
+    oscillation) before anything is tagged, trashed or moved, and pause the
+    album's auto-apply for the window: what keeps undoing a fix is for the
+    user to look at. An Apply asked for by hand is refused the same way,
+    until the back-and-forth is older than the window or one of its moves
+    is undone."""
+    found = await oscillation(moves)
+    if found is None:
+        return
+    from .units import unit_id_of
+    reason = f"oscillating between {found[0]} and {found[1]}"
+    unit_id = ctx.unit_id or await unit_id_of(ctx.key) or ctx.key
+    await db.execute("INSERT INTO md_state (key, value) VALUES (?, ?) ON CONFLICT(key) "
+                     "DO UPDATE SET value = excluded.value",
+                     (AUTO_PAUSED + unit_id,
+                      json.dumps({"until": time.time() + OSCILLATION_WINDOW, "reason": reason})))
+    log.warning("%s: %s; nothing moved, and its fixes wait for the user", ctx.key, reason)
+    raise ApplyError(f"{reason}: nothing was moved. Moves of these files are refused, "
+                     f"automatic or applied by hand, while the back-and-forth is within "
+                     f"{OSCILLATION_WINDOW // 86400} days; undo one of the moves to lift it sooner")
+
+
+@settles
 async def do_move(issue: dict, ctx: Ctx) -> str:
     _require_online()
     from .issues import move_conflict, planned_moves
@@ -371,6 +496,7 @@ async def do_move(issue: dict, ctx: Ctx) -> str:
     moves = planned_moves(ctx.rows, ctx.desired)
     if not moves:
         return "nothing to move"
+    await refuse_oscillation(ctx, moves)
     conflict = await move_conflict(ctx.key, ctx.rows, ctx.desired, moves)
     if conflict:
         raise ApplyError(conflict)
@@ -408,16 +534,16 @@ async def _relocate(ctx: Ctx, moves: list[dict], batch: str, summary: str | None
                     except (ApplyError, OSError) as exc:
                         log.info("sidecar %s left behind: %s", side_src, exc)
     except (OSError, ApplyError) as exc:
-        await rekey_paths(done)
+        await relocate.relocate(done)
         raise ApplyError(f"stopped after {len(done)} of {len(moves)} files: {exc}") from exc
 
     await _tidy_folders(source_dirs, target_dir, batch, ctx)
-    await rekey_paths(done)
-    for folder in source_dirs:
-        await rekey_folder(folder, target_dir)
     new_artist = Path(target_dir).parts[0]
     new_key = target_dir
-    await rekey_unit(ctx.key, new_key, target_dir, new_artist)
+    # the album's record follows it (rekey_unit), and what names its files
+    # and the folders they left follows them
+    followed = await relocate.relocate(done, units={ctx.key: new_key})
+    ctx.unit_id = followed.get(ctx.key) or ctx.unit_id
     await db.execute("UPDATE md_changes SET summary = ?, album_key = ?, artist_dir = ? "
                      "WHERE batch_id = ?",
                      (summary or f"Moved {len(done)} files to {target_dir}", new_key, new_artist,
@@ -484,12 +610,8 @@ async def _tidy_folders(folders, target_dir: str, batch: str, ctx: Ctx) -> None:
 def _audio_quality(row: dict, reference: float | None) -> int:
     """How good a copy is as audio: lossless over lossy, bitrate, and a cut-off
     copy last. Tags don't count: the copy kept gets the album's tags anyway."""
-    from .. import library
-    score = library.format_quality(row)
-    duration = row.get("duration_sec")
-    if reference and duration and duration < reference - 2 * library.DURATION_TOLERANCE:
-        score -= 900
-    return score
+    from .. import identity
+    return identity.file_quality(row, reference, tags=False)[0]
 
 
 async def merge_plan(ctx: Ctx) -> dict:
@@ -497,7 +619,7 @@ async def merge_plan(ctx: Ctx) -> dict:
     doing it: {"moves", "trash", "kept_there", "left"} — files moved in, worse
     copies trashed, the destination's copies kept, and files left where they
     are (nothing to pair them with safely). None of it touches a file."""
-    from .. import library
+    from .. import identity, library
     from .issues import conflict_of, other_album, planned_moves
     from .units import in_box_set
     if ctx.desired is None:
@@ -553,7 +675,7 @@ async def merge_plan(ctx: Ctx) -> dict:
         other = None
         if matched(row):
             other = by_track.get(want.get("releasetrack_mbid") or "")
-            if other is not None and not library.same_recording(row, other):
+            if other is not None and not identity.same_length(row, other):
                 plan["left"].append(row["path"])    # one track, two lengths: not proven a copy
                 continue
             other = other or library.match_in(row, index)
@@ -580,6 +702,7 @@ async def merge_plan(ctx: Ctx) -> dict:
     return plan
 
 
+@settles
 async def do_merge(issue: dict, ctx: Ctx) -> str:
     """A move blocked by another copy of this album at the destination,
     made one album: the destination gets the tracks it lacks, and where both
@@ -590,6 +713,7 @@ async def do_merge(issue: dict, ctx: Ctx) -> str:
     _require_online()
     from .. import library
     plan = await merge_plan(ctx)
+    await refuse_oscillation(ctx, plan["moves"])
     if plan["conflict"] is None:
         if not plan["moves"]:
             return "nothing to move"
@@ -622,60 +746,69 @@ async def do_merge(issue: dict, ctx: Ctx) -> str:
     return note
 
 
-async def copies_plan(issue: dict, ctx: Ctx) -> dict:
-    """What merging an album's other copies into this one does, without
-    doing it: {"moves", "trash", "left"}. Only a file identified as a
-    recording on this album's release moves in or is trashed; for each
-    recording the best file stays (ties keep this album's own)."""
-    from .. import library
+async def copy_keys(detail: dict) -> list[str]:
+    """Where the copies an album_copies fix names are now: it names their
+    units (and their keys when it was planned). A copy merged into another
+    album since is no copy to merge."""
+    from .units import resolve
+    keys = list(detail.get("copies") or [])
+    uids = detail.get("copy_units") or []
+    if len(uids) != len(keys):
+        return keys
+    out = []
+    for uid, key in zip(uids, keys):
+        found = await resolve(uid)
+        if found is None:
+            out.append(key)
+        elif found.get("key"):
+            out.append(found["key"])
+    return list(dict.fromkeys(out))
+
+
+def copy_decisions(desired: dict, rows: list[dict], rel: dict,
+                   copies: list[tuple[str, list[dict], dict]]) -> dict:
+    """What merging these copies into the album (its desired state, rows and
+    release) does with each of their files, without doing it: {"moves",
+    "trash", "left"}, and under "of", per copy key, how many of that
+    copy's own files move in, go to Trash and stay where they are. `copies`:
+    (key, rows, desired) of each other copy, in order. Only a file
+    identified as a recording on this album's release moves in or is
+    trashed; for each recording the best file stays (ties keep this album's
+    own). Each move carries the track of this release the file becomes, its
+    index row, and the file it replaces here (if any). Nothing is read:
+    copies_plan applies it, and issues.plan_album_copies plans by it."""
+    from .. import identity
     from . import musicbrainz as mb
     from .issues import matched_recordings, plain_recordings
-    from .units import in_box_set, load_unit
-    if ctx.desired is None:
-        raise ApplyError("the album is not identified")
-    if await in_box_set(ctx.key, ctx.rows):
-        raise ApplyError("this album is part of a box set, which keeps its own copy")
-    try:
-        rel = await mb.release(ctx.desired["release_mbid"])
-    except mb.MusicBrainzError as exc:
-        raise ApplyError(f"MusicBrainz: {exc}") from exc
-    if not rel:
-        raise ApplyError("the release is gone from MusicBrainz")
     multi = len(rel.get("media") or []) > 1
     plain = plain_recordings(rel)
     on_release = {t["recording_id"]: t for t in mb.release_tracks(rel)
                   if t.get("recording_id") in plain}
-    folder = ctx.desired.get("folder") or folder_of(ctx.rows[0])
-    by_path = {r["path"]: r for r in ctx.rows}
+    folder = desired.get("folder") or folder_of(rows[0])
+    by_path = {r["path"]: r for r in rows}
     # this album's own file for each recording (the first, if it holds two)
     held: dict[str, dict] = {}
-    for rec, paths in matched_recordings(ctx.desired).items():
-        rows = [by_path[p] for p in paths if p in by_path and not by_path[p].get("unreadable")]
-        if rows:
-            held[rec] = rows[0]
-    plan = {"moves": [], "trash": [], "left": [], "pin": ctx.desired["release_mbid"]}
-    taken = {r["path"].casefold() for r in ctx.rows}
-    for key in issue["detail"].get("copies") or []:
-        rows = await load_unit(key)
-        record = await db.fetchone("SELECT desired, status FROM md_albums WHERE key = ?", (key,))
-        if not rows or not record or record["status"] != "resolved" or not record["desired"] \
-                or await in_box_set(key, rows):
-            continue
-        want = json.loads(record["desired"])
-        for row in rows:
+    for rec, paths in matched_recordings(desired).items():
+        mine = [by_path[p] for p in paths if p in by_path and not by_path[p].get("unreadable")]
+        if mine:
+            held[rec] = mine[0]
+    plan = {"moves": [], "trash": [], "left": []}
+    taken = {r["path"].casefold() for r in rows}
+    for _key, theirs, want in copies:
+        for row in theirs:
             t = want["tracks"].get(row["path"]) or {}
             rec = t.get("recording_mbid") if t.get("matched") else None
             if not rec or rec not in on_release or row.get("unreadable"):
                 plan["left"].append(row["path"])    # not this album's recording: stays
                 continue
             there = held.get(rec)
-            if there is not None and not library.same_recording(row, there):
+            if there is not None and not identity.same_length(row, there):
                 plan["left"].append(row["path"])    # lengths disagree: not proven one
                 continue
             track = on_release[rec]
             try:
                 name = build_track_relpath(
-                    ctx.desired.get("albumartist") or "x", ctx.desired.get("album") or "x",
+                    desired.get("albumartist") or "x", desired.get("album") or "x",
                     plain_title(track["title"]), Path(row["path"]).suffix, track["number"],
                     track["disc"] if multi else None).name
             except PathBuildError:
@@ -687,74 +820,177 @@ async def copies_plan(issue: dict, ctx: Ctx) -> dict:
                 if _audio_quality(row, ref) <= _audio_quality(there, ref):
                     plan["trash"].append(row["path"])
                     continue
+            free = taken - {there["path"].casefold()} if there is not None else taken
+            if target.casefold() in free:
+                # the name is another file's: this one stays, and so does the
+                # copy it would have replaced
+                plan["left"].append(row["path"])
+                continue
+            if there is not None:
                 plan["trash"].append(there["path"])
                 taken.discard(there["path"].casefold())
-            if target.casefold() in taken:
-                plan["left"].append(row["path"])    # the name is another file's
-                continue
-            plan["moves"].append({"from": row["path"], "to": target})
+            plan["moves"].append({"from": row["path"], "to": target, "track": track, "row": row,
+                                  "replaces": there["path"] if there is not None else None})
             taken.add(target.casefold())
             held[rec] = row
     # a file can lose only once (two copies of a track, both beaten)
     plan["trash"] = list(dict.fromkeys(p for p in plan["trash"]
                                        if p not in {m["from"] for m in plan["moves"]}))
+    owner = {r["path"]: key for key, theirs, _ in copies for r in theirs}
+    plan["of"] = {key: {"moves": 0, "trash": 0, "left": 0} for key, _, _ in copies}
+    for what, paths in (("moves", [m["from"] for m in plan["moves"]]),
+                        ("trash", plan["trash"]), ("left", plan["left"])):
+        for p in paths:
+            if p in owner:
+                plan["of"][owner[p]][what] += 1
     return plan
 
 
+async def copies_plan(issue: dict, ctx: Ctx) -> dict:
+    """What merging an album's other copies into this one does, without
+    doing it (copy_decisions): {"moves", "trash", "left", "pin", "release"}."""
+    from . import musicbrainz as mb
+    from .units import in_box_set, load_unit
+    if ctx.desired is None:
+        raise ApplyError("the album is not identified")
+    if await in_box_set(ctx.key, ctx.rows):
+        raise ApplyError("this album is part of a box set, which keeps its own copy")
+    try:
+        rel = await mb.release(ctx.desired["release_mbid"])
+    except mb.MusicBrainzError as exc:
+        raise ApplyError(f"MusicBrainz: {exc}") from exc
+    if not rel:
+        raise ApplyError("the release is gone from MusicBrainz")
+    copies = []
+    for key in await copy_keys(issue["detail"]):
+        rows = await load_unit(key)
+        record = await db.fetchone("SELECT desired, status FROM md_albums WHERE key = ?", (key,))
+        if not rows or not record or record["status"] != "resolved" or not record["desired"] \
+                or await in_box_set(key, rows):
+            continue
+        copies.append((key, rows, json.loads(record["desired"])))
+    plan = copy_decisions(ctx.desired, ctx.rows, rel, copies)
+    return {**plan, "pin": ctx.desired["release_mbid"], "release": rel}
+
+
+@settles
 async def do_album_copies(issue: dict, ctx: Ctx) -> str:
-    """One album held in several folders, made one: see copies_plan. The
+    """One album held in several folders, made one: see copies_plan. Each
+    file moving in is first tagged as the track of this album it becomes,
+    where it is (moved in with its old album's tags, it would split off as
+    that album and be moved back). A file whose tags can't be written stays
+    out of the merge, and so does the copy it would have replaced. The
     losing files go to Trash, and the whole merge is one undoable change."""
     _require_online()
     from .. import library
+    if not settings.metadata_write_files:
+        raise ApplyError("merging copies needs METADATA_WRITE_FILES: the files moved in would "
+                         "keep their old album's tags and split off again")
     plan = await copies_plan(issue, ctx)
     if not plan["moves"] and not plan["trash"]:
         return "nothing to merge"
+    await refuse_oscillation(ctx, plan["moves"])
+    album_tags = album_tags_of(ctx.desired)
+    if plan["moves"] and not album_tags.get("album"):
+        raise ApplyError("the album's tags aren't known: check it again first")
     folder = ctx.desired.get("folder") or folder_of(ctx.rows[0])
-    batch = ctx.new_batch()
-    trashed = 0
-    if plan["trash"]:
-        result = await library.trash_paths(plan["trash"], reason=f"merged into {folder}")
-        trashed = result["trashed"]
-        if result.get("batch_id") and result["trashed"]:
-            await journal(batch, "trash", result["batch_id"], "files", plan["trash"], None,
-                          f"Trashed {len(plan['trash'])} worse copies merging into {folder}",
-                          artist_dir=ctx.artist_dir, album_key=ctx.key)
-        if result.get("failures"):
-            raise ApplyError(f"could not trash {result['failures'][0]['path']}: "
-                             f"{result['failures'][0]['error']}")
     root = settings.library_dir
-    done = []
+    batch = ctx.new_batch()
+    moves, unwritten = [], []
     for m in plan["moves"]:
+        fields = track_tags(album_tags, plan["release"], m["track"], m["row"])
         try:
-            await _run(_move_file, root / m["from"], root / m["to"])
-        except (OSError, ApplyError) as exc:
-            log.info("could not merge %s into %s: %s", m["from"], folder, exc)
-            continue
-        done.append((m["from"], m["to"]))
-        await journal(batch, "move", m["from"], "file", m["from"], m["to"],
-                      f"Moved {Path(m['from']).name}", artist_dir=ctx.artist_dir, album_key=ctx.key)
-        for suffix in SIDECARS:
-            side, side_dst = (root / m["from"]).with_suffix(suffix), (root / m["to"]).with_suffix(suffix)
-            if await _run(side.exists) and not await _run(side_dst.exists):
-                await _run(_move_file, side, side_dst)
-                await journal(batch, "move", str(Path(m["from"]).with_suffix(suffix)), "sidecar",
-                              None, str(Path(m["to"]).with_suffix(suffix)), "Moved sidecar",
+            result = await _run(_write_checked, root / m["from"], fields)
+        except (tagio.TagError, OSError, ApplyError) as exc:
+            unwritten.append(m)
+            log.info("could not tag %s to merge it into %s: %s", m["from"], folder, exc)
+            if isinstance(exc, TagsLeftWritten):
+                await journal(batch, "file", m["from"], "tags", exc.result["before"], fields,
+                              f"Wrote tags on {Path(m['from']).name}",
                               artist_dir=ctx.artist_dir, album_key=ctx.key)
-    await rekey_paths(done)
-    sources = {folder_of({"path": s}) for s in [m["from"] for m in plan["moves"]] + plan["trash"]}
+            continue
+        moves.append(m)
+        if result["changed"]:
+            await journal(batch, "file", m["from"], "tags", result["before"], fields,
+                          f"Wrote tags on {Path(m['from']).name}",
+                          artist_dir=ctx.artist_dir, album_key=ctx.key)
+    # The index learns a file's new tags once it is moved in, not before:
+    # indexed in its old folder, it would split that folder by album for a
+    # cycle running meanwhile, whose registry would drop the old album's
+    # record (and the user's pin) with its key.
+    kept = {m["replaces"] for m in unwritten if m["replaces"]}
+    losers = [p for p in plan["trash"] if p not in kept]
+    if unwritten and not moves and not losers:
+        raise ApplyError(f"could not tag the {len(unwritten)} files to move in, so nothing was "
+                         f"merged")
+    trashed = 0
+    done = []
+    try:
+        if losers:
+            result = await library.trash_paths(losers, reason=f"merged into {folder}")
+            trashed = result["trashed"]
+            if result.get("batch_id") and result["trashed"]:
+                await journal(batch, "trash", result["batch_id"], "files", losers, None,
+                              f"Trashed {len(losers)} worse copies merging into {folder}",
+                              artist_dir=ctx.artist_dir, album_key=ctx.key)
+            if result.get("failures"):
+                raise ApplyError(f"could not trash {result['failures'][0]['path']}: "
+                                 f"{result['failures'][0]['error']}")
+        for m in moves:
+            try:
+                await _run(_move_file, root / m["from"], root / m["to"])
+            except (OSError, ApplyError) as exc:
+                log.info("could not merge %s into %s: %s", m["from"], folder, exc)
+                continue
+            done.append((m["from"], m["to"]))
+            await journal(batch, "move", m["from"], "file", m["from"], m["to"],
+                          f"Moved {Path(m['from']).name}", artist_dir=ctx.artist_dir,
+                          album_key=ctx.key)
+            # its row moves, then learns its new tags; a copy's folder left
+            # empty hands its record on to this album (relocate: in this
+            # batch, the move's, to be undone with it)
+            await relocate.relocate([(m["from"], m["to"])], reread=True)
+            for suffix in SIDECARS:
+                side = (root / m["from"]).with_suffix(suffix)
+                side_dst = (root / m["to"]).with_suffix(suffix)
+                if await _run(side.exists) and not await _run(side_dst.exists):
+                    await _run(_move_file, side, side_dst)
+                    await journal(batch, "move", str(Path(m["from"]).with_suffix(suffix)),
+                                  "sidecar", None, str(Path(m["to"]).with_suffix(suffix)),
+                                  "Moved sidecar", artist_dir=ctx.artist_dir, album_key=ctx.key)
+    finally:
+        # tagged but not moved (a failed move or trash): indexed as it now is
+        moved = {s for s, _ in done}
+        stayed = [m["from"] for m in moves if m["from"] not in moved]
+        if stayed:
+            await reindex(stayed)
+    sources = {folder_of({"path": s}) for s in [m["from"] for m in moves] + losers}
     await _tidy_folders(sources - {folder}, folder, batch, ctx)
     note = (f"merged {len(issue['detail'].get('copies') or [])} copies into {folder}: "
             f"{len(done)} moved in, {trashed} worse copies trashed"
+            + (f", {len(unwritten)} that could not be tagged left where they are"
+               if unwritten else "")
             + (f", {len(plan['left'])} other files left where they are" if plan["left"] else ""))
     await db.execute("UPDATE md_changes SET summary = ? WHERE batch_id = ?",
                      (note[:1].upper() + note[1:], batch))
-    # the album is this release now, whatever the files moved in were tagged
+    # the album is this release now, and the files moved in say so too
+    # (what it was pinned to before goes back with an undo)
+    was = await db.fetchone("SELECT manual, release_mbid FROM md_albums WHERE key = ?", (ctx.key,))
     await db.execute("UPDATE md_albums SET manual = 1, release_mbid = ?, next_check = 0 "
                      "WHERE key = ?", (plan["pin"], ctx.key))
-    keys = issue["detail"].get("copies") or []
+    # its folder isn't moved out of for a while: see issues.plan_unit
+    await db.execute("INSERT INTO md_state (key, value) VALUES (?, ?) ON CONFLICT(key) "
+                     "DO UPDATE SET value = excluded.value",
+                     (MERGE_KEEPER + folder.casefold(),
+                      json.dumps({"at": time.time(), "release": plan["pin"], "batch": batch,
+                                  "unit_id": ctx.unit_id or await unit_id_of(ctx.key),
+                                  "was": dict(was) if was else None})))
+    keys = await copy_keys(issue["detail"])
     if keys:
         await db.execute(f"UPDATE md_albums SET next_check = 0 WHERE key IN "
                          f"({','.join('?' * len(keys))})", tuple(keys))
+    gone = set(losers)
+    ctx.rows = [r for r in ctx.rows if r["path"] not in gone]
     ctx.moved.update(dict(done))
     ctx.touched_folders |= sources | {folder}
     ctx.new_folders.add(folder)
@@ -762,6 +998,7 @@ async def do_album_copies(issue: dict, ctx: Ctx) -> str:
     return note
 
 
+@settles
 async def do_bad_file(issue: dict, ctx: Ctx) -> str:
     """Damaged files to Trash, once it is certain they are: a file that
     reads now (a NAS hiccup at scan time) is read into the index instead."""
@@ -830,6 +1067,7 @@ def _age(stamp: str | None) -> float:
 READD_EVERY = 7 * 86400
 
 
+@settles
 async def do_scan(issue: dict, ctx: Ctx) -> str:
     folder = (issue.get("detail") or {}).get("folder") or (folder_of(ctx.rows[0]) if ctx.rows else None)
     if folder is None:
@@ -839,6 +1077,24 @@ async def do_scan(issue: dict, ctx: Ctx) -> str:
         info = await plexsync.album_for_paths(readable)
         missing = [p for p in readable if p not in ((info or {}).get("tracks") or {})]
         if missing:
+            # The mirror can be behind (or a listing came up short): only a
+            # file Plex itself doesn't list now is hidden and added again.
+            listed = await _live_listing(missing)
+            if listed is None:
+                # Plex can't say (or doesn't list the folder at all, as when
+                # its scans haven't reached it): a plain scan, nothing hidden
+                ctx.touched_folders.add(folder)
+                ctx.plex_dirty = True
+                raise KeepOpen(f"Plex asked to scan {folder}; it couldn't say which files it "
+                               f"lists there, so none were re-added")
+            have = {nfc(p).casefold(): key for p, key in listed.items()}
+            keys = [have[nfc(p).casefold()] for p in missing
+                    if nfc(p).casefold() in have]
+            missing = [p for p in missing if nfc(p).casefold() not in have]
+            if keys:
+                await plexsync.refresh_items(list(dict.fromkeys(keys)))
+            if not missing:
+                return f"Plex lists all {len(keys)} files: the mirror was behind, and is read again"
             mark = f"plex_readd:{folder}"
             row = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (mark,))
             if row and time.time() - float(row["value"] or 0) < READD_EVERY:
@@ -855,6 +1111,18 @@ async def do_scan(issue: dict, ctx: Ctx) -> str:
     return f"Plex asked to scan {folder}"
 
 
+async def _live_listing(paths: list[str]) -> dict[str, str] | None:
+    """What Plex lists right now in these files' folders: {path: rating
+    key}. None when Plex can't say, so nothing is re-added on a guess."""
+    listed: dict[str, str] = {}
+    for parent in sorted({p.rsplit("/", 1)[0] if "/" in p else "" for p in paths}):
+        files = await plex.folder_files(parent)
+        if files is None:
+            return None
+        listed.update(files)
+    return listed
+
+
 async def readd(paths: list[str]) -> int:
     """Have Plex forget files it holds but won't show and add them again.
 
@@ -869,9 +1137,15 @@ async def readd(paths: list[str]) -> int:
     pairs = [(p, str(Path(p).with_name(f".mdl-readd-{Path(p).name}"))) for p in paths]
     folders = sorted({str(Path(p).parent) for p in paths})
     async with SCAN_HOLD:
+        # files an earlier re-add left hidden (the mount went away) go back
+        # first: their record is about to be written over
+        await restore_hidden()
+        if await db.fetchone("SELECT 1 FROM md_state WHERE key = ?", (READD_PENDING,)):
+            raise ApplyError("files an earlier re-add hid can't be put back yet; not hiding more")
         await db.execute("INSERT INTO md_state (key, value) VALUES (?, ?) ON CONFLICT(key) "
                          "DO UPDATE SET value = excluded.value", (READD_PENDING, json.dumps(pairs)))
         hidden = []
+        offline = False
         try:
             for rel, tmp in pairs:
                 try:
@@ -883,10 +1157,20 @@ async def readd(paths: list[str]) -> int:
                 for folder in folders:
                     await plex.refresh_path(folder)
                 await plex.wait_for_scan(timeout=300)
-                await plex.empty_trash()
-                await plex.wait_for_scan(timeout=120, start=10)
+                # Emptying Plex's trash drops every item it can't see just
+                # then, not only these: never while the mount is away.
+                offline = not library_online()
+                if not offline:
+                    await plex.empty_trash()
+                    await plex.wait_for_scan(timeout=120, start=10)
         finally:
-            await restore_hidden(hidden)
+            back = await restore_hidden(hidden)
+    if offline:
+        left = len(hidden) - back
+        raise ApplyError("the library mount went offline during the re-add: Plex's trash was "
+                         "left alone, and " + (f"{left} files are still hidden; they go back at "
+                                               f"the next re-add or restart" if left
+                                               else "the files put back"))
     for folder in folders:
         await plex.refresh_path(folder)
     log.info("plex re-add of %d files in %s", len(hidden), ", ".join(folders[:3]))
@@ -895,20 +1179,29 @@ async def readd(paths: list[str]) -> int:
 
 async def restore_hidden(pairs: list | None = None) -> int:
     """Put files hidden for a re-add back under their names (after a re-add,
-    or at startup for one a restart cut short)."""
+    or at startup for one a restart cut short). The record of them stays
+    while one can't be: on an error, or when a file is under neither name
+    and the mount is offline (an empty mount point shows neither)."""
     if pairs is None:
         row = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (READD_PENDING,))
         pairs = json.loads(row["value"]) if row and row["value"] else []
     root = settings.library_dir
-    back = 0
+    back = unseen = 0
     for rel, tmp in pairs:
         try:
-            if await _run((root / tmp).exists) and not await _run((root / rel).exists):
-                await _run(os.replace, root / tmp, root / rel)
-                back += 1
+            if await _run((root / tmp).exists):
+                if not await _run((root / rel).exists):
+                    await _run(os.replace, root / tmp, root / rel)
+                    back += 1
+            elif not await _run((root / rel).exists):
+                unseen += 1
         except OSError as exc:
             log.warning("could not put back %s (still at %s): %s", rel, tmp, exc)
             return back
+    if unseen and not library_online():
+        log.warning("the library mount is offline: %d files hidden for a Plex re-add "
+                    "go back later", unseen)
+        return back
     await db.execute("DELETE FROM md_state WHERE key = ?", (READD_PENDING,))
     return back
 
@@ -996,14 +1289,16 @@ SHARED_NOTE = "left alone: Plex files other albums' tracks in this album"
 
 
 async def _shared(ctx: Ctx, rating_key: str) -> bool:
-    """Whether Plex files other albums' tracks in this album, so that it is
-    not this one's to match or tag (a fix planned before that was known)."""
+    """Whether Plex files other albums' tracks, or another folder's, in this
+    album, so that it is not this one's to match or tag (a fix planned
+    before that was known)."""
     if not ctx.rows:
         return False
     info = await plexsync.album_for_paths([ctx.moved.get(r["path"], r["path"]) for r in ctx.rows])
     if ((info or {}).get("album") or {}).get("rating_key") != rating_key:
         return True      # the tracks have left that album: it is not theirs now
-    return plexsync.shares_album(info, ctx.rows, (ctx.desired or {}).get("releasegroup_mbid"))
+    return plexsync.shares_album(info, ctx.rows, (ctx.desired or {}).get("releasegroup_mbid")) \
+        or bool(plexsync.foreign_files(info, ctx.key))
 
 
 async def do_genres(issue: dict, ctx: Ctx) -> str:
@@ -1092,6 +1387,15 @@ async def do_artist_genres(issue: dict, ctx: Ctx) -> str:
 
 async def _match(rating_key: str, mbid: str, name: str, ctx: Ctx, *, parent: str | None = None,
                  year: str | None = None, kind: str) -> str:
+    # Matched to different releases lately: two units each take the item
+    # for theirs, and a match may merge Plex albums (§2). Not again.
+    flips = await match_flipflop(rating_key)
+    if flips:
+        units = list(dict.fromkeys(m["album_key"] for m in flips if m["album_key"]))
+        raise ApplyError(f"Plex item {rating_key} was matched to "
+                         f"{len({m['guid'] for m in flips})} different releases within "
+                         f"{FLIPFLOP_WINDOW // 86400} days, by {' and '.join(units) or 'us'}: "
+                         f"not matched again")
     before = await plex.metadata(rating_key)
     if before is None:
         raise ApplyError("the item is gone from Plex")
@@ -1222,6 +1526,9 @@ async def clean_ghosts(found: list[dict]) -> str:
     if "" in targets:
         await plex.refresh_all()
     await plex.wait_for_scan(timeout=min(6 * 3600, 120 * len(targets)))
+    if not library_online():
+        # an empty now would drop every item Plex can't see, not only these
+        raise ApplyError("the library mount looks offline: Plex's trash was left alone")
     await plex.empty_trash()
     await plexsync.forget_paths([p for i in found for p in (i.get("detail") or {}).get("paths") or []])
     return f"Plex rescanned {len(targets)} folders and emptied its trash"
@@ -1254,9 +1561,7 @@ async def current_path(path: str) -> str:
     seen = set()
     while path not in seen:
         seen.add(path)
-        row = await db.fetchone(
-            "SELECT new_value FROM md_changes WHERE target = 'move' AND ref = ? "
-            "AND reverted_at IS NULL ORDER BY id DESC LIMIT 1", (path,))
+        row = await db.fetchone(CURRENT_PATH, (path,))
         if row is not None:
             path = json.loads(row["new_value"])
             continue
@@ -1276,12 +1581,37 @@ async def revert(batch_id: str) -> dict:
         (batch_id,))]
     if not rows:
         return {"reverted": 0, "failures": [{"ref": batch_id, "error": "nothing to undo"}]}
+    # every folder the undo changes is held while it does (locks): where
+    # tags are put back, where moved files are and go back to, and where
+    # trashed files return
+    folders: set[str] = set()
+    for change in rows:
+        if change["target"] == "file":
+            folders.add(str(Path(await current_path(change["ref"])).parent))
+        elif change["target"] == "move":
+            folders |= {str(Path(change["ref"]).parent),
+                        str(Path(json.loads(change["new_value"])).parent)}
+        elif change["target"] == "trash":
+            folders |= {r["original_path"] if r["kind"] == "dir"
+                        else str(Path(r["original_path"]).parent)
+                        for r in await db.fetchall("SELECT original_path, kind FROM library_trash "
+                                                   "WHERE batch_id = ?", (change["ref"],))}
+    async with locks.hold(*folders):
+        return await _revert(batch_id, rows)
+
+
+async def _revert(batch_id: str, rows: list[dict]) -> dict:
     root = settings.library_dir
     reverted, failures = 0, []
     touched: set[str] = set()
     moved_back: list[tuple[str, str]] = []
     reindex_paths: list[str] = []
+    # albums the moves merged into others: made their own again once their
+    # files are back (below)
+    merges = [c for c in rows if c["target"] == "unit"]
     for change in rows:
+        if change["target"] == "unit":
+            continue
         try:
             if change["target"] == "file":
                 _require_online()
@@ -1339,11 +1669,28 @@ async def revert(batch_id: str) -> dict:
             reverted += 1
         except Exception as exc:
             failures.append({"ref": change["ref"], "error": str(exc)[:200]})
+    if not failures:
+        # a merge of copies undone no longer holds its folder (issues.merged_into),
+        # and its keeper is pinned as it was, if nothing pinned it since
+        for r in await db.fetchall("SELECT key, value FROM md_state WHERE key LIKE ?",
+                                   (MERGE_KEEPER + "%",)):
+            try:
+                held = json.loads(r["value"])
+                if held.get("batch") != batch_id:
+                    continue
+            except (TypeError, ValueError, AttributeError):
+                continue
+            await db.execute("DELETE FROM md_state WHERE key = ?", (r["key"],))
+            if held.get("was") and held.get("unit_id"):
+                await db.execute("UPDATE md_albums SET manual = ?, release_mbid = ? "
+                                 "WHERE unit_id = ? AND manual = 1 AND release_mbid = ?",
+                                 (held["was"]["manual"], held["was"]["release_mbid"],
+                                  held["unit_id"], held.get("release")))
     if moved_back:
-        await rekey_paths(moved_back)
-        for new_dir, old_dir in {(str(Path(n).parent), str(Path(o).parent))
-                                 for n, o in moved_back}:
-            await rekey_folder(new_dir, old_dir)
+        # what names the files, and the folders they left, follows them back
+        # (an album the way back empties joins the one there in a batch of
+        # its own: there is nothing to undo of an undo)
+        await relocate.relocate(moved_back, batch=uuid.uuid4().hex[:12])
 
         # tidy now-empty folders the files came back out of
         def tidy():
@@ -1358,8 +1705,19 @@ async def revert(batch_id: str) -> dict:
                     pass
         await _run(tidy)
     if reindex_paths:
-        await reindex(reindex_paths)
+        # tags put back before their file moved back are read where it is now
+        back = dict(moved_back)
+        await reindex(list(dict.fromkeys(back.get(p, p) for p in reindex_paths)))
+    from . import units
+    restored: list[str] = []
+    for change in merges:       # newest first, as the batch was undone
+        try:
+            restored += await units.unmerge(change)
+            reverted += 1
+        except Exception as exc:
+            failures.append({"ref": change["ref"], "error": str(exc)[:200]})
     if touched and plex.configured:
         for folder in sorted(touched)[:10]:
             await plex.refresh_path(folder)
-    return {"reverted": reverted, "failures": failures, "folders": sorted(touched)}
+    return {"reverted": reverted, "failures": failures, "folders": sorted(touched),
+            "restored_keys": list(dict.fromkeys(restored))}

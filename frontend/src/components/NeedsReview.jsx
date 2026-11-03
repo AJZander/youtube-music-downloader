@@ -1,31 +1,51 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
-  Box, Button, Chip, Paper, Typography,
+  Alert, Box, Button, Chip, Paper, Typography,
 } from '@mui/material'
 
 import { api } from '../api.js'
 
 export default function NeedsReview({ onChanged }) {
   const [tracks, setTracks] = useState([])
+  // what went wrong with the last action or load, said rather than swallowed
+  const [error, setError] = useState(null)
 
   const refresh = useCallback(() => {
-    api.needsReview().then(setTracks).catch(() => {})
+    api.needsReview().then(setTracks).catch((e) => setError(e.message))
   }, [])
   useEffect(() => { refresh() }, [refresh])
 
   const act = async (id, action) => {
-    await api.resolveTrack(id, action)
+    try {
+      await api.resolveTrack(id, action)
+      setError(null)
+    } catch (e) {
+      setError(e.message)
+    }
     refresh(); onChanged?.()
   }
+  const queue = (videoId) => api.createJob(`https://music.youtube.com/watch?v=${videoId}`)
+    .then(() => { setError(null); onChanged?.() })
+    .catch((e) => setError(e.message))
+
+  const alert = error && (
+    <Alert severity="error" sx={{ mb: 1.5 }} onClose={() => setError(null)}>{error}</Alert>
+  )
 
   if (!tracks.length) {
-    return <Typography color="text.secondary" sx={{ mt: 4, textAlign: 'center' }}>
-      Nothing needs review.
-    </Typography>
+    return (
+      <Box>
+        {alert}
+        <Typography color="text.secondary" sx={{ mt: 4, textAlign: 'center' }}>
+          Nothing needs review.
+        </Typography>
+      </Box>
+    )
   }
 
   return (
     <Box>
+      {alert}
       {tracks.map((t) => {
         let candidates = []
         try { candidates = JSON.parse(t.match_candidates || '[]') } catch { /* ignore */ }
@@ -50,9 +70,7 @@ export default function NeedsReview({ onChanged }) {
                       {c.artists} — {c.title}
                       {c.duration_sec ? ` (${Math.round(c.duration_sec)}s)` : ''}
                     </Typography>
-                    <Button size="small" onClick={() =>
-                      api.createJob(`https://music.youtube.com/watch?v=${c.video_id}`)
-                        .then(() => onChanged?.())}>
+                    <Button size="small" onClick={() => queue(c.video_id)}>
                       Queue this
                     </Button>
                   </Box>

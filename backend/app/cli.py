@@ -1,7 +1,8 @@
 """Maintenance / Phase-1 test CLI.
 
   python -m app.cli download <url>     end-to-end single URL (no API needed)
-  python -m app.cli index --rebuild    rebuild library_index from the library
+  python -m app.cli index --rebuild    re-read every file (library scan --full);
+                                       refused while the app is running
   python -m app.cli import-legacy <archive.txt>   load v1 archive (advisory)
   python -m app.cli canary             extractor + credential health probe
   python -m app.cli library scan [--full]        refresh the management index
@@ -11,10 +12,24 @@
 import argparse
 import asyncio
 import logging
+import socket
 import sys
 
 from .db import db
 from .models import JobStatus
+
+# Where the app listens (entrypoint.sh): in its own container, and beside it
+# on the compose network.
+APP_PORT = 8000
+_APP_HOSTS = ("127.0.0.1", "mdl-app")
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # httpx logs full request URLs at INFO — would leak the Plex token
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 async def _cmd_download(url: str) -> int:
@@ -47,18 +62,47 @@ async def _cmd_download(url: str) -> int:
     return 0 if job["status"] == JobStatus.COMPLETED else 1
 
 
+def _app_running(timeout: float = 1.0) -> bool:
+    """Whether the app is up: something answers on its port, here (`docker
+    compose exec mdl-app`) or at its compose host name (`docker compose
+    run`). A container on another network sees neither."""
+    for host in _APP_HOSTS:
+        try:
+            addrs = socket.getaddrinfo(host, APP_PORT, type=socket.SOCK_STREAM)
+        except OSError:
+            continue    # no such host: not on the app's network
+        for *_, addr in addrs:
+            try:
+                with socket.create_connection(addr[:2], timeout=timeout):
+                    return True
+            except OSError:
+                pass
+    return False
+
+
 async def _cmd_index(rebuild: bool) -> int:
     from . import library_index
     if not rebuild:
         print("only --rebuild is supported")
         return 2
+    if _app_running():
+        # The app scans and moves files on its own schedule; a second
+        # process re-reading the library alongside it races both.
+        print("the app is running: stop it first (docker compose stop mdl-app), then run\n"
+              "  docker compose run --rm --entrypoint /opt/engine-venv/bin/python "
+              "mdl-app -m app.cli index --rebuild")
+        return 1
 
     def progress(done, total):
-        print(f"\r  scanned {done}/{total}", end="", flush=True)
+        print(f"\r  read {done}/{total}", end="", flush=True)
 
     result = await library_index.rebuild(progress_cb=progress)
-    print(f"\nindexed {result['indexed']} tracks "
-          f"({result['unreadable']} unreadable of {result['files']} files)")
+    # counted from the index: the scan's own unreadable count includes every
+    # file it read (it tests the row's last column, tags_version)
+    unreadable = (await db.fetchone(
+        "SELECT COUNT(*) AS n FROM library_index WHERE unreadable = 1"))["n"]
+    print(f"\nrebuild complete: +{result['added']} new, ~{result['updated']} updated, "
+          f"-{result['removed']} gone, {unreadable} unreadable")
     return 0
 
 
@@ -143,7 +187,10 @@ async def _main() -> int:
     p_dl = sub.add_parser("download")
     p_dl.add_argument("url")
     p_idx = sub.add_parser("index")
-    p_idx.add_argument("--rebuild", action="store_true")
+    p_idx.add_argument("--rebuild", action="store_true",
+                       help="re-read every file, as `library scan --full`. Refused while "
+                            "the app answers on 127.0.0.1 or mdl-app port 8000; run from a "
+                            "container on another network, that check cannot see it")
     p_leg = sub.add_parser("import-legacy")
     p_leg.add_argument("path")
     sub.add_parser("canary")
@@ -156,8 +203,7 @@ async def _main() -> int:
     p_lib.add_argument("--days", type=int)
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    _setup_logging()
     await db.connect()
     try:
         if args.cmd == "download":

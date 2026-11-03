@@ -2,9 +2,15 @@
 every judgement the user has to make.
 
 An issue has a stable key (kind + what it is about), so a re-check updates
-it in place instead of piling up copies; a problem that goes away is closed
-as `applied`; one the user dismissed stays dismissed ("not a problem" is a
-decision, like the duplicate exclusions).
+it in place instead of piling up copies; one the user dismissed stays
+dismissed ("not a problem" is a decision, like the duplicate exclusions).
+
+Its state says what happened to it: `open` (to do), `queued` (a fix is
+about to run), `applied` (a fix of ours ran), `failed` (it ran and failed,
+or the issue was still there right after it), `tried` (Download missing
+fetched what it could; the rest isn't there to fetch), `dismissed` (the
+user's call), `superseded` (the album moved, merged into another or went
+away) and `cleared` (no longer found, with no fix of ours behind it).
 """
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -19,10 +26,11 @@ from pathlib import Path
 from ..config import settings
 from ..db import db, utcnow
 from ..engine import tagio
+from ..identity import matched_recordings, plain_recordings  # noqa: F401
 from ..library import strict_key
 from ..plex import is_matched
 from . import musicbrainz as mb
-from .plexsync import album_share, jlist, shares_album
+from .plexsync import album_share, foreign_files, jlist, shares_album
 from .units import folder_of, in_box_set, unit_folder
 
 log = logging.getLogger("mdl.issues")
@@ -76,6 +84,14 @@ KINDS: dict[str, dict] = {
                     "description": "Plex files these tracks in one album with other albums' tracks, "
                                    "and an earlier fix matched or tagged that album as this one. "
                                    "Applying puts back what Plex had."},
+    "plex_foreign": {"label": "Plex album mixes folders", "severity": "warning",
+                     "applyable": False, "action": None,
+                     "description": "Plex shows these tracks in one album with another album "
+                                    "folder's tracks (two editions tagged alike, or a track Plex "
+                                    "first saw elsewhere), or the album was matched to different "
+                                    "releases in turn. Until it holds this album's tracks only, "
+                                    "nothing album-level is changed in Plex: no match, genres, "
+                                    "moods or cover. Don't delete tracks in Plex to fix it."},
     "genres": {"label": "Genres", "severity": "info", "applyable": True,
                "action": "Set genres",
                "description": "Plex's genres differ from the desired genres."},
@@ -117,9 +133,15 @@ KINDS: dict[str, dict] = {
                        "description": "MusicBrainz has no such artist. Adding it lets Plex match it too."},
 }
 UNIT_KINDS = ("not_in_plex", "unmatched", "wrong_match", "tags", "track_order", "move",
-              "move_conflict", "plex_shared", "bad_file",
+              "move_conflict", "plex_shared", "plex_foreign", "bad_file",
               "genres", "moods", "poster", "review_match", "unresolved", "folder_artist",
               "extra_tracks")
+# What a check of an album a download is going into (locks.settling) leaves
+# as it was: whatever changes its files (apply.FILE_STAGE), and the files
+# the release lacks a match for, which the download is still bringing.
+# Plex's own fields are planned as ever.
+SETTLING_KINDS = ("bad_file", "tags", "track_order", "move", "move_conflict", "not_in_plex",
+                  "extra_tracks")
 ARTIST_KINDS = ("artist_unmatched", "artist_genres", "artist_moods", "artist_poster",
                 "artist_unknown")
 DUP_KINDS = ("dup_album", "dup_track", "split_artist")
@@ -131,6 +153,29 @@ APPLY_ORDER = ("bad_file", "missing_tracks", "tags", "track_order", "move", "mov
                "unmatched", "wrong_match", "plex_shared",
                "genres", "moods", "poster", "artist_unmatched", "artist_genres",
                "artist_moods", "artist_poster")
+
+
+# What Needs attention counts: what needs the user (a failed fix shows its
+# reason). A fix under way (queued) and the Tried bucket are shown beside
+# it, not in it.
+ATTENTION_STATES = ("open", "failed")
+
+
+async def counts() -> dict:
+    """{"open": what needs the user, "by_kind": the same by kind,
+    "in_progress": fixes queued, "tried": the Tried bucket}: what the
+    sidebar, the overview and library.issues count."""
+    by_kind: Counter = Counter()
+    beside: Counter = Counter()
+    for r in await db.fetchall("SELECT kind, state, COUNT(*) AS n FROM md_issues "
+                               "WHERE state IN ('open', 'failed', 'queued', 'tried') "
+                               "GROUP BY kind, state"):
+        if r["state"] in ATTENTION_STATES:
+            by_kind[r["kind"]] += r["n"]
+        else:
+            beside[r["state"]] += r["n"]
+    return {"open": sum(by_kind.values()), "by_kind": dict(by_kind),
+            "in_progress": beside["queued"], "tried": beside["tried"]}
 
 
 def issue_out(row) -> dict:
@@ -154,16 +199,78 @@ def planned(kind: str, ref: str, summary: str, detail: dict | None = None, *,
             "artist_dir": artist_dir, "album_key": album_key, "refs": refs or []}
 
 
+def unchanged(key: str) -> dict:
+    """In a plan: the issue with this key, if there is one, stays as it is
+    (not planned again, and not closed)."""
+    return {"key": key, "unchanged": True}
+
+
 async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: str | None = None,
                artist_dir: str | None = None, all_scope: bool = False,
-               close_others: bool = True) -> None:
+               close_others: bool = True, close_as: str = "cleared",
+               reason: str | None = "no longer found") -> None:
     """Upsert `items` and close every other open issue of `scope_kinds` in the
-    same scope (this album, this artist, or everywhere)."""
+    same scope (this album, this artist, or everywhere), as `close_as`
+    (`superseded`, with the reason, when the album itself is gone). All of
+    it, or (on an error) none: one transaction."""
+    async with db.transaction():
+        await _save(items, scope_kinds, album_key, artist_dir, all_scope, close_others,
+                    close_as, reason)
+
+
+# A fix of ours found again as it was within this long of running didn't
+# stick: the issue is failed, and auto-apply leaves it for the user. Found
+# later, or with something new in it, it is a new problem.
+REOPEN_WINDOW = 24 * 3600
+STILL_THERE = "still there after the fix"
+
+
+def _missing(detail: str | None) -> set[str]:
+    try:
+        tracks = (json.loads(detail) if detail else {}).get("missing") or []
+    except (TypeError, ValueError, AttributeError):
+        return set()
+    return {t.get("releasetrack_mbid") or t.get("title") or "" for t in tracks}
+
+
+def _same_problem(existing, detail: str) -> bool:
+    """Whether an issue planned again is what its fix was for: the same
+    detail, or (missing tracks) nothing missing that wasn't then. A new
+    file in the album (a Download missing's) plans a fix of its own."""
+    if existing["detail"] == detail:
+        return True
+    return existing["kind"] == "missing_tracks" and _missing(detail) <= _missing(existing["detail"])
+
+
+def _replanned(existing, detail: str) -> tuple[str, str | None]:
+    """The state (and error) of an issue planned again. Dismissed stays
+    dismissed; queued stays queued (it is about to run); failed stays
+    failed while the fix planned is the same one, so auto-apply doesn't
+    retry it every pass (Apply still does); a fix of ours that ran lately
+    and is planned again as it was didn't stick, and fails; the Tried
+    bucket keeps what is still all it was. Anything else is open."""
+    state, error = existing["state"], existing["error"]
+    if state in ("dismissed", "queued") or (state == "failed" and existing["detail"] == detail):
+        return state, error
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - REOPEN_WINDOW))
+    if state == "applied" and existing["applied_at"] and existing["applied_at"] >= since \
+            and _same_problem(existing, detail):
+        return "failed", STILL_THERE
+    if state == "tried" and _missing(detail) <= _missing(existing["detail"]):
+        return state, error
+    return "open", None
+
+
+async def _save(items: list[dict], scope_kinds: tuple[str, ...], album_key: str | None,
+                artist_dir: str | None, all_scope: bool, close_others: bool,
+                close_as: str, reason: str | None) -> None:
     now = utcnow()
     keys = {i["key"] for i in items}
     for item in items:
-        existing = await db.fetchone("SELECT id, state, detail FROM md_issues WHERE key = ?",
-                                     (item["key"],))
+        if item.get("unchanged"):
+            continue
+        existing = await db.fetchone("SELECT id, kind, state, detail, error, applied_at "
+                                     "FROM md_issues WHERE key = ?", (item["key"],))
         detail = json.dumps(item["detail"], default=str)
         if existing is None:
             await db.execute(
@@ -177,23 +284,14 @@ async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: st
             issue_id = row["id"]
         else:
             issue_id = existing["id"]
-            # dismissed stays dismissed; queued stays queued (it is about to
-            # run); failed stays failed while the fix planned is the same one,
-            # so auto-apply doesn't retry it every pass (Apply still does)
-            state = existing["state"]
-            if state in ("dismissed", "queued") or (state == "failed"
-                                                    and existing["detail"] == detail):
-                new_state = state
-            else:
-                new_state = "open"
+            new_state, error = _replanned(existing, detail)
             await db.execute(
                 "UPDATE md_issues SET entity = ?, ref = ?, artist_dir = ?, album_key = ?, "
-                "severity = ?, summary = ?, detail = ?, auto = ?, state = ?, "
-                "error = CASE WHEN ? = 'open' THEN NULL ELSE error END, updated_at = ? "
-                "WHERE id = ?",
+                "severity = ?, summary = ?, detail = ?, auto = ?, state = ?, error = ?, "
+                "updated_at = ? WHERE id = ?",
                 (item["entity"], item["ref"], item["artist_dir"], item["album_key"],
                  item["severity"], item["summary"], detail, int(item["auto"]), new_state,
-                 new_state, now, issue_id))
+                 error, now, issue_id))
         await db.execute("DELETE FROM md_issue_refs WHERE issue_id = ?", (issue_id,))
         refs = item["refs"] or [(item["artist_dir"], item["album_key"])]
         await db.executemany(
@@ -203,7 +301,7 @@ async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: st
         return
     # close what is no longer a problem
     marks = ",".join("?" * len(scope_kinds))
-    where = f"state IN ('open', 'failed') AND kind IN ({marks})"
+    where = f"state IN ('open', 'failed', 'tried') AND kind IN ({marks})"
     params: list = list(scope_kinds)
     if not all_scope:
         if album_key is not None:
@@ -217,8 +315,8 @@ async def save(items: list[dict], *, scope_kinds: tuple[str, ...], album_key: st
     for i in range(0, len(stale), 400):
         chunk = stale[i:i + 400]
         await db.execute(
-            f"UPDATE md_issues SET state = 'applied', updated_at = ? "
-            f"WHERE id IN ({','.join('?' * len(chunk))})", (now, *chunk))
+            f"UPDATE md_issues SET state = ?, error = ?, updated_at = ? "
+            f"WHERE id IN ({','.join('?' * len(chunk))})", (close_as, reason, now, *chunk))
 
 
 # ------------------------------------------------------------------ comparing
@@ -296,9 +394,26 @@ def junk_fix_fields(row: dict) -> dict[str, list[str]]:
 
 # ------------------------------------------------------------------ planning
 async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex: dict | None,
-                    *, plex_synced: bool, ours_locked, no_release: bool = False) -> list[dict]:
+                    *, plex_synced: bool, ours_locked, no_release: bool = False,
+                    merge_keeper: bool = False, unit_id: str | None = None,
+                    settling: bool = False) -> list[dict]:
     """`no_release`: the user says MusicBrainz has no release for these files,
-    so nothing asks them to identify it; the files keep their own tags."""
+    so nothing asks them to identify it; the files keep their own tags.
+    `merge_keeper`: a merge of copies made this folder the album's lately
+    (see merged_into), so its files stay in it. `unit_id`: the album's own
+    id, which its issues are keyed by (`kind:unit_id`), so they stay the
+    same issues wherever it moves; the key is where it is. `settling`: a
+    download is going into the album, so nothing of SETTLING_KINDS is
+    planned (the caller leaves those issues as they are)."""
+    out = await _plan_unit(key, rows, desired, res, plex, plex_synced=plex_synced,
+                           ours_locked=ours_locked, no_release=no_release,
+                           merge_keeper=merge_keeper, unit_id=unit_id)
+    return [p for p in out if p["kind"] not in SETTLING_KINDS] if settling else out
+
+
+async def _plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex: dict | None,
+                     *, plex_synced: bool, ours_locked, no_release: bool,
+                     merge_keeper: bool, unit_id: str | None) -> list[dict]:
     artist_dir = rows[0].get("artist_dir") if rows else None
     out: list[dict] = []
     # A file nothing can open can't be tagged, numbered or shown in Plex: it
@@ -307,8 +422,8 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
     rows = [r for r in rows if not r.get("unreadable")]
 
     def add(kind, summary, detail=None, *, ref=None, auto=False, severity=None):
-        out.append(planned(kind, ref or key, summary, detail, auto=auto, severity=severity,
-                           artist_dir=artist_dir, album_key=key))
+        out.append(planned(kind, ref or unit_id or key, summary, detail, auto=auto,
+                           severity=severity, artist_dir=artist_dir, album_key=key))
 
     plex_tracks = (plex or {}).get("tracks") or {}
     plex_album = (plex or {}).get("album")
@@ -428,6 +543,10 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
                 retarget(desired, alt)
                 moves = planned_moves(rows, desired)
                 found = await conflict_of(key, rows, desired, moves) if moves else None
+        if moves and merge_keeper and desired["folder"].casefold() != folder_of(rows[0]).casefold():
+            # Moving out of the folder a merge just filled would undo the
+            # merge, which would then be planned again (renames in it are fine).
+            moves = []
         if moves:
             conflict = found["message"] if found else None
             detail = {"from": folder_of(rows[0]), "to": desired["folder"], "files": moves,
@@ -441,17 +560,28 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
                              else f"Move to {desired['folder']}"), detail, auto=auto)
 
     # -- Plex
-    if plex_album and settings.metadata_write_plex \
-            and shares_album(plex, rows, desired.get("releasegroup_mbid")):
+    shared = foreign = None
+    if plex_album and settings.metadata_write_plex:
+        shared = shares_album(plex, rows, desired.get("releasegroup_mbid"))
+        foreign = foreign_files(plex, key)
+    if shared or foreign:
         # Plex files these tracks with other albums' (an untitled album it
-        # made before their tags were fixed, and never regroups): the album
-        # is not ours to match, tag or give a cover, or every album in it
-        # would overwrite the last. Our tracks still get their genres, and
-        # what we did to the album before we knew is put back.
+        # made before their tags were fixed, and never regroups) or with
+        # another folder's (two editions tagged alike): the album is not
+        # ours to match, tag or give a cover, or every album in it would
+        # overwrite the last. Our tracks still get their genres, and what
+        # we did to an untitled album before we knew is put back.
         rk = plex_album["rating_key"]
+        if foreign:
+            detail = await foreign_detail(plex_album, foreign)
+            folders = detail["folders"]
+            add("plex_foreign", f"Plex shows {plex_album.get('title') or 'an untitled album'} "
+                f"mixed with {len(foreign)} tracks of {folders[0]}"
+                + (f" and {len(folders) - 1} more folders" if len(folders) > 1 else "")
+                + ": no album edits in Plex until it is one album", detail)
         # put back only an album no identified album holds most of: one
         # that does puts the album right itself on its own next check
-        if await changed_by_us(rk) and \
+        if shared and await changed_by_us(rk) and \
                 not album_share(plex, rows, desired.get("releasegroup_mbid"))["owner_tagged"]:
             add("plex_shared", f"Plex files these tracks in {plex_album.get('title') or 'an untitled album'}"
                 f" with other albums': restore it", {"rating_key": rk, "title": plex_album.get("title")},
@@ -467,13 +597,14 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
         guid = plex_album.get("guid") or ""
         plex_mbid = plex_album.get("mbid")
         rk = plex_album["rating_key"]
+        match = None        # (kind, summary, detail, auto) of a match to plan
         # mbid://<our release>: Plex took our match but has no catalogue
         # entry for it to become plex://, and asking again changes nothing
         if not is_matched(guid) and plex_mbid != desired["release_mbid"] \
                 and guid != f"mbid://{desired['release_mbid']}":
-            add("unmatched", f"Plex has no match for {plex_album.get('title')}",
-                {"rating_key": rk, "guid": guid, "release_mbid": desired["release_mbid"],
-                 "title": desired["album"]}, auto=auto)
+            match = ("unmatched", f"Plex has no match for {plex_album.get('title')}",
+                     {"rating_key": rk, "guid": guid, "release_mbid": desired["release_mbid"],
+                      "title": desired["album"]}, auto)
         elif is_matched(guid) and plex_mbid and plex_mbid != desired["release_mbid"]:
             other_rg = None
             try:
@@ -482,12 +613,27 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
             except mb.MusicBrainzError:
                 other = None
             if other is not None and other_rg != desired.get("releasegroup_mbid"):
-                add("wrong_match",
-                    f"Plex matched it to {other.get('title')} ({(other.get('date') or '')[:4]})",
-                    {"rating_key": rk, "guid": guid, "plex_mbid": plex_mbid,
-                     "plex_title": other.get("title"), "release_mbid": desired["release_mbid"],
-                     "title": desired["album"]},
-                    auto=auto and (res.score >= 0.9))
+                match = ("wrong_match",
+                         f"Plex matched it to {other.get('title')} ({(other.get('date') or '')[:4]})",
+                         {"rating_key": rk, "guid": guid, "plex_mbid": plex_mbid,
+                          "plex_title": other.get("title"), "release_mbid": desired["release_mbid"],
+                          "title": desired["album"]},
+                         auto and (res.score >= 0.9))
+        flips = await match_flipflop(rk) if match else []
+        if flips:
+            # matched as one release and then another lately: each unit
+            # that takes the album for its own undoes the last one's match
+            units_ = list(dict.fromkeys(m["album_key"] for m in flips if m["album_key"]))
+            add("plex_foreign", f"Plex album {plex_album.get('title') or rk} was matched to "
+                f"{len({m['guid'] for m in flips})} different releases within "
+                f"{FLIPFLOP_WINDOW // 86400} days, by {' and '.join(units_) or 'us'}: "
+                f"not matched again",
+                {"rating_key": rk, "title": plex_album.get("title"), "reason": "flip_flop",
+                 "units": units_, "unit_ids": await _unit_ids(units_),
+                 "folders": list(dict.fromkeys(unit_folder(k) for k in units_)),
+                 "guids": list(dict.fromkeys(m["guid"] for m in flips))})
+        elif match:
+            add(match[0], match[1], match[2], auto=match[3])
         locked = set(jlist(plex_album.get("locked")))
         want_genres = desired.get("genres") or []
         if want_genres and not ("genre" in locked and not await ours_locked(rk, "genre")):
@@ -519,15 +665,76 @@ async def plan_unit(key: str, rows: list[dict], desired: dict | None, res, plex:
     return out
 
 
+async def _unit_ids(keys: list[str]) -> list[str]:
+    """The unit ids of the albums at these keys (those the registry knows)."""
+    ids: dict[str, str] = {}
+    for i in range(0, len(keys), 400):
+        chunk = keys[i:i + 400]
+        for r in await db.fetchall(
+                f"SELECT key, unit_id FROM md_albums WHERE key IN ({','.join('?' * len(chunk))})",
+                tuple(chunk)):
+            ids[r["key"]] = r["unit_id"]
+    return list(dict.fromkeys(ids[k] for k in keys if ids.get(k)))
+
+
+async def foreign_detail(plex_album: dict, foreign: list[dict]) -> dict:
+    """plex_foreign's detail for an album holding other units' files: the
+    folders, and the units they are (album keys, and their ids), where the
+    registry says."""
+    folders = list(dict.fromkeys(f["folder"] for f in foreign))
+    known: dict[str, list[str]] = {}
+    for i in range(0, len(folders), 400):
+        chunk = folders[i:i + 400]
+        for r in await db.fetchall(
+                f"SELECT key, dirpath FROM md_albums WHERE dirpath IN ({','.join('?' * len(chunk))})",
+                tuple(chunk)):
+            known.setdefault(r["dirpath"], []).append(r["key"])
+    units_: list[str] = []
+    for f in foreign:
+        # a folder split by album tag: the unit the file's album tag puts it in
+        keys = known.get(f["folder"]) or []
+        split = f"{f['folder']}|{f['split']}"
+        units_.append(split if split in keys else keys[0] if len(keys) == 1 else f["folder"])
+    units_ = list(dict.fromkeys(units_))
+    return {"rating_key": plex_album["rating_key"], "title": plex_album.get("title"),
+            "reason": "shared", "folders": folders, "units": units_,
+            "unit_ids": await _unit_ids(units_), "tracks": len(foreign)}
+
+
+# Matches of one Plex item to different releases within this long mean two
+# units take it for theirs, each undoing the other's match.
+FLIPFLOP_WINDOW = 14 * 86400
+# by name, like apply.OURS_LOCKED: served by idx_changes_target_ref (db v14)
+MATCH_FLIPFLOP = ("SELECT album_key, new_value, applied_at FROM md_changes WHERE target = 'plex' "
+                  "AND field = 'match' AND ref = ? AND reverted_at IS NULL AND applied_at >= ? "
+                  "ORDER BY id")
+
+
+async def match_flipflop(rating_key: str) -> list[dict]:
+    """The matches journalled on this Plex item within the window
+    ([{"guid", "album_key", "at"}]) when they name two or more releases;
+    otherwise none."""
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - FLIPFLOP_WINDOW))
+    matches = []
+    for r in await db.fetchall(MATCH_FLIPFLOP, (rating_key, since)):
+        try:
+            guid = (json.loads(r["new_value"]) or {}).get("guid")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if guid:
+            matches.append({"guid": guid, "album_key": r["album_key"], "at": r["applied_at"]})
+    return matches if len({m["guid"] for m in matches}) > 1 else []
+
+
 SHARED_FIELDS = ("match", "genre", "mood")
+CHANGED_BY_US = ("SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? "
+                 f"AND reverted_at IS NULL AND field IN ({','.join('?' * len(SHARED_FIELDS))}) "
+                 "LIMIT 1")
 
 
 async def changed_by_us(rating_key: str) -> bool:
     """Whether we matched or tagged this Plex album and have not put it back."""
-    marks = ",".join("?" * len(SHARED_FIELDS))
-    return await db.fetchone(
-        "SELECT 1 FROM md_changes WHERE target = 'plex' AND ref = ? AND reverted_at IS NULL "
-        f"AND field IN ({marks}) LIMIT 1", (rating_key, *SHARED_FIELDS)) is not None
+    return await db.fetchone(CHANGED_BY_US, (rating_key, *SHARED_FIELDS)) is not None
 
 
 def same_file(a: Path, b: Path) -> bool:
@@ -795,29 +1002,23 @@ async def plan_artist(artist_dir: str, desired: dict | None, plex_artist: dict |
     return out
 
 
-def plain_recordings(rel: dict | None) -> set[str]:
-    """The recordings of a release that MusicBrainz knows in one version
-    only. One it tells apart from others ("original mono studio mix", "2017
-    stereo mix", "live") may be any of them in our files: when the release
-    was picked among pressings the files can't tell apart (mono or stereo,
-    the same tracklist), the recording is a guess, and no guess is a reason
-    to call two files one."""
-    out = set()
-    for medium in (rel or {}).get("media") or []:
-        for t in medium.get("tracks") or []:
-            rec = t.get("recording") or {}
-            if rec.get("id") and not (rec.get("disambiguation") or "").strip():
-                out.add(rec["id"])
-    return out
+# How long a file's moves are remembered against moving it back and forth,
+# and a merged album's folder is kept as it is.
+OSCILLATION_WINDOW = 14 * 86400
+# md_state key, + the folder casefolded: {"at", "release", "batch"} of the
+# last merge of copies into it
+MERGE_KEEPER = "merge_keeper:"
 
 
-def matched_recordings(desired: dict) -> dict[str, list[str]]:
-    """recording MBID -> the files of an identified album holding it."""
-    out: dict[str, list[str]] = {}
-    for path, t in (desired.get("tracks") or {}).items():
-        if t.get("matched") and t.get("recording_mbid"):
-            out.setdefault(t["recording_mbid"], []).append(path)
-    return out
+async def merged_into(folder: str) -> bool:
+    """Whether a merge of copies made `folder` an album's within the window."""
+    row = await db.fetchone("SELECT value FROM md_state WHERE key = ?",
+                            (MERGE_KEEPER + folder.casefold(),))
+    try:
+        at = float(json.loads(row["value"])["at"]) if row and row["value"] else 0.0
+    except (ValueError, KeyError, TypeError):
+        return False
+    return time.time() - at < OSCILLATION_WINDOW
 
 
 async def plan_album_copies() -> list[dict]:
@@ -826,11 +1027,19 @@ async def plan_album_copies() -> list[dict]:
     remaster of one album; a standard and a deluxe edition). Each set is
     one issue, kept by the copy whose release holds most of what the set
     has. A new remix shares no recording with the original mix, so it is
-    another album; a box set keeps its own copies."""
+    another album; a box set keeps its own copies. A set one of whose copies
+    a download is going into (locks.settling) waits: its issue, if it has
+    one, stays as it is. Only what the merge would take is planned
+    (apply.copy_decisions, the merge's own rule): a copy none of whose files
+    it would move or trash is left out, and a set left with none isn't one,
+    or it would be planned again after every merge that did nothing."""
     from collections import defaultdict
+    from .. import locks
     from . import units as units_mod
+    from .apply import copy_decisions
+    settling = await locks.settling()
     rows = await db.fetchall(
-        "SELECT key, artist_dir, release_mbid, releasegroup_mbid, desired FROM md_albums "
+        "SELECT key, unit_id, artist_dir, release_mbid, releasegroup_mbid, desired FROM md_albums "
         "WHERE status = 'resolved' AND ignored = 0 AND no_release = 0 "
         "AND releasegroup_mbid IS NOT NULL AND desired IS NOT NULL")
     by_group: dict[str, list] = defaultdict(list)
@@ -853,7 +1062,7 @@ async def plan_album_copies() -> list[dict]:
             unit_rows = await units_mod.load_unit(m["key"])
             if not unit_rows or await in_box_set(m["key"], unit_rows):
                 continue
-            held.append({"key": m["key"], "artist_dir": m["artist_dir"],
+            held.append({"key": m["key"], "unit_id": m["unit_id"], "artist_dir": m["artist_dir"],
                          "release": m["release_mbid"], "recs": set(recs), "want": want,
                          "rows": unit_rows})
         for copies in _sharing(held):
@@ -862,16 +1071,43 @@ async def plan_album_copies() -> list[dict]:
                 continue
             others = [c for c in copies if c is not keep]
             album = keep["want"].get("album") or keep["key"]
+            # keyed by the albums, not their folders: the same set is the
+            # same issue after a move. Their keys say where they were.
+            ref = f"{group}:{min(c['unit_id'] or c['key'] for c in copies)}"
+            if any(locks.key(f) in settling for f in
+                   [*(unit_folder(c["key"]) for c in copies), keep["want"].get("folder")] if f):
+                out.append(unchanged(f"album_copies:{ref}"))
+                continue
+            try:
+                rel = await mb.release(keep["release"])
+            except mb.MusicBrainzError:
+                continue
+            if not rel:
+                continue
+            plan = copy_decisions(keep["want"], keep["rows"], rel,
+                                  [(c["key"], c["rows"], c["want"]) for c in others])
+            # a copy the merge takes nothing from changes nothing by its
+            # dropping out: the others' files are decided the same
+            others = [c for c in others
+                      if plan["of"][c["key"]]["moves"] or plan["of"][c["key"]]["trash"]]
+            if not others:
+                continue
+            moves, trash = len(plan["moves"]), len(plan["trash"])
+            leaves = sum(plan["of"][c["key"]]["left"] for c in others)
             shared = sum(len(c["recs"] & keep["recs"]) for c in others)
             out.append(planned(
-                "album_copies", f"{group}:{min(c['key'] for c in copies)}",
-                f"{album}: {len(copies)} copies — merge into {keep['want'].get('folder') or keep['key']}",
+                "album_copies", ref,
+                f"{album}: {len(others) + 1} copies — merge into "
+                f"{keep['want'].get('folder') or keep['key']}: {moves} moved in, {trash} to Trash"
+                + (f", {leaves} left where they are" if leaves else ""),
                 {"keep": keep["key"], "copies": [c["key"] for c in others],
-                 "folders": [c["key"] for c in copies], "album": album,
+                 "keep_unit": keep["unit_id"], "copy_units": [c["unit_id"] for c in others],
+                 "folders": [c["key"] for c in [keep, *others]], "album": album,
                  "release_mbid": keep["release"], "releasegroup_mbid": group,
-                 "shared": shared, "to": keep["want"].get("folder")},
+                 "shared": shared, "to": keep["want"].get("folder"),
+                 "moves": moves, "trash": trash, "leaves": leaves},
                 artist_dir=keep["artist_dir"], album_key=keep["key"],
-                refs=[(c["artist_dir"], c["key"]) for c in copies]))
+                refs=[(c["artist_dir"], c["key"]) for c in [keep, *others]]))
     return out
 
 

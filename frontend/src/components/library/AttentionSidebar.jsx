@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  Badge, Box, Button, Chip, Divider, IconButton, LinearProgress, Stack, ToggleButton,
+  Badge, Box, Button, Chip, Divider, IconButton, LinearProgress, Link, Stack, ToggleButton,
   ToggleButtonGroup, Tooltip, Typography,
 } from '@mui/material'
 import BlockIcon from '@mui/icons-material/Block'
@@ -22,7 +22,12 @@ const DUPE_TAB = { dup_album: 'albums', dup_track: 'tracks', split_artist: 'arti
 function Group({ group, onApply, onReview, onResolve }) {
   const kind = KINDS[group.kind]
   const applyable = group.applyable ?? kind?.applyable
-  const open = group.count - (group.queued_count || 0)
+  // what "<action> all" takes: the count (open and failed; for missing
+  // tracks, the ones never tried)
+  const open = group.bulk_count ?? group.count
+  // beside the count: fixes under way, and the Tried bucket
+  const inProgress = group.queued_count || 0
+  const tried = group.tried_count || 0
   return (
     <Box sx={{
       px: 1, py: 0.75, borderLeft: 3, borderLeftColor: `${severityColor(group.severity)}.main`,
@@ -34,10 +39,27 @@ function Group({ group, onApply, onReview, onResolve }) {
             {group.label || kind?.label || group.kind}
           </Typography>
         </Tooltip>
-        <Chip size="small" label={group.count.toLocaleString()}
-          color={severityColor(group.severity)} variant="outlined"
-          sx={{ height: 20, fontSize: '0.7rem' }} />
+        {group.count > 0 && (
+          <Chip size="small" label={group.count.toLocaleString()}
+            color={severityColor(group.severity)} variant="outlined"
+            sx={{ height: 20, fontSize: '0.7rem' }} />
+        )}
       </Box>
+      {(inProgress > 0 || tried > 0) && (
+        <Typography variant="caption" color="text.secondary" display="block">
+          {inProgress > 0 && `${inProgress.toLocaleString()} in progress`}
+          {inProgress > 0 && tried > 0 && ' · '}
+          {tried > 0 && (
+            <Tooltip title="Download missing fetched what it could; the rest isn't there to fetch"
+              placement="left">
+              <Link component="button" variant="caption" underline="hover"
+                onClick={() => onReview(group, 'tried')} sx={{ verticalAlign: 'baseline' }}>
+                {tried.toLocaleString()} tried
+              </Link>
+            </Tooltip>
+          )}
+        </Typography>
+      )}
       <Stack direction="row" spacing={0.5} sx={{ mt: 0.5 }}>
         {applyable && group.auto_count > 0 && (
           <Button size="small" variant="outlined" sx={{ py: 0, fontSize: '0.72rem' }}
@@ -53,9 +75,11 @@ function Group({ group, onApply, onReview, onResolve }) {
             </Button>
           </Tooltip>
         )}
-        <Button size="small" sx={{ py: 0, fontSize: '0.72rem' }} onClick={() => onReview(group)}>
-          Review
-        </Button>
+        {group.count > 0 && (
+          <Button size="small" sx={{ py: 0, fontSize: '0.72rem' }} onClick={() => onReview(group)}>
+            Review
+          </Button>
+        )}
         {DUPE_KINDS.has(group.kind) && (
           <Button size="small" sx={{ py: 0, fontSize: '0.72rem' }} onClick={() => onResolve(group)}>
             Resolve
@@ -195,7 +219,7 @@ export default function AttentionSidebar({
           {groups.map((g) => (
             <Group key={g.kind} group={g}
               onApply={(grp, onlyAuto) => onApply(grp, scopedArtist, onlyAuto)}
-              onReview={(grp) => onReview(grp, scopedArtist)}
+              onReview={(grp, state) => onReview(grp, scopedArtist, state)}
               onResolve={(grp) => onResolveDupes(DUPE_TAB[grp.kind] || 'albums')} />
           ))}
 

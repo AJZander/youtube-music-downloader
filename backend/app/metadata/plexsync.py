@@ -10,7 +10,8 @@ request), and a page's genres stand until the item changes again.
 Incremental syncs fetch only what was added or updated since the last one.
 Plex has no "deleted since" filter, so when the section's counts stop
 matching the mirror's — or every few hours anyway — the listing is complete
-and anything not seen is dropped.
+and anything not seen is dropped, but only when the listing held as many
+items as Plex counted, and Plex, asked for it by key, says it is gone.
 """
 from __future__ import annotations
 
@@ -117,8 +118,10 @@ async def sync(*, full: bool = False, progress=None) -> dict:
     full = full or drifted or not previous or started - last_full > FULL_EVERY
 
     seen = 0
+    listed: dict[int, set[str]] = {}       # the distinct items each type's listing held
     for type_num in (ARTIST, ALBUM, TRACK):
         rows: list[tuple] = []
+        keys = listed.setdefault(type_num, set())
         if full:
             sources = [plex.iter_items(type_num)]
         else:
@@ -128,6 +131,7 @@ async def sync(*, full: bool = False, progress=None) -> dict:
         for source in sources:
             async for item in source:
                 rows.append(_row(item, type_num, started))
+                keys.add(rows[-1][0])
                 if len(rows) >= 2000:
                     await db.executemany(_UPSERT, rows)
                     seen += len(rows)
@@ -139,11 +143,41 @@ async def sync(*, full: bool = False, progress=None) -> dict:
             seen += len(rows)
     removed = 0
     if full:
-        row = await db.fetchone("SELECT COUNT(*) AS n FROM plex_items WHERE seen_at < ?",
-                                (started,))
-        removed = row["n"]
-        await db.execute("DELETE FROM plex_items WHERE seen_at < ?", (started,))
-        await _set_state("plex_last_full", str(started))
+        # What a listing didn't show is gone from Plex only if the listing
+        # was whole: one that came up short (items added or removed mid-
+        # sync shift the pages) would drop rows Plex still has. A count
+        # Plex didn't give (None) is never reached.
+        short = {t: len(listed[t]) for t in listed
+                 if counts[t] is None or len(listed[t]) < counts[t]}
+        missed: dict[int, int] = {}
+        for type_num in listed:
+            if type_num in short:
+                continue
+            # A delete and an add mid-sync keep the count yet shift the
+            # pages past one item: each unseen row is asked for by key, and
+            # only what Plex says is gone is dropped.
+            name = TYPE_NAME[type_num]
+            unseen = [r["rating_key"] for r in await db.fetchall(
+                "SELECT rating_key FROM plex_items WHERE type = ? AND seen_at < ?",
+                (name, started))]
+            if not unseen:
+                continue
+            count = "SELECT COUNT(*) AS n FROM plex_items WHERE type = ?"
+            before = (await db.fetchone(count, (name,)))["n"]
+            await refresh_items(unseen)
+            gone = before - (await db.fetchone(count, (name,)))["n"]
+            removed += gone
+            if len(unseen) > gone:
+                missed[type_num] = len(unseen) - gone
+        if short:
+            log.warning("plex sync: the listing came up short (%s); unseen rows kept",
+                        ", ".join(f"{TYPE_NAME[t]}s {n} of {'?' if counts[t] is None else counts[t]}"
+                                  for t, n in short.items()))
+        if missed:
+            log.warning("plex sync: the listing missed %s Plex still has (or couldn't say); "
+                        "rows kept", ", ".join(f"{n} {TYPE_NAME[t]}s" for t, n in missed.items()))
+        if not short and not missed:
+            await _set_state("plex_last_full", str(started))
 
     # An album's folder: where most of its tracks are.
     await db.execute("""
@@ -377,9 +411,37 @@ async def album_others(album_key: str, paths: list[str]) -> list[dict]:
     for i in range(0, len(other_paths), 400):
         chunk = other_paths[i:i + 400]
         others += [dict(r) for r in await db.fetchall(
-            "SELECT path, album, mb_releasegroupid FROM library_index WHERE path IN "
-            f"({','.join('?' * len(chunk))})", tuple(chunk))]
+            "SELECT path, dirpath, artist_dir, album, album_artist, mb_releasegroupid "
+            f"FROM library_index WHERE path IN ({','.join('?' * len(chunk))})", tuple(chunk))]
     return others
+
+
+def foreign_files(info: dict | None, key: str | None) -> list[dict]:
+    """The tracks of the Plex album these files map to that belong to
+    another unit: a file of another album folder (disc subfolders count as
+    their album's), or, for a unit split out of a folder by album tag, of
+    one of the folder's other albums. Plex lumps two editions tagged alike
+    into one album, and keeps a track in the album it first saw it in. Such
+    an album is no unit's to match, tag, mood or give a cover: each unit in
+    it would overwrite the last (until the reconciler, P1-C4, sorts it out).
+
+    Only indexed files count (`others`), so a ghost entry doesn't; a file
+    of ours the index has no folder for yet (an import) is placed by its
+    path, so it doesn't either. [{"path", "folder", "split"}]: the file's
+    album folder, and the split key its album tag gives it there."""
+    if key is None:
+        return []
+    from ..identity import split_key, unit_dir
+    folder, _, split = key.partition("|")
+    out: list[dict] = []
+    for other in (info or {}).get("others") or []:
+        path = other.get("path") or ""
+        theirs = unit_dir(other.get("dirpath") or (path.rsplit("/", 1)[0] if "/" in path else ""))
+        k = split_key(other.get("album"), other.get("album_artist") or other.get("artist_dir"))
+        # (in a split folder an untagged file joins its largest album: not foreign)
+        if nfc(theirs).casefold() != nfc(folder).casefold() or (split and k and k != split):
+            out.append({"path": path, "folder": theirs, "split": k})
+    return out
 
 
 def album_share(info: dict | None, rows: list[dict], releasegroup: str | None = None) -> dict:
@@ -396,10 +458,11 @@ def album_share(info: dict | None, rows: list[dict], releasegroup: str | None = 
                if t.get("parent_key") == album.get("rating_key")) or len(rows)
     if not others:
         return {"ours": mine, "foreign": 0, "owner_tagged": False}
-    from ..library import album_key
+    from ..identity import album_id, album_key, same_album
     groups = ({releasegroup} if releasegroup
               else {r.get("mb_releasegroupid") for r in rows if r.get("mb_releasegroupid")})
-    names = {album_key(r.get("album")) for r in rows if r.get("album")}
+    # by album tag: one album, in any edition (a [Single] is not its album)
+    names = [album_id(t) for t in sorted({r.get("album") for r in rows if r.get("album")})]
     foreign: Counter = Counter()
     same = 0
     for other in others:
@@ -408,7 +471,8 @@ def album_share(info: dict | None, rows: list[dict], releasegroup: str | None = 
             if rg in groups:
                 same += 1
                 continue
-        elif other.get("album") and album_key(other["album"]) in names:
+        elif other.get("album") and any(
+                same_album(album_id(other["album"]), mine_, "release_group") for mine_ in names):
             same += 1
             continue
         foreign[f"rg:{rg}" if rg else f"name:{album_key(other.get('album') or '')}"] += 1

@@ -32,16 +32,24 @@ import os
 import re
 import shutil
 import time
-import unicodedata
 import uuid
 from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
+from . import identity, locks, relocate
 from .config import settings
 from .db import db, utcnow
 from .engine.matcher import normalize
+# What is the same recording, album, artist or path, and which copy is
+# better, is app.identity's to say; these names stay for the callers that
+# have always asked here.
+from .identity import (  # noqa: F401
+    _DIR_NOISE, _YOUTUBE_JUNK, DURATION_TOLERANCE, LOSSLESS_FORMATS, UPLOAD_TOLERANCE,
+    album_identity, album_key, edition_words, fold, format_quality, keys_for, row_album_id,
+    row_album_identity, row_album_keys, row_edition, same_album, strict_key, tag_quality,
+    title_keys, title_looks_like_junk, unit_dir, version_markers)
 
 log = logging.getLogger("mdl.library")
 
@@ -51,15 +59,6 @@ AUDIO_SUFFIXES = {".mp3", ".flac", ".opus", ".m4a", ".ogg", ".wav", ".aac", ".wm
 # audio into the trash when a whole folder goes, and never hold a folder open.
 SIDECAR_SUFFIXES = {".lrc", ".jpg", ".jpeg", ".png", ".webp", ".nfo", ".txt",
                     ".cue", ".log", ".m3u", ".m3u8", ".sfv", ".md5", ".db", ".ini"}
-LOSSLESS_FORMATS = {"flac", "wav", "alac", "aiff", "aif", "ape", "wv"}
-
-# Duration difference that still counts as "the same recording". Wider than
-# the matcher's ±3s: these are two rips of the same track from different
-# sources, not a match against a known reference duration.
-DURATION_TOLERANCE = 5.0
-# Old YouTube uploads run long — a few seconds of silence, a video's intro —
-# so a copy with a YouTube-style title gets this much slack instead.
-UPLOAD_TOLERANCE = 30.0
 
 # Fraction of the smaller album's tracks that must appear in the larger one
 # before the two folders are called the same album.
@@ -73,204 +72,6 @@ MAX_BUCKET = 250
 # waiting on a chunk boundary; a partial scan still keeps everything committed
 # before the last boundary it crossed.
 COMMIT_CHUNK = 2000
-
-
-# ------------------------------------------------------------------ text keys
-_YOUTUBE_JUNK = re.compile(
-    r"\b(official\s*(music\s*)?(video|audio|visuali[sz]er)|lyric[s]?\s*video"
-    r"|full\s*album|audio\s*only|hd|hq|4k|m/v|mv)\b", re.I)
-
-_DIR_NOISE = [
-    re.compile(r"^\s*[\(\[\{]?\s*(19|20)\d{2}\s*[\)\]\}]?\s*[-–—.]+\s*"),  # (2013) - / 2013 -
-    re.compile(r"[\[\{][^\]\}]*[\]\}]"),                                    # [FLAC 24bit]
-    re.compile(r"\((?:19|20)\d{2}\)"),                                      # (2017)
-    re.compile(r"\b(flac|mp3|m4a|aac|opus|wav|web|webrip|cd\d?|cdrip|vinyl|"
-               r"\d{2,3}\s?kbps|\d{3}k|v0|v2|\d{2}\s?bit|\d{2}(\.\d)?\s?khz|"
-               r"hi\s?res|lossless|obey|scene)\b", re.I),
-]
-
-
-def strict_key(s: str) -> str:
-    """Punctuation- and space-insensitive identity key. `AC_DC`, `AC/DC` and
-    `ACDC` are one artist; `3 Doors Down` and `3doorsdown` are one artist."""
-    s = unicodedata.normalize("NFKD", s or "").casefold()
-    return re.sub(r"[^a-z0-9]+", "", s)
-
-
-def fold(text: str | None) -> str:
-    """Case- and accent-blind text to search in: "Måneskin" -> "maneskin"."""
-    decomposed = unicodedata.normalize("NFKD", text or "")
-    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
-
-
-_FEAT_TAG = re.compile(r"\s*[\(\[]\s*(?:feat|ft|featuring)\b\.?[^\)\]]*[\)\]]", re.I)
-
-
-def title_keys(title: str | None, artist_hint: str | None = None,
-               artists=()) -> frozenset[str]:
-    """Comparison keys for one track title.
-
-    v1 wrote whole YouTube video titles into the title tag — `Ariana Grande -
-    Baby I (Official Video)` sits next to a clean `Baby I`. Rather than guess
-    which side of a dash is the title, emit both readings and call two tracks
-    the same when *any* key matches. Matching on a set intersection instead of
-    string equality is what lets a junk-tagged folder group with a clean one.
-    """
-    if not title:
-        return frozenset()
-    # a bracketed credit goes first: normalize() cuts everything after
-    # "feat.", which would take "(Wideboys Remix)" after it along too
-    raw = _FEAT_TAG.sub("", _YOUTUBE_JUNK.sub(" ", title))
-    keys = {normalize(raw)}
-    if artist_hint:
-        prefix = re.compile(r"^\s*" + re.escape(artist_hint) + r"\s*[-–—]\s*", re.I)
-        keys.add(normalize(prefix.sub("", raw)))
-    if " - " in raw or " – " in raw:
-        left, right = re.split(r"\s+[-–—]\s+", raw, maxsplit=1)
-        # "Artist - Title" from a video, never "Title - Live" or "Kapitel 2 -
-        # Chronicles, Vol. 1": what follows the dash there is shared by
-        # every track of the album
-        left_key = strict_key(left)
-        names = {strict_key(a) for a in (artist_hint, *artists) if a}
-        if title_looks_like_junk(title) or any(
-                n == left_key or (len(n) >= 4 and n in left_key) for n in names if n):
-            keys.add(normalize(right))
-            if re.search(r"\b(?:feat|ft)\b", left, re.I):
-                # "SALMO FEAT. ENIGMA - MUNCHIES": normalize() cuts at the
-                # credit, leaving only the artist as the whole title's key
-                keys.discard(normalize(raw))
-                if artist_hint:
-                    keys.discard(normalize(prefix.sub("", raw)))
-    return frozenset(k for k in keys if k)
-
-
-def keys_for(row: dict) -> frozenset[str]:
-    """title_keys for a scanned row, memoized on the row itself.
-
-    Album grouping compares every pair of folders an artist owns, so an
-    un-memoized call recomputes the same regex work thousands of times for a
-    prolific artist. The cache lives on the dict, which is per-analysis."""
-    cached = row.get("_keys")
-    if cached is None:
-        cached = row["_keys"] = title_keys(
-            row.get("title"), row.get("album_artist") or row.get("artist_dir"),
-            (row.get("artist"), row.get("album_artist"), row.get("artist_dir")))
-    return cached
-
-
-def album_key(folder_or_album: str | None, artist_hint: str | None = None) -> str:
-    """Normalized album identity from a folder name or an album tag, with the
-    release-year prefixes, scene tags and repeated artist name stripped."""
-    if not folder_or_album:
-        return ""
-    name = folder_or_album
-    if artist_hint:
-        name = re.sub(r"^\s*" + re.escape(artist_hint) + r"\s*[-–—]\s*", " ", name, flags=re.I)
-    for pattern in _DIR_NOISE:
-        name = pattern.sub(" ", name)
-    if artist_hint:  # the year prefix may have been hiding the artist name
-        name = re.sub(r"^\s*" + re.escape(artist_hint) + r"\s*[-–—]\s*", " ", name, flags=re.I)
-    return strict_key(name)
-
-
-# A remaster is the same album; a deluxe or anniversary edition is not.
-_ALBUM_REMASTER = re.compile(
-    r"\s*[\(\[][^\)\]]*\bremaster(?:ed)?\b[^\)\]]*[\)\]]"
-    r"|\s*[-–—:]\s*(?:\d{4}\s+)?(?:digital(?:ly)?\s+)?remaster(?:ed)?\b.*$", re.I)
-
-
-def album_identity(name: str | None, artist_hints=()) -> frozenset[str]:
-    """Keys an album name is known by — two names are the same album when
-    any key is shared.
-
-    One key per artist hint, since a folder may or may not repeat the artist
-    (`(2013) - Ariana Grande - Yours Truly`). YouTube junk (`Full Album`) and
-    remaster tags go first; edition words stay, because `Seventy (Deluxe
-    Edition)` is a different album from `Seventy`."""
-    if not name:
-        return frozenset()
-    base = _ALBUM_REMASTER.sub("", _YOUTUBE_JUNK.sub(" ", name))
-    keys = {album_key(base)} | {album_key(base, h) for h in artist_hints if h}
-    keys.discard("")
-    return frozenset(keys)
-
-
-def row_album_identity(row: dict) -> frozenset[str]:
-    """What album a library file is on: its album tag and, unless it sits
-    loose in the artist folder, the folder it is in. Memoized on the row."""
-    cached = row.get("_albums")
-    if cached is None:
-        path = row.get("path") or ""
-        top = path.split("/", 1)[0]
-        hints = {row.get("artist_dir"), row.get("album_artist"), top}
-        folder = row.get("dirpath") or path.rsplit("/", 1)[0]
-        cached = album_identity(row.get("album"), hints) | album_identity(
-            row.get("norm_album"), hints)
-        if folder and folder != top:   # a loose file's folder is the artist
-            cached |= album_identity(folder.rsplit("/", 1)[-1], hints)
-        row["_albums"] = cached
-    return cached
-
-
-_DISC_DIR = re.compile(r"^(?:cd|disc|disk)\s*\d+\b", re.I)
-
-
-def unit_dir(dirpath: str) -> str:
-    """The album folder a file folder belongs to: a disc subfolder's parent
-    (never an artist folder: `Artist/CD1` stays its own)."""
-    parent, _, leaf = (dirpath or "").rpartition("/")
-    return parent if "/" in parent and _DISC_DIR.match(leaf) else dirpath
-
-
-# Words in a name's brackets or dash suffix that make it another edition of
-# the album. Remasters and reissues are the same album, so they are not here.
-_EDITION_WORDS = re.compile(
-    r"\b(deluxe|expanded|special|complete|anniversary|collector|super|platinum|bonus"
-    r"|international|instrumental|acoustic|remix(?:es)?|uncut|live|japan(?:ese)?"
-    r"|extended|tour|clean|edited|censored|mono|limited)\b", re.I)
-_QUALIFIERS = re.compile(r"[\(\[]([^\)\]]*)[\)\]]|\s[-–—]\s+([^-–—]*)$")
-# "Wild Ones (feat. Sia)": a featured credit names a single, not its album
-_CREDIT = re.compile(r"^\s*(?:feat|ft|featuring)\b", re.I)
-
-
-def edition_words(*names: str | None, hints=()) -> frozenset[str]:
-    """What edition a name says it is: `Album (Deluxe Edition)` and `(2017)
-    Album [Deluxe]` say deluxe, `Album [2011 Remaster]` says nothing. Only
-    qualifiers count, so a title's own words (`Live Through This`, `1988 -
-    Live at Wembley`) never do."""
-    found = set()
-    for name in names:
-        name = _DIR_NOISE[0].sub("", fold(name))
-        for hint in hints:
-            if hint:
-                name = re.sub(r"^\s*" + re.escape(fold(hint)) + r"\s*[-–—]\s*", "", name)
-        for m in _QUALIFIERS.finditer(name):
-            if _CREDIT.match(m.group(1) or ""):
-                found.add("single")
-            for word in _EDITION_WORDS.findall(m.group(1) or m.group(2) or ""):
-                word = word.lower()
-                found.add("remix" if word.startswith("remix")
-                          else "japan" if word.startswith("japan") else word)
-    return frozenset(found)
-
-
-def row_edition(row: dict) -> frozenset[str]:
-    """The edition a file's album is, by its tag and its album folder."""
-    cached = row.get("_edition")
-    if cached is None:
-        folder = unit_dir(row.get("dirpath") or "")
-        leaf = folder.rsplit("/", 1)[-1] if folder and folder != row.get("artist_dir") else ""
-        cached = row["_edition"] = edition_words(
-            row.get("album"), leaf, hints=(row.get("artist_dir"), row.get("album_artist")))
-    return cached
-
-
-def title_looks_like_junk(title: str | None) -> bool:
-    """True for a title tag that is really a YouTube video title."""
-    if not title:
-        return True
-    return bool(_YOUTUBE_JUNK.search(title)) or bool(
-        re.search(r"\b(ft\.?|feat\.?)\b", title, re.I) and " - " in title)
 
 
 # ------------------------------------------------------------------ scanning
@@ -320,7 +121,8 @@ _COLUMNS = ("norm_artist", "norm_title", "norm_album", "path", "format",
             "artist_dir", "scanned_at", "added_at", "unreadable",
             "genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
             "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
-            "releasetype", "label", "originaldate", "junk", "tags_version")
+            "releasetype", "label", "originaldate", "junk", "tags_version", "path_key")
+_PATH = _COLUMNS.index("path")
 _EXTENDED = ("genre", "isrc", "mb_albumid", "mb_releasegroupid", "mb_albumartistid",
              "mb_artistid", "mb_trackid", "mb_releasetrackid", "compilation",
              "releasetype", "label", "originaldate", "junk", "tags_version")
@@ -345,7 +147,7 @@ ON CONFLICT(path) DO UPDATE SET
   mb_trackid=excluded.mb_trackid, mb_releasetrackid=excluded.mb_releasetrackid,
   compilation=excluded.compilation, releasetype=excluded.releasetype,
   label=excluded.label, originaldate=excluded.originaldate, junk=excluded.junk,
-  tags_version=excluded.tags_version,
+  tags_version=excluded.tags_version, path_key=excluded.path_key,
   -- a rescan must not forget which download produced the file
   provider_track_id=COALESCE(library_index.provider_track_id,
                              excluded.provider_track_id)
@@ -422,7 +224,7 @@ def _unreadable_row(root: Path, rel: str, size: int, mtime: float) -> tuple:
             None, stem, None, None, None, None, None, None, None, None, None,
             size, mtime, dirpath, artist_dir, utcnow(), utcnow(), 1,
             None, None, None, None, None, None, None, None, None, None, None, None, None,
-            TAGS_VERSION)
+            TAGS_VERSION, identity.path_key(rel))
 
 
 def _read_file(root: Path, rel: str, size: int, mtime: float) -> tuple:
@@ -515,7 +317,7 @@ def _read_file(root: Path, rel: str, size: int, mtime: float) -> tuple:
         (date or "")[:4] or None,
         bitrate_kbps, sample_rate, bits, channels,
         size, mtime, dirpath, artist_dir, utcnow(), utcnow(), 0,
-        *extended,
+        *extended, identity.path_key(rel),
     )
 
 
@@ -544,6 +346,12 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
     reopened. That matters — walking this library takes ~30s but reading tags
     off 61k files over CIFS takes far longer, so a rescan after resolving
     duplicates has to cost a stat() per file, not a parse.
+
+    It doesn't wait for writers (locks): a folder one held at any point of
+    the scan may have been read half changed (a merge's files tagged and not
+    yet moved, a move's file there and its row not yet), so its rows are
+    neither written nor pruned. The writer indexes what it did; the next
+    scan reads the rest.
     """
     if _scan_lock.locked():
         raise RuntimeError("a library scan is already running")
@@ -556,6 +364,11 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
         state.phase = "walking"
         root = settings.library_dir
         loop = asyncio.get_running_loop()
+        since = locks.tick()
+
+        def settled(rel: str) -> bool:
+            return not locks.touched_since(str(Path(rel).parent), since)
+
         try:
             found = await loop.run_in_executor(None, _walk, root)
             log.info("library scan: %d audio files on disk", len(found))
@@ -605,7 +418,7 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
                         state.done = before
                         results = await loop.run_in_executor(
                             None, _run_batches, pool, str(root), chunk, tick)
-                    rows = [r for r in results if r]
+                    rows = [r for r in results if r and settled(r[_PATH])]
                     state.unreadable += sum(1 for r in rows if r[-1])
                     for rel, _size, _mtime in chunk:
                         if rel in known:
@@ -631,6 +444,8 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
                 state.error = (f"pruning skipped: only {len(found)} of {len(known)} "
                                "indexed files were visible")
                 gone = []
+            gone = [p for p in gone if settled(p)]
+            await _follow_renamed(gone, [p for p in found if p not in known and settled(p)])
             for start in range(0, len(gone), 500):
                 batch = gone[start:start + 500]
                 await db.execute(
@@ -650,76 +465,51 @@ async def scan(full: bool = False, progress_cb=None) -> dict:
         return state.snapshot()
 
 
+# What a file's index row says about its content: the same on both sides of
+# a rename or a move, and next to never the same for two different files.
+_SAME_FILE = ("filesize_bytes", "duration_sec", "format", "title", "artist", "album",
+              "album_artist", "track_number", "disc_number", "mb_trackid")
+
+
+async def _follow_renamed(gone: list[str], added: list[str]) -> int:
+    """Files that left one path and turned up, unchanged, at another in the
+    same scan (a folder renamed or moved outside the app, which the walk
+    sees as a delete and an add) carry the unit they were last seen in, so
+    the album's identity and decisions follow them (units.sync_registry).
+    Only a file with exactly one match on each side is taken for the same
+    one: files that can't be told apart start afresh. Returns how many."""
+    if not gone or not added:
+        return 0
+    columns = ", ".join(_SAME_FILE)
+
+    async def by_content(paths: list[str]) -> dict[tuple, dict]:
+        seen: dict[tuple, list[dict]] = collections.defaultdict(list)
+        for start in range(0, len(paths), 500):
+            batch = paths[start:start + 500]
+            for r in await db.fetchall(
+                    f"SELECT path, unit_id, {columns} FROM library_index "
+                    f"WHERE path IN ({','.join('?' * len(batch))})", tuple(batch)):
+                if r["filesize_bytes"] and r["duration_sec"]:
+                    seen[tuple(r[c] for c in _SAME_FILE)].append(dict(r))
+        return {k: v[0] for k, v in seen.items() if len(v) == 1}
+
+    before = {k: r for k, r in (await by_content(gone)).items() if r["unit_id"]}
+    if not before:
+        return 0
+    after = await by_content(added)
+    pairs = [(before[k]["unit_id"], after[k]["path"]) for k in before.keys() & after.keys()
+             if not after[k]["unit_id"]]
+    if pairs:
+        await db.executemany("UPDATE library_index SET unit_id = ? WHERE path = ?", pairs)
+        log.info("library scan: %d files found at new paths keep their album", len(pairs))
+    return len(pairs)
+
+
 # ------------------------------------------------------------------ scoring
-def format_quality(row: dict) -> int:
-    fmt = (row.get("format") or "").lower()
-    if fmt in LOSSLESS_FORMATS:
-        score = 1000
-        if (row.get("bit_depth") or 16) > 16:
-            score += 60
-        if (row.get("sample_rate") or 44100) > 48000:
-            score += 30
-        return score
-    return min(row.get("bitrate_kbps") or 0, 400)
-
-
-def tag_quality(row: dict) -> int:
-    score = 0
-    if row.get("album_artist"):
-        score += 40
-    if row.get("album"):
-        score += 40
-    if row.get("track_number"):
-        score += 30
-    if row.get("year"):
-        score += 10
-    if not title_looks_like_junk(row.get("title")):
-        score += 40
-    return score
-
-
 def score_file(row: dict, reference_duration: float | None = None) -> tuple[int, list[str]]:
-    """Rank one copy of a track. Returns (score, human-readable reasons).
-
-    The reasons are the point: the UI has to be able to say *why* it wants to
-    delete the file you spent bandwidth on, or it will not be trusted.
-    """
-    reasons: list[str] = []
-    fmt = (row.get("format") or "?").lower()
-    quality = format_quality(row)
-    if fmt in LOSSLESS_FORMATS:
-        detail = f"lossless {fmt}"
-        if (row.get("bit_depth") or 0) > 16:
-            detail += f" {row['bit_depth']}-bit"
-        if (row.get("sample_rate") or 0) > 48000:
-            detail += f" {row['sample_rate'] // 1000}kHz"
-        reasons.append(detail)
-    elif row.get("bitrate_kbps"):
-        reasons.append(f"{row['bitrate_kbps']} kbps {fmt}")
-    else:
-        reasons.append(fmt)
-
-    score = quality
-    duration = row.get("duration_sec")
-    if reference_duration and duration:
-        delta = duration - reference_duration
-        if delta < -DURATION_TOLERANCE * 2:
-            score -= 900
-            reasons.append(f"{abs(round(delta))}s shorter than the other copies "
-                           "— likely truncated")
-        elif delta > 20:
-            reasons.append(f"{round(delta)}s longer (extended version or trailing silence)")
-
-    tags = tag_quality(row)
-    score += tags
-    missing = [name for name, key in
-               (("album artist", "album_artist"), ("album", "album"),
-                ("track number", "track_number")) if not row.get(key)]
-    if missing:
-        reasons.append("missing " + ", ".join(missing))
-    if title_looks_like_junk(row.get("title")):
-        reasons.append("title is a YouTube video title")
-    return score, reasons
+    """Rank one copy of a track: identity.file_quality, tags counted.
+    Returns (score, human-readable reasons)."""
+    return identity.file_quality(row, reference_duration, tags=True)
 
 
 # ------------------------------------------------------------------ grouping
@@ -729,11 +519,13 @@ def pair_key(a: str, b: str) -> tuple[str, str]:
 
 
 async def load_exclusions() -> dict[str, set[tuple[str, str]]]:
-    """Pairs the user has said may coexist, by scope."""
+    """Pairs the user has said may coexist, by scope. Each in pair_key's
+    order, however it was stored (a rename used to leave a pair the other
+    way round)."""
     out: dict[str, set[tuple[str, str]]] = collections.defaultdict(set)
     for row in await db.fetchall(
             "SELECT scope, key_a, key_b FROM library_exclusions"):
-        out[row["scope"]].add((row["key_a"], row["key_b"]))
+        out[row["scope"]].add(pair_key(row["key_a"], row["key_b"]))
     return out
 
 
@@ -771,6 +563,15 @@ async def list_exclusions() -> dict:
         entry["members"].update((row["key_a"], row["key_b"]))
     items = [{**e, "members": sorted(e["members"])} for e in buckets.values()]
     return {"total": len(rows), "items": items}
+
+
+async def exclusion_pairs(ids: list[int]) -> list[dict]:
+    """The decisions with these ids: each one's scope and pair of keys."""
+    if not ids:
+        return []
+    return [dict(r) for r in await db.fetchall(
+        f"SELECT scope, key_a, key_b FROM library_exclusions WHERE id IN "
+        f"({','.join('?' * len(ids))})", tuple(ids))]
 
 
 async def remove_exclusions(ids: list[int]) -> int:
@@ -880,22 +681,13 @@ class AlbumInstance:
         return index
 
 
-def same_recording(a: dict, b: dict) -> bool:
-    """Whether two same-titled files are one recording by their lengths: an
-    edited vinyl cut, a cover in the artist's folder or another mix runs
-    longer or shorter. A YouTube upload gets slack for its intro."""
-    da, dbn = a.get("duration_sec"), b.get("duration_sec")
-    if not da or not dbn:
-        return True
-    upload = title_looks_like_junk(a.get("title")) or title_looks_like_junk(b.get("title"))
-    return abs(da - dbn) <= (UPLOAD_TOLERANCE if upload else DURATION_TOLERANCE)
-
-
 def match_in(row: dict, index: dict[str, list[dict]]) -> dict | None:
-    """The file in `index` (title key -> files) holding this file's recording."""
+    """The file in `index` (title key -> files) holding this file's
+    recording: the lengths agree, and nothing tells the two apart (another
+    version, two recording IDs, two tracks of one release)."""
     for key in keys_for(row):
         for other in index.get(key, ()):
-            if same_recording(row, other):
+            if identity.same_length(row, other) and identity.same_recording(row, other):
                 return other
     return None
 
@@ -925,10 +717,10 @@ def _album_overlap(a: AlbumInstance, b: AlbumInstance) -> tuple[float, int]:
 
 def _instance_identity(inst: AlbumInstance) -> frozenset[str]:
     """Every name an album folder answers to: its files' album tags and the
-    folder's own name, each through album_identity."""
+    folder's own name, each through album_keys."""
     keys: set[str] = set()
     for f in inst.files:
-        keys |= row_album_identity(f)
+        keys |= row_album_keys(f)
     return frozenset(keys)
 
 
@@ -937,11 +729,11 @@ def _most(values) -> object:
     return counts.most_common(1)[0][0] if counts else None
 
 
-def _instance_kind(inst: AlbumInstance) -> tuple:
-    """Which album a folder is beyond its name: the MusicBrainz release group
-    its files are tagged with (None when untagged), and its edition."""
-    return (_most(f.get("mb_releasegroupid") for f in inst.files),
-            _most(row_edition(f) for f in inst.files) or frozenset())
+def _instance_kind(inst: AlbumInstance, names: frozenset[str]) -> identity.AlbumId:
+    """Which album a folder is: its names, the MusicBrainz release group its
+    files are tagged with (None when untagged), and its edition."""
+    return identity.AlbumId(names, _most(row_edition(f) for f in inst.files) or frozenset(),
+                            _most(f.get("mb_releasegroupid") for f in inst.files))
 
 
 _YEAR_NAME = re.compile(r"^\s*[\(\[]?(?:19|20)\d{2}[\)\]]?\s*[-–—.]?\s+\S")
@@ -968,13 +760,6 @@ def _box_set_members(instances: dict[str, AlbumInstance]) -> set[str]:
         if len({k for k in members.values() if k}) > 1:
             out |= set(members)
     return out
-
-
-def _same_kind(a: tuple, b: tuple) -> bool:
-    """A single named like its album, or a deluxe edition beside the
-    standard one, is another release: the same album needs the same release
-    group (when both are known) and the same edition."""
-    return (not a[0] or not b[0] or a[0] == b[0]) and a[1] == b[1]
 
 
 def find_album_duplicates(rows: list[dict],
@@ -1004,7 +789,7 @@ def find_album_duplicates(rows: list[dict],
             buckets[key].append(inst)
 
     names = {d: _instance_identity(inst) for d, inst in instances.items()}
-    kinds = {d: _instance_kind(inst) for d, inst in instances.items()}
+    kinds = {d: _instance_kind(inst, names[d]) for d, inst in instances.items()}
     union = _Union()
     exact_pairs: set[tuple[str, str]] = set()
     for key, members in buckets.items():
@@ -1021,8 +806,9 @@ def find_album_duplicates(rows: list[dict],
                     continue   # the user has said these two are different albums
                 if not (names[a.dirpath] & names[b.dirpath]):
                     continue   # different albums, whatever they share
-                if not _same_kind(kinds[a.dirpath], kinds[b.dirpath]):
-                    continue   # another release or edition of it
+                if not same_album(kinds[a.dirpath], kinds[b.dirpath]) \
+                        or kinds[a.dirpath].edition != kinds[b.dirpath].edition:
+                    continue   # another release or edition of it, a single named like it
                 overlap, hits = _album_overlap(a, b)
                 if overlap < ALBUM_OVERLAP_THRESHOLD:
                     continue
@@ -1180,7 +966,7 @@ def _file_view(row: dict, keeper_index: dict,
 def _same_album(a: dict, b: dict) -> bool:
     """Two files on the same album — or, with no album to go on, two loose
     copies sitting side by side in one folder."""
-    ia, ib = row_album_identity(a), row_album_identity(b)
+    ia, ib = row_album_keys(a), row_album_keys(b)
     if ia or ib:
         return bool(ia & ib)
     return bool(a.get("dirpath")) and a.get("dirpath") == b.get("dirpath")
@@ -1197,19 +983,6 @@ def _track_scope(a: dict, b: dict) -> bool:
     return (a.get("dirpath") == a.get("artist_dir")) != (b.get("dirpath") == b.get("artist_dir"))
 
 
-def _two_tracks(a: dict, b: dict) -> bool:
-    """Two tracks of one release, however alike their titles: the release
-    lists both (a clean and an explicit take, "ON" and "ON" feat. Sia)."""
-    if a.get("mb_albumid") and a.get("mb_albumid") == b.get("mb_albumid") \
-            and a.get("mb_releasetrackid") and b.get("mb_releasetrackid"):
-        return a["mb_releasetrackid"] != b["mb_releasetrackid"]
-    if unit_dir(a.get("dirpath") or "") == unit_dir(b.get("dirpath") or "") \
-            and a.get("track_number") and b.get("track_number"):
-        return ((a.get("disc_number") or 1, a["track_number"])
-                != (b.get("disc_number") or 1, b["track_number"]))
-    return False
-
-
 def find_track_duplicates(rows: list[dict], covered_dirs: set[str] | None = None,
                           excluded: set[tuple[str, str]] = frozenset()) -> list[dict]:
     """The same track on the same album, more than once: one track in two
@@ -1222,7 +995,6 @@ def find_track_duplicates(rows: list[dict], covered_dirs: set[str] | None = None
     durations agree: `Bob Marley — Keep On Moving` exists at 4:20 and 6:25,
     and those are two different mixes, not a duplicate.
     """
-    from .ownership import version_markers    # ownership builds on this module
     buckets: dict[str, list[dict]] = collections.defaultdict(list)
     for row in rows:
         for key in _artist_buckets(row):
@@ -1245,15 +1017,15 @@ def find_track_duplicates(rows: list[dict], covered_dirs: set[str] | None = None
                     da, dbn = a.get("duration_sec"), b.get("duration_sec")
                     if da and dbn and abs(da - dbn) > DURATION_TOLERANCE:
                         continue
-                    if not _track_scope(a, b) or _two_tracks(a, b):
+                    if not _track_scope(a, b):
                         continue
-                    if not _same_album(a, b) or row_edition(a) != row_edition(b):
-                        continue
-                    ga, gb = a.get("mb_releasegroupid"), b.get("mb_releasegroupid")
-                    if ga and gb and ga != gb:
-                        continue   # a single named like its album
+                    if not _same_album(a, b) or row_edition(a) != row_edition(b) \
+                            or same_album(row_album_id(a), row_album_id(b)).same is False:
+                        continue   # another edition, a single named like its album
                     if version_markers(a.get("title")) != version_markers(b.get("title")):
-                        continue   # "Song" and "Song feat. X - Remix"
+                        continue   # "Song" and "Song feat. X - Remix", whatever the tags' IDs
+                    if not identity.same_recording(a, b):
+                        continue   # two tracks of one release, the disc 2 live take, two IDs
                     if pair_key(a["path"], b["path"]) in excluded:
                         continue
                     union.union(a["path"], b["path"])
@@ -1388,8 +1160,23 @@ async def trash_paths(relpaths: list[str], reason: str = "") -> dict:
     the audio is still byte-identical if it needs to come back. Sidecars (.lrc,
     folder art) follow their track, and an album folder emptied of audio goes
     with its leftovers rather than lingering as a stub for Plex to re-find.
+
+    The album folders are held (locks) while their files go: not during an
+    import into them, or another fix of them.
     """
     _require_online()
+    folders = await asyncio.get_running_loop().run_in_executor(None, _folders_of, relpaths)
+    async with locks.hold(*folders):
+        return await _trash(relpaths, reason)
+
+
+def _folders_of(relpaths) -> list[str]:
+    """The folders these library paths are in, or are (one trashed whole)."""
+    root = settings.library_dir
+    return [p if (root / p).is_dir() else str(Path(p).parent) for p in relpaths if p]
+
+
+async def _trash(relpaths: list[str], reason: str) -> dict:
     batch_id = uuid.uuid4().hex[:12]
     stamp = time.strftime("%Y%m%d-%H%M%S")
     batch_root = settings.trash_dir / f"{stamp}-{batch_id}"
@@ -1485,18 +1272,16 @@ async def trash_paths(relpaths: list[str], reason: str = "") -> dict:
         except OSError as exc:
             log.warning("could not clear emptied folder %s: %s", dirrel, exc)
 
+    # Trash's record of them first, on its own: they are in Trash already,
+    # and a failure leaving the index mustn't take the record (what the
+    # Trash list and Restore read) with it
     if entries:
         await db.executemany(
             "INSERT INTO library_trash (batch_id, original_path, trash_path, kind, "
             "reason, filesize_bytes, trashed_at) VALUES (?,?,?,?,?,?,?)", entries)
-    audio_paths = [e[1] for e in entries if e[3] == "audio"]
-    for start in range(0, len(audio_paths), 400):
-        batch = audio_paths[start:start + 400]
-        await db.execute(
-            f"DELETE FROM library_index WHERE path IN ({','.join('?' * len(batch))})",
-            tuple(batch))
-    for dirrel in emptied:
-        await db.execute("DELETE FROM library_index WHERE dirpath = ?", (dirrel,))
+    # out of the index; what else names them keeps their path (relocate.forget)
+    await relocate.forget([e[1] for e in entries if e[3] == "audio"],
+                          [e[1] for e in entries if e[3] == "dir"] + emptied)
 
     artist_dirs = {Path(e[1]).parts[0] for e in entries if Path(e[1]).parts}
     await _refresh_plex(artist_dirs)
@@ -1529,14 +1314,41 @@ async def list_trash(limit: int = 200, include_restored: bool = False) -> dict:
     return {"batches": batches, "entries": total["n"], "bytes": total["bytes"]}
 
 
+async def trash_folders(batch_id: str) -> list[str]:
+    """The folders a Trash batch took files from, or took whole."""
+    rows = await db.fetchall("SELECT original_path, kind FROM library_trash WHERE batch_id = ?",
+                             (batch_id,))
+    return sorted({r["original_path"] if r["kind"] == "dir"
+                   else str(Path(r["original_path"]).parent) for r in rows})
+
+
+async def in_trash(folder: str) -> bool:
+    """Whether Trash holds audio from this folder, or the folder (or one
+    above it) whole: a Restore would bring it back."""
+    parts = folder.split("/")
+    whole = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    return await db.fetchone(
+        f"SELECT 1 FROM library_trash WHERE restored_at IS NULL AND ((kind = 'dir' AND "
+        f"original_path IN ({','.join('?' * len(whole))})) OR (kind IN ('audio', 'dir') "
+        f"AND original_path >= ? AND original_path < ?)) LIMIT 1",
+        (*whole, folder + "/", folder + "0")) is not None
+
+
 async def restore_batch(batch_id: str) -> dict:
-    """Put a trashed batch back exactly where it came from."""
+    """Put a trashed batch back exactly where it came from, and in the index."""
     _require_online()
     rows = await db.fetchall(
         "SELECT * FROM library_trash WHERE batch_id = ? AND restored_at IS NULL",
         (batch_id,))
     if not rows:
         raise LibraryError("nothing to restore in that batch")
+    # the album folders they go back into are held while they do (locks)
+    async with locks.hold(*(r["original_path"] if r["kind"] == "dir"
+                            else str(Path(r["original_path"]).parent) for r in rows)):
+        return await _restore(rows, batch_id)
+
+
+async def _restore(rows, batch_id: str) -> dict:
     loop = asyncio.get_running_loop()
     restored, failures = [], []
     # Directories first: a file's parent has to exist before the file lands.
@@ -1558,10 +1370,11 @@ async def restore_batch(batch_id: str) -> dict:
             restored.append(row["original_path"])
         except (LibraryError, OSError) as exc:
             failures.append({"path": row["original_path"], "error": str(exc)[:200]})
+    if restored:
+        await relocate.unforget(restored)
     await _refresh_plex({Path(p).parts[0] for p in restored if Path(p).parts})
     log.info("restored %d entries from batch %s", len(restored), batch_id)
-    return {"restored": len(restored), "failures": failures,
-            "rescan_needed": bool(restored)}
+    return {"restored": len(restored), "failures": failures, "rescan_needed": False}
 
 
 async def purge_trash(batch_id: str | None = None, older_than_days: int | None = None) -> dict:
@@ -1616,24 +1429,86 @@ async def merge_artist_folders(sources: list[str], target: str,
     Plex splits artists on the albumartist *tag*, not the folder, so moving
     folders without rewriting the tag just relocates the problem. The artist
     tag is only rewritten where it equals the old folder name — a featured
-    guest's name on a track must survive the merge."""
+    guest's name on a track must survive the merge.
+
+    The merge is one change in the journal (md_changes), undone as one: each
+    file moved, each tag rewritten (with what it said before), and the copies
+    the target already had, which go to Trash. Everything that names the
+    moved files and folders follows them (relocate): their index rows keep
+    their video ids and albums, and nothing waits for a rescan. Every album
+    folder it changes is held meanwhile (locks)."""
     _require_online()
-    loop = asyncio.get_running_loop()
-    target_dir = _safe_abs(target)
-    if not target_dir.is_dir():
+    if not _safe_abs(target).is_dir():
         raise LibraryError(f"target artist folder does not exist: {target!r}")
+    folders = await asyncio.get_running_loop().run_in_executor(
+        None, _artist_folders, sources, target)
+    async with locks.hold(*folders):
+        return await _merge_artists(sources, target, rewrite_tags)
+
+
+def _artist_folders(sources: list[str], target: str) -> list[str]:
+    """The folders an artist merge changes: the artists', their albums',
+    and the target's albums of the same names."""
+    root = settings.library_dir
+    out = []
+    for artist in [*sources, target]:
+        out.append(artist)
+        try:
+            names = [c.name for c in (root / artist).iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        out += [f"{artist}/{n}" for n in names] + [f"{target}/{n}" for n in names]
+    return out
+
+
+async def _merge_artists(sources: list[str], target: str, rewrite_tags: bool) -> dict:
+    from .metadata.apply import journal
+    from .metadata.issues import same_file
+    loop = asyncio.get_running_loop()
+    root = settings.library_dir
+    target_dir = _safe_abs(target)
+
+    def rel(path: Path) -> str:
+        return str(path.relative_to(root))
+
+    batch = uuid.uuid4().hex[:12]
+    journalled = 0
+    pairs: dict[str, str] = {}                      # what moved, old -> new
+    into_leftovers: list[tuple[str, str]] = []      # of those, out of a folder trashed below
+
+    async def record(old: str, new: str) -> None:
+        nonlocal journalled
+        audio = Path(new).suffix.lower() in AUDIO_SUFFIXES
+        await journal(batch, "move", old, "file" if audio else "leftover",
+                      old if audio else None, new, f"Moved {Path(old).name}",
+                      artist_dir=target, album_key=identity.unit_dir(str(Path(new).parent)))
+        journalled += 1
+        pairs[old] = new
 
     moved, merged_into, retagged, failures = [], [], 0, []
     leftovers: list[str] = []
+    skipped = {target}
+    # the album artist the target's own files carry, before the moved ones count
+    name = await _album_artist_of(target) if rewrite_tags else None
     for source in sources:
-        if source == target:
+        if source in skipped:
             continue
         source_dir = _safe_abs(source)
         if not source_dir.is_dir():
             failures.append({"path": source, "error": "not a folder"})
             continue
+        if same_file(source_dir, target_dir):
+            # the target spelled another way (the share ignores case): each
+            # album would be its own destination, and go to Trash as a copy
+            skipped.add(source)
+            failures.append({"path": source, "error": "the target's own folder, in another case"})
+            continue
         for child in sorted(source_dir.iterdir()):
-            destination = target_dir / child.name
+            # an album folder the target has in another case is that folder
+            # (the share ignores case): spelled the target's way. Only the
+            # album's name: the target's is as given, never the source's
+            spelled = await relocate.on_disk(f"{rel(target_dir)}/{child.name}")
+            destination = target_dir / spelled.rpartition("/")[2]
             try:
                 if destination.exists() and child.is_dir():
                     # Same album folder name on both sides — merge file by file.
@@ -1644,14 +1519,16 @@ async def merge_artist_folders(sources: list[str], target: str,
                         if final.exists():
                             continue   # a copy is already there; deal with it below
                         await loop.run_in_executor(None, _relocate, inner, final)
-                        moved.append(str(final.relative_to(settings.library_dir)))
+                        moved.append(rel(final))
+                        await record(rel(inner), moved[-1])
+                        into_leftovers.append((rel(inner), moved[-1]))
                     merged_into.append(child.name)
                     # Whatever could not move is a file the target already has.
                     # It still goes through the trash — this module does not
                     # delete, and "it looked like a duplicate" is exactly the
                     # judgement the duplicate screens exist to make explicit.
                     if any(f.is_file() for f in child.rglob("*")):
-                        leftovers.append(str(child.relative_to(settings.library_dir)))
+                        leftovers.append(rel(child))
                     else:
                         await loop.run_in_executor(
                             None, lambda c=child: shutil.rmtree(c, ignore_errors=True))
@@ -1660,19 +1537,41 @@ async def merge_artist_folders(sources: list[str], target: str,
                                      "error": "a file of that name already exists in the target"})
                 else:
                     await loop.run_in_executor(None, os.replace, child, destination)
-                    moved.append(str(destination.relative_to(settings.library_dir)))
+                    moved.append(rel(destination))
+                    if not destination.is_dir():
+                        await record(rel(child), moved[-1])
+                        continue
+                    old_dir = rel(child)
+                    for inner in sorted(destination.rglob("*")):
+                        if inner.is_file():
+                            await record(str(Path(old_dir) / inner.relative_to(destination)),
+                                         rel(inner))
+                    # and whatever the index has there that is no longer on disk
+                    for r in await db.fetchall(
+                            "SELECT path FROM library_index WHERE path >= ? AND path < ?",
+                            (old_dir + "/", old_dir + "0")):
+                        pairs.setdefault(r["path"], moved[-1] + r["path"][len(old_dir):])
             except OSError as exc:
                 failures.append({"path": child.name, "error": str(exc)[:200]})
-        await db.execute("DELETE FROM library_index WHERE artist_dir = ?", (source,))
+    # What names the moved files names where they are now. Their index rows
+    # go first, so the copies trashed next are all that is left behind.
+    await relocate.relocate(list(pairs.items()))
 
     trashed = {}
     if leftovers:
         trashed = await trash_paths(
             leftovers, f"already present in {target} after an artist merge")
+        if trashed.get("batch_id") and trashed.get("trashed"):
+            await journal(batch, "trash", trashed["batch_id"], "files", leftovers, None,
+                          f"Trashed {len(leftovers)} folders of copies {target} already had",
+                          artist_dir=target, album_key=None)
+            journalled += 1
+        # the folders that emptied hand on what names them
+        await relocate.relocate(into_leftovers)
 
     # Only now can the source folders go, and only if they really are empty.
     for source in sources:
-        if source == target:
+        if source in skipped:
             continue
         try:
             _safe_abs(source).rmdir()
@@ -1682,59 +1581,81 @@ async def merge_artist_folders(sources: list[str], target: str,
                                  "error": f"folder not empty, left in place ({exc})"})
 
     if rewrite_tags:
-        retagged = await _retag_album_artist(target, sources)
+        written = await _retag_album_artist(target, sources, name, batch=batch)
+        retagged = len(written)
+        journalled += retagged
+        await relocate.reread_files(written)
+    if journalled:
+        await db.execute("UPDATE md_changes SET summary = ? WHERE batch_id = ?",
+                         (f"Merged {', '.join(s for s in sources if s != target)} into {target}",
+                          batch))
     await _refresh_plex({target})
     log.info("merged %s into %s: %d items moved, %d retagged",
              sources, target, len(moved), retagged)
     return {"moved": len(moved), "merged_albums": merged_into,
             "retagged": retagged, "trashed": trashed.get("trashed", 0),
-            "failures": failures, "rescan_needed": True}
+            "failures": failures, "batch_id": batch if journalled else None,
+            "rescan_needed": False}
 
 
-async def _retag_album_artist(target: str, old_names: list[str]) -> int:
+async def _album_artist_of(artist_dir: str) -> str:
+    row = await db.fetchone(
+        "SELECT album_artist FROM library_index WHERE artist_dir = ? AND album_artist != '' "
+        "GROUP BY album_artist ORDER BY COUNT(*) DESC LIMIT 1", (artist_dir,))
+    return row["album_artist"] if row else artist_dir
+
+
+async def _retag_album_artist(target: str, old_names: list[str], name: str | None = None,
+                              *, batch: str | None = None) -> list[str]:
     """Set albumartist to the target's own name across the merged folder.
 
     That name is the album artist the target's files already carry, not the
     folder name: a folder can't hold "AC/DC", and "AC_DC" is no name. And
     "AC/DC" reduces to the same key as an "ACDC" folder, so a tag already
-    spelt the target's way is left alone."""
-    import mutagen
+    spelt the target's way is left alone. Written with tagio, and journalled
+    in `batch` with what each tag said before, so the merge can be undone.
+    Returns the files rewritten."""
+    from .engine import tagio
+    from .metadata.apply import journal
 
     loop = asyncio.get_running_loop()
-    row = await db.fetchone(
-        "SELECT album_artist FROM library_index WHERE artist_dir = ? AND album_artist != '' "
-        "GROUP BY album_artist ORDER BY COUNT(*) DESC LIMIT 1", (target,))
-    name = row["album_artist"] if row else target
+    name = name or await _album_artist_of(target)
     old_keys = {strict_key(n) for n in old_names}
     target_dir = _safe_abs(target)
+    root = settings.library_dir
 
-    def _rewrite() -> int:
-        changed = 0
-        for path in target_dir.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
+    def _rewrite() -> list[tuple[str, dict, dict]]:
+        changed = []
+        for path in sorted(target_dir.rglob("*")):
+            # a dot name is a file still being written (.incoming-*), or hidden
+            if not path.is_file() or path.name.startswith(".") \
+                    or path.suffix.lower() not in tagio.WRITABLE_SUFFIXES:
                 continue
             try:
-                audio = mutagen.File(path, easy=True)
-                if audio is None:
-                    continue
-                current_aa = (audio.get("albumartist") or [None])[0]
-                current_artist = (audio.get("artist") or [None])[0]
-                dirty = False
+                fields = tagio.read(path)["fields"]
+                current_aa = (fields.get("albumartist") or [None])[0]
+                current_artist = (fields.get("artist") or [None])[0]
+                wanted = {}
                 if current_aa != name and (not current_aa or strict_key(current_aa) in old_keys):
-                    audio["albumartist"] = [name]
-                    dirty = True
+                    wanted["albumartist"] = [name]
                 if current_artist and current_artist != name \
                         and strict_key(current_artist) in old_keys:
-                    audio["artist"] = [name]
-                    dirty = True
-                if dirty:
-                    audio.save()
-                    changed += 1
+                    wanted["artist"] = [name]
+                if wanted:
+                    result = tagio.write(path, wanted, strip_junk=False)
+                    if result["changed"]:
+                        changed.append((str(path.relative_to(root)), result["before"], wanted))
             except Exception as exc:
                 log.debug("retag skipped for %s: %s", path, exc)
         return changed
 
-    return await loop.run_in_executor(None, _rewrite)
+    changed = await loop.run_in_executor(None, _rewrite)
+    if batch:
+        for path, before, wanted in changed:
+            await journal(batch, "file", path, "tags", before, wanted,
+                          f"Wrote tags on {Path(path).name}", artist_dir=target,
+                          album_key=identity.unit_dir(str(Path(path).parent)))
+    return [path for path, _, _ in changed]
 
 
 # ------------------------------------------------------------------ browsing
@@ -1826,13 +1747,17 @@ _analysis_lock = asyncio.Lock()
 
 async def _analysis_token() -> tuple:
     """Cheap fingerprint of the indexed library plus its trash. Any scan,
-    removal or restore moves it, and nothing else needs to."""
+    removal or restore moves it, and so does a move (relocate's generation:
+    an artist merge changes no count and reads no file); nothing else needs
+    to."""
     row = await db.fetchone(
         "SELECT COUNT(*) AS n, COALESCE(MAX(scanned_at), '') AS last FROM library_index")
     trash = await db.fetchone("SELECT COUNT(*) AS n FROM library_trash")
     excl = await db.fetchone(
         "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS last FROM library_exclusions")
-    return (row["n"], row["last"], trash["n"], excl["n"], excl["last"])
+    moved = await db.fetchone("SELECT value FROM md_state WHERE key = ?", (relocate.GENERATION,))
+    return (row["n"], row["last"], trash["n"], excl["n"], excl["last"],
+            moved["value"] if moved else "")
 
 
 async def _analyse() -> dict:

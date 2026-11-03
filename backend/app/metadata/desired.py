@@ -112,7 +112,10 @@ async def on_disk(folder: str, other_names: tuple[str, ...] = ()) -> str:
     so "Sam Smith/…" would land in the existing "SAM SMITH" folder anyway,
     under a path nothing here knows about. A release credited to "Alanis"
     files with "Alanis Morissette" (`other_names`: the artist's listed
-    name) when that folder exists."""
+    name) when that folder exists. A folder the index doesn't know yet is
+    spelled as the share has it (relocate.on_disk, which the importer
+    uses too)."""
+    from .. import relocate
     artist, _, album = folder.partition("/")
     known = await _existing_artists()
     existing = (known.get(_words(name)) for name in (artist, *other_names))
@@ -122,7 +125,7 @@ async def on_disk(folder: str, other_names: tuple[str, ...] = ()) -> str:
         parts = r["dirpath"].split("/")
         if len(parts) >= 2 and _fold(parts[1]) == _fold(album):
             return f"{artist}/{parts[1]}"
-    return f"{artist}/{album}"
+    return await relocate.on_disk(f"{artist}/{album}")
 
 
 def _said_in(label: str, title: str) -> bool:
@@ -255,6 +258,43 @@ async def artist_profile(mbid: str | None, name: str, plex_artist: dict | None =
             "moods": moods, "mood_source": mood_source}
 
 
+# The tags a file carries as one track of its release; the rest are the album's.
+TRACK_FIELDS = ("title", "artist", "artists", "tracknumber", "totaltracks", "discnumber",
+                "isrc", "mb_artistid", "mb_trackid", "mb_releasetrackid")
+
+
+def track_tags(album_tags: dict, rel: dict, t: dict, row: dict) -> dict:
+    """A file's tags as track `t` (a mb.release_tracks entry) of `rel`: the
+    album's tags, and the track's own."""
+    credits = t["credits"] or rel.get("artist-credit") or []
+    isrc = row.get("isrc") if row.get("isrc") in t["isrcs"] else (
+        t["isrcs"][0] if t["isrcs"] else None)
+    return {
+        **album_tags,
+        "title": [plain(t["title"])],
+        "artist": [plain(mb.credit_string(credits))],
+        "artists": [plain(n) for n in mb.credit_names(credits)],
+        "tracknumber": [str(t["number"])],
+        "totaltracks": [str(t["disc_tracks"])] if t.get("disc_tracks") else [],
+        "discnumber": [str(t["disc"])],
+        "isrc": [isrc] if isrc else [],
+        "mb_artistid": mb.credit_ids(credits),
+        "mb_trackid": [t["recording_id"]] if t.get("recording_id") else [],
+        "mb_releasetrackid": [t["track_id"]] if t.get("track_id") else [],
+    }
+
+
+def album_tags_of(desired: dict) -> dict:
+    """The album-level tags of an album's desired state: any of its files'
+    tags without the track's own (a matched file's first; every file
+    carries them)."""
+    ordered = sorted((desired.get("tracks") or {}).values(), key=lambda t: not t.get("matched"))
+    for t in ordered:
+        if t.get("tags"):
+            return {k: v for k, v in t["tags"].items() if k not in TRACK_FIELDS}
+    return {}
+
+
 async def build_album(rows: list[dict], res: Resolution, *, plex_album: dict | None,
                       plex_artist: dict | None, overrides: dict) -> dict:
     rel = res.release
@@ -279,9 +319,12 @@ async def build_album(rows: list[dict], res: Resolution, *, plex_album: dict | N
     types = [t.lower() for t in [group.get("primary-type"), *(group.get("secondary-types") or [])]
              if t]
     compilation = aa["various"] or "compilation" in types
+    # a label the tag writer would strip as junk ("Siccness.net", "nugs.net")
+    # is never wanted: written, it would be planned again every check
     label = next((li.get("label", {}).get("name") for li in rel.get("label-info") or []
                   if (li.get("label") or {}).get("name")
-                  and li["label"]["name"].lower() not in ("[no label]", "no label")), None)
+                  and li["label"]["name"].lower() not in ("[no label]", "no label")
+                  and not tagio.spam(li["label"]["name"])), None)
     media = rel.get("media") or []
 
     # ---- genres
@@ -364,11 +407,8 @@ async def build_album(rows: list[dict], res: Resolution, *, plex_album: dict | N
             tracks[path] = {"matched": False, "target": target,
                             "tags": dict(album_tags)}
             continue
-        credits = t["credits"] or rel.get("artist-credit") or []
-        title = plain(t["title"])
-        credit = plain(mb.credit_string(credits))
-        isrc = row.get("isrc") if row.get("isrc") in t["isrcs"] else (
-            t["isrcs"][0] if t["isrcs"] else None)
+        tags = track_tags(album_tags, rel, t, row)
+        title, credit = tags["title"][0], tags["artist"][0]
         try:
             name = build_track_relpath(
                 aa["name"], folder_album, title, ext, t["number"],
@@ -376,19 +416,6 @@ async def build_album(rows: list[dict], res: Resolution, *, plex_album: dict | N
             target = f"{folder}/{name}" if folder else None
         except PathBuildError:
             target = None
-        tags = {
-            **album_tags,
-            "title": [title],
-            "artist": [credit],
-            "artists": [plain(n) for n in mb.credit_names(credits)],
-            "tracknumber": [str(t["number"])],
-            "totaltracks": [str(t["disc_tracks"])] if t.get("disc_tracks") else [],
-            "discnumber": [str(t["disc"])],
-            "isrc": [isrc] if isrc else [],
-            "mb_artistid": mb.credit_ids(credits),
-            "mb_trackid": [t["recording_id"]] if t.get("recording_id") else [],
-            "mb_releasetrackid": [t["track_id"]] if t.get("track_id") else [],
-        }
         tracks[path] = {
             "matched": True, "target": target, "title": title,
             "artist": credit, "tracknumber": t["number"],

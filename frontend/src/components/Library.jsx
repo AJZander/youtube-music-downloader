@@ -18,7 +18,7 @@ import {
   DupesManagerDialog, FullRunDialog, IgnoredDialog, MergeArtistDialog, OverrideDialog,
   TrashDialog,
 } from './library/dialogs.jsx'
-import { buildHash, parseHash } from './library/issues.js'
+import { albumRef, buildHash, isAlbum, parseHash } from './library/issues.js'
 
 /** Which pane tab answers an issue of this kind. */
 const TAB_FOR_KIND = {
@@ -29,6 +29,8 @@ const TAB_FOR_KIND = {
   move: 'files', move_conflict: 'files',
   extra_tracks: 'tracks', not_in_plex: 'tracks', plex_ghost: 'tracks',
   track_order: 'tracks', missing_tracks: 'tracks',
+  // which tracks Plex files together
+  plex_foreign: 'tracks',
 }
 
 function stored(key) {
@@ -46,6 +48,7 @@ function store(key, value) {
 export default function Library() {
   const initial = useRef(parseHash()).current
   const [artistDir, setArtistDir] = useState(initial?.artistDir || null)
+  // the selected album's unit id (a key, from an old link, until it loads)
   const [albumKey, setAlbumKey] = useState(initial?.albumKey || null)
   const [paneOpen, setPaneOpen] = useState(!!initial?.albumKey)
   const [paneTab, setPaneTab] = useState('compare')
@@ -116,7 +119,10 @@ export default function Library() {
     const { albumKey: currentKey } = selection.current
     setArtistDir(dir || null)
     setAlbumKey(key || null)
-    if (key) {
+    if (opts.replace) {
+      // the album on screen under its current name (an old link's key, a
+      // merged-away album's keeper): the pane stays as it is
+    } else if (key) {
       if (opts.tab) setPaneTab(opts.tab)
       else if (key !== currentKey) setPaneTab('compare')
       if (opts.pane !== false) setPaneOpen(true)
@@ -127,7 +133,9 @@ export default function Library() {
       setPaneOpen(false)
     }
     const hash = buildHash(dir, key)
-    if (window.location.hash !== hash) window.history.pushState(null, '', hash)
+    if (window.location.hash !== hash) {
+      window.history[opts.replace ? 'replaceState' : 'pushState'](null, '', hash)
+    }
   }, [])
 
   useEffect(() => {
@@ -154,7 +162,7 @@ export default function Library() {
       setModal({ type: 'merge', artistDir: issue.artist_dir || issue.ref })
       return
     }
-    const key = issue.album_key || (issue.entity === 'album' ? issue.ref : null)
+    const key = issue.unit_id || issue.album_key || (issue.entity === 'album' ? issue.ref : null)
     if (key) {
       navigate(issue.artist_dir, key, { tab: TAB_FOR_KIND[issue.kind] || 'compare' })
     } else {
@@ -190,14 +198,26 @@ export default function Library() {
   useEffect(() => {
     if (!albumKey) { setAlbum(null); setAlbumError(null); return undefined }
     let live = true
-    setAlbum((prev) => (prev?.key === albumKey ? prev : null))
+    setAlbum((prev) => (isAlbum(prev, albumKey) ? prev : null))
     setAlbumLoading(true); setAlbumError(null)
     api.libraryAlbum(albumKey)
-      .then((d) => { if (live) setAlbum(d) })
+      .then((d) => {
+        if (!live) return
+        const { artistDir: dir } = selection.current
+        if (d?.redirect) {
+          // merged into another album: that one takes this link's place
+          navigate(d.redirect.artist_dir || dir, d.redirect.unit_id || d.redirect.key,
+            { replace: true })
+          return
+        }
+        setAlbum(d)
+        // an old link names the album by its key: the URL takes its id
+        if (d?.unit_id && d.unit_id !== albumKey) navigate(dir, d.unit_id, { replace: true })
+      })
       .catch((e) => { if (live) setAlbumError(e.message) })
       .finally(() => { if (live) setAlbumLoading(false) })
     return () => { live = false }
-  }, [albumKey, versions.album])
+  }, [albumKey, versions.album, navigate])
 
   // Several events arrive in bursts while a run applies fixes; each kind of
   // refetch waits for the burst to settle.
@@ -227,14 +247,16 @@ export default function Library() {
       const { artistDir: dir, albumKey: key } = selection.current
       const moved = key && d?.renamed?.[key]
       if (moved) {
-        // the album on screen was moved: follow it to its new key
-        navigate(moved.artist_dir || dir, moved.key, { pane: true })
+        // the album on screen was moved (or merged into another): follow it
+        navigate(moved.artist_dir || dir, moved.unit_id || moved.key, { pane: true })
+        later('artist')
+        later('album')
         later('list', 3000)
         later('attention')
         return
       }
       if (dir && d?.artist_dirs?.includes(dir)) later('artist')
-      if (key && d?.album_keys?.includes(key)) later('album')
+      if (key && (d?.unit_ids?.includes(key) || d?.album_keys?.includes(key))) later('album')
       later('attention')
       later('list', 3000)
       later('overview', 5000)
@@ -279,7 +301,7 @@ export default function Library() {
       || (a.flags || []).some((f) => ['unmatched', 'wrong_match'].includes(f.kind)))
       || (artist.albums || []).find((a) => a.plex && !a.plex.matched)
     if (target) {
-      navigate(artist.artist_dir, target.key, { tab: 'match' })
+      navigate(artist.artist_dir, albumRef(target), { tab: 'match' })
     } else if ((artist.issues || []).some((i) => i.kind === 'artist_unmatched' && i.state === 'open')) {
       navigate(artist.artist_dir, null, { pane: true, tab: 'overview' })
     } else {
@@ -295,7 +317,7 @@ export default function Library() {
   }
 
   const crumbArtist = artist?.name || artistDir
-  const crumbAlbum = album?.key === albumKey ? album?.album : null
+  const crumbAlbum = isAlbum(album, albumKey) ? album?.album : null
 
   return (
     <Box>
@@ -386,8 +408,11 @@ export default function Library() {
             version={versions.attention}
             onApply={(group, dir, onlyAuto = true) => setModal({
               type: 'apply', kind: group.kind, artistDir: dir, onlyAuto,
-              count: onlyAuto ? group.auto_count : group.count - (group.queued_count || 0) })}
-            onReview={(group, dir) => setModal({ type: 'issues', kind: group.kind, artistDir: dir })}
+              filter: onlyAuto ? undefined : group.bulk_filter,
+              count: onlyAuto ? group.auto_count
+                : group.bulk_count ?? group.count })}
+            onReview={(group, dir, state) => setModal({
+              type: 'issues', kind: group.kind, artistDir: dir, state })}
             onResolveDupes={(tab) => setModal({ type: 'dupes', tab })}
             onTrash={() => setModal({ type: 'trash' })}
             onIgnored={() => setModal({ type: 'ignored' })}
@@ -397,7 +422,7 @@ export default function Library() {
 
       {paneVisible && (
         <DetailPane mode={albumKey ? 'album' : 'artist'}
-          album={album?.key === albumKey ? album : null} artist={artist}
+          album={isAlbum(album, albumKey) ? album : null} artist={artist}
           loading={albumKey ? albumLoading : artistLoading}
           error={albumKey ? albumError : artistError}
           height={paneHeight} onHeight={setPaneHeight}
@@ -415,12 +440,14 @@ export default function Library() {
       )}
       {modal?.type === 'apply' && (
         <ConfirmApplyDialog kind={modal.kind} count={modal.count} artistDir={modal.artistDir}
-          onlyAuto={modal.onlyAuto} notify={notify} onClose={() => setModal(null)}
+          onlyAuto={modal.onlyAuto} filter={modal.filter} notify={notify}
+          onClose={() => setModal(null)}
           onDone={onChanged} />
       )}
       {modal?.type === 'issues' && (
-        <IssueListDialog kind={modal.kind} artistDir={modal.artistDir} notify={notify}
-          onClose={() => setModal(null)} onNavigate={navigateIssue} onChanged={onChanged} />
+        <IssueListDialog kind={modal.kind} artistDir={modal.artistDir} state={modal.state}
+          notify={notify} onClose={() => setModal(null)} onNavigate={navigateIssue}
+          onChanged={onChanged} />
       )}
       {modal?.type === 'dupes' && (
         <DupesManagerDialog initial={modal.tab} scanRunning={scan?.running}

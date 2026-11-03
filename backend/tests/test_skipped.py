@@ -6,14 +6,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.api import _album_key, _matched_album
+from app.api import _different_album, _matched_album
 
 
 def different_album(track_album, library_path):
-    """Mirrors the flag list_skipped computes per row."""
-    matched = _matched_album(library_path)
-    return bool(matched and track_album
-                and _album_key(matched) != _album_key(track_album))
+    """The flag list_skipped computes per row, for a skip outside a Download
+    missing whose match is judged by its path."""
+    return _different_album({"album": track_album, "library_path": library_path,
+                             "job_id": None}) is not None
 
 
 class TestMatchedAlbum(unittest.TestCase):
