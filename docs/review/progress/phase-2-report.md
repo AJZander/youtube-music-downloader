@@ -1,7 +1,7 @@
 # Phase 2 report: issues that close when they're fixed
 
 Integrator's report for `fix/review-2026-11-p2`, which started at `263261c`
-(phase 1's integrated tip plus the ledger). The code tip is `9055e30`. The
+(phase 1's integrated tip plus the ledger). The code tip is `69739fb`. The
 commit that adds this report and the plan sits on top of it. The checks ran on
 2026-11-02 (14:56Z onwards) against the shared copy
 `.cache/claude-sandbox/mdl-p2.db` (schema v11, the live app's pre-phase-1
@@ -41,7 +41,7 @@ by the resolved hunk; lane b's other five files are identical to
 | P1-A1 Honest issue states | a | `e4e9fab` | `3057b6d` + fixup `66d8301` |
 | P1-A2 Fixes that converge | a | `9b4abb3` | `4663fe1` |
 | P2-A4 The UI reflects the true state | a | `2e0536c` | `3c1d01e` + fixup `f80ab7a` |
-| P1-A3 Duplicates-manager actions update issues at once | b | `9055e30` | `17958dc` + fixup `b723329` |
+| P1-A3 Duplicates-manager actions update issues at once | b | `69739fb` | `17958dc` + fixup `b723329` |
 
 - **Order.** The integration order rule for this run is lanes a then b, each
   in its lane order, so A4 sits before A3. §6 and the plan list A1 → A2 → A3
@@ -75,7 +75,7 @@ by the resolved hunk; lane b's other five files are identical to
   The conflicting pick was the last in the list, so after the commit
   `git cherry-pick --quit` cleared it. Nothing was skipped.
 
-Files changed in the phase (`git diff --stat 263261c..9055e30`: 32 files,
+Files changed in the phase (`git diff --stat 263261c..69739fb`: 32 files,
 +2,447/−263):
 - new backend module `app/metadata/recheck.py`;
 - backend `app/{api,db,library,relocate}.py`, `app/engine/tagio.py` and
